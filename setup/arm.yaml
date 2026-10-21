@@ -455,3 +455,37 @@ BARCODE_PAIR_SECONDS: 120
 # Look the barcode up online (upcitemdb for video discs, MusicBrainz for audio CDs)
 # when ARM could not identify the disc from the disc itself.
 BARCODE_LOOKUP: true
+
+
+#################################################
+##              SLEEVE LABELS                  ##
+#################################################
+
+# Print a label for each ripped disc on a Brother P-touch tape printer (USB) and track which box
+# the sleeve went into. The label carries a QR code of the sleeve id (S0001, S0002, ...), the id in
+# large text, the title, year and disc type. See the Sleeve Labels wiki page for the printer setup.
+LABEL_ENABLED: false
+
+# Print the label automatically when a DVD or Blu-ray rip finishes. Off: print from the job page.
+LABEL_AUTO_PRINT: true
+
+# Width of the tape in the printer, in mm (6, 9, 12, 18, 24). 18 mm gives the most readable label.
+LABEL_TAPE_MM: 18
+
+# Command that prints a PNG; {image} is replaced by the file. Default is the ptouch tool from ptouch-rs.
+LABEL_PRINTER_CMD: "ptouch print -i {image}"
+
+# ptouch-rs --usb BUS:ADDRESS selector (from "ptouch doctor") when more than one printer is attached.
+LABEL_USB: ""
+
+# Seconds to wait for the printer command before giving up.
+LABEL_TIMEOUT: 60
+
+# Letters in front of the number on every sleeve id. Change it only before the first label is printed.
+LABEL_ID_PREFIX: "S"
+
+# Longest label to print, in mm; the title is shrunk or shortened to fit.
+LABEL_MAX_MM: 90
+
+# TrueType font file for the label text. Blank picks DejaVu Sans Bold or another bold font on the system.
+LABEL_FONT: ""

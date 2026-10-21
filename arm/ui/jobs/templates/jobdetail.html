@@ -240,6 +240,34 @@
                                         {% if jobs.disc_barcode_title %}<br/><small class="text-muted">{{ jobs.disc_barcode_title }}</small>{% endif %}
                                     </td>
                                 </tr>
+                                <tr>
+                                    <td style="text-align:left"><strong>sleeve_id</strong></td>
+                                    <td style="text-align:left">
+                                        {% if jobs.sleeve_id %}<strong>{{ jobs.sleeve_id }}</strong>
+                                            <a href="boxes/preview.png?job_id={{ jobs.job_id }}" target="_blank" class="ml-2">preview label</a>
+                                        {% else %}None (assigned when the label is first printed){% endif %}
+                                        {% if jobs.disctype in ('dvd', 'bluray') %}
+                                        <form method="post" action="boxes/print" class="d-inline ml-2">
+                                            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                                            <input type="hidden" name="job_id" value="{{ jobs.job_id }}">
+                                            <button type="submit" class="btn btn-sm btn-primary">{{ 'Reprint label' if jobs.sleeve_id else 'Print label' }}</button>
+                                        </form>
+                                        {% endif %}
+                                    </td>
+                                </tr>
+                                <tr>
+                                    <td style="text-align:left"><strong>box</strong></td>
+                                    <td style="text-align:left">
+                                        <form method="post" action="boxes/set" class="form-inline" autocomplete="off">
+                                            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                                            <input type="hidden" name="job_id" value="{{ jobs.job_id }}">
+                                            <input type="text" class="form-control form-control-sm mr-2" name="box" maxlength="64"
+                                                   value="{{ jobs.box if jobs.box else '' }}" placeholder="not filed">
+                                            <button type="submit" class="btn btn-sm btn-secondary">Save box</button>
+                                            <a href="boxes" class="ml-2">all boxes</a>
+                                        </form>
+                                    </td>
+                                </tr>
                                 {% if not jobs.poster_url %}
                                     <tr>
                                         <td style="text-align:left"><strong>poster_url</strong></td>

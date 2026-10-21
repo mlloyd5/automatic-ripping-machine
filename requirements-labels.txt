@@ -1,0 +1,5 @@
+# Extra Python dependencies for sleeve labels (arm/labels): drawing the label bitmap and its QR code.
+# Kept out of requirements.txt like the camera packages: Pillow builds from source on 32-bit ARM and
+# most installs have no label printer. The Debian installer and the Dockerfile install this file.
+Pillow==11.3.0
+qrcode==8.2

@@ -141,6 +141,8 @@ class Job(db.Model):
     disc_photo_ocr = db.Column(db.Text)  # raw OCR text from the disc photo
     disc_barcode = db.Column(db.String(32))  # UPC/EAN scanned from the case before the tray closed
     disc_barcode_title = db.Column(db.String(256))  # product title the barcode looked up to
+    sleeve_id = db.Column(db.String(16), index=True)  # code on the sleeve label (S0001...), assigned once
+    box = db.Column(db.String(64))  # box the sleeve was filed in
     devpath = db.Column(db.String(15))
     mountpoint = db.Column(db.String(20))
     hasnicetitle = db.Column(db.Boolean)

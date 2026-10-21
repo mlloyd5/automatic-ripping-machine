@@ -982,6 +982,31 @@ function CreateAndStartCameraService() {
   systemctl start armcamera
 }
 
+function InstallSleeveLabels() {
+  echo -e "${RED}Installing sleeve label support (Brother P-touch over USB)${NC}"
+  # Pillow and qrcode draw the label; a failure here must not stop the rest of the install
+  sudo -u arm /opt/arm/venv/bin/pip3 install -r /opt/arm/requirements-labels.txt || \
+    echo -e "${RED}Could not install the sleeve label Python packages; labels will be unavailable${NC}"
+  apt-get install -y fonts-dejavu-core libusb-1.0-0
+  # ptouch (ptouch-rs) talks to the printer; pinned, downloaded from GitHub, skipped when offline
+  local ptouch_version="0.14.0"
+  local arch
+  arch="$(dpkg --print-architecture)"
+  if ! command -v ptouch >/dev/null 2>&1; then
+    if curl -fsSL -o /tmp/ptouch.deb \
+        "https://github.com/vowstar/ptouch-rs/releases/download/v${ptouch_version}/ptouch_${ptouch_version}_${arch}.deb"; then
+      dpkg -i /tmp/ptouch.deb || echo -e "${RED}ptouch-rs could not be installed; sleeve labels will not print${NC}"
+      rm -f /tmp/ptouch.deb
+    else
+      echo -e "${RED}ptouch-rs ${ptouch_version} could not be downloaded; sleeve labels will not print${NC}"
+    fi
+  fi
+  # Let the arm user reach the printer and keep the kernel's usblp driver off it
+  cp /opt/arm/setup/99-arm-ptouch.rules /etc/udev/rules.d/99-arm-ptouch.rules
+  usermod -aG plugdev arm
+  udevadm control --reload-rules && udevadm trigger
+}
+
 function LaunchSetup() {
   echo -e "${RED}Launching ArmUI first-time setup${NC}"
 
@@ -1058,4 +1083,5 @@ MountDrives
 SetupFolders
 CreateAndStartService
 CreateAndStartCameraService
+InstallSleeveLabels
 LaunchSetup

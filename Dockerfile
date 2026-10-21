@@ -53,6 +53,21 @@ RUN apt-get update && \
     pip3 install --no-cache-dir --prefer-binary -r /tmp/requirements-camera.txt && \
     rm /tmp/requirements-camera.txt
 
+# Sleeve labels: Pillow and qrcode draw the label, ptouch (ptouch-rs) sends it to a Brother P-touch over USB.
+# The .deb is fetched from GitHub; a failed download must not break the image (labels are then unavailable).
+ARG PTOUCH_RS_VERSION=0.14.0
+COPY ./requirements-labels.txt /tmp/requirements-labels.txt
+COPY ./setup/99-arm-ptouch.rules /etc/udev/rules.d/99-arm-ptouch.rules
+RUN pip3 install --no-cache-dir --prefer-binary -r /tmp/requirements-labels.txt && \
+    rm /tmp/requirements-labels.txt && \
+    apt-get update && apt-get install -y --no-install-recommends fonts-dejavu-core libusb-1.0-0 && \
+    rm -rf /var/lib/apt/lists/* && \
+    arch="$(dpkg --print-architecture)" && \
+    (curl -fsSL -o /tmp/ptouch.deb \
+        "https://github.com/vowstar/ptouch-rs/releases/download/v${PTOUCH_RS_VERSION}/ptouch_${PTOUCH_RS_VERSION}_${arch}.deb" && \
+     dpkg -i /tmp/ptouch.deb && rm -f /tmp/ptouch.deb) || \
+    echo "ptouch-rs ${PTOUCH_RS_VERSION} not installed; sleeve labels will not print"
+
 # Add ARMui service
 RUN mkdir /etc/service/armui
 COPY ./scripts/docker/runsv/armui.sh /etc/service/armui/run

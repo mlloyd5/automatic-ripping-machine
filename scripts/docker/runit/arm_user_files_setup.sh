@@ -56,6 +56,9 @@ usermod -a -G video arm
 echo "Adding arm user to 'input' group (barcode scanner access)"
 getent group input > /dev/null || groupadd -r input
 usermod -a -G input arm
+echo "Adding arm user to 'plugdev' group (USB label printer access)"
+getent group plugdev > /dev/null || groupadd -r plugdev
+usermod -a -G plugdev arm
 
 ### Setup Files
 chown -R arm:arm /opt/arm

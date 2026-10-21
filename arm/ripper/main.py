@@ -30,6 +30,7 @@ from arm.models.system_drives import SystemDrives  # noqa: E402
 from arm.ripper import (arm_ripper, identify, logger,  # noqa: E402
                         music_brainz, utils)
 from arm.ripper.ARMInfo import ARMInfo  # noqa E402
+from arm.labels import sleeve  # noqa E402
 from arm.ui import app, constants, db  # noqa E402
 from arm.ui.settings import DriveUtils as drive_utils  # noqa E402
 
@@ -107,6 +108,16 @@ def check_fstab():
     logging.error("No fstab entry found.  ARM will likely fail.")
 
 
+def print_sleeve_label(job):
+    """Print the sleeve label for the disc just ripped; a missing printer must never fail the rip."""
+    try:
+        printed, message = sleeve.auto_print(job)
+        if printed and job.config.NOTIFY_RIP:
+            utils.notify(job, constants.NOTIFY_TITLE, f"{job.title}: {message}")
+    except Exception as error:
+        logging.error(f"Sleeve label printing failed: {error}", exc_info=True)
+
+
 def main():
     """main disc processing function"""
     logging.info("Starting Disc identification")
@@ -139,6 +150,7 @@ def main():
     # Type: dvd/bluray
     if job.disctype in ["dvd", "bluray"]:
         arm_ripper.rip_visual_media(have_dupes, job, log_file, job.has_track_99)
+        print_sleeve_label(job)
 
     # Type: Music
     elif job.disctype == "music":
