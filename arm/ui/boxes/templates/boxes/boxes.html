@@ -12,7 +12,7 @@
                         <h3>Sleeves and boxes</h3>
                         <p class="mb-1">{{ labelled }} labelled disc{{ 's' if labelled != 1 }},
                             {{ groups|box_count }} box{{ 'es' if groups|box_count != 1 }},
-                            {{ unfiled }} not filed yet.</p>
+                            {{ unfiled }} not filed yet. This machine's ids start with <code>{{ prefix }}-</code>.</p>
                         {% if not enabled %}
                             <p class="text-warning mb-1">Sleeve labels are off: set <code>LABEL_ENABLED</code> to true in
                                 Settings &gt; Ripper Settings to print labels. Boxes can be assigned either way.</p>
@@ -23,6 +23,34 @@
                     </div>
                 </div>
             </div>
+
+            {% if pending %}
+                <div class="card mb-3 border-warning">
+                    <div class="card-header">
+                        <strong>Labels to print</strong>
+                        <span class="text-muted">{{ pending|length }} waiting</span>
+                        <form method="post" action="boxes/print_pending" class="d-inline float-right">
+                            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                            <button type="submit" class="btn btn-sm btn-primary" {% if not enabled %}disabled{% endif %}>Print pending</button>
+                        </form>
+                    </div>
+                    <div class="table-responsive">
+                        <table class="table table-sm table-striped mb-0">
+                            <thead><tr><th>Sleeve</th><th>Title</th><th>Type</th><th>Ripped</th></tr></thead>
+                            <tbody>
+                            {% for job in pending %}
+                                <tr>
+                                    <td><a href="jobdetail?job_id={{ job.job_id }}">{{ job.sleeve_id }}</a></td>
+                                    <td>{{ job.title or job.label or 'Title unknown' }}{% if job.year %} ({{ job.year }}){% endif %}</td>
+                                    <td>{{ disc_type_name(job) }}</td>
+                                    <td>{{ job.start_time.strftime('%Y-%m-%d') if job.start_time else '' }}</td>
+                                </tr>
+                            {% endfor %}
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            {% endif %}
 
             <div class="row">
                 <div class="col-md-6">
@@ -41,7 +69,7 @@
                                 <div class="form-group">
                                     <label for="sleeve_id" class="mb-0 font-weight-bold">Sleeve id</label>
                                     <input type="text" class="form-control" id="sleeve_id" name="sleeve_id" value=""
-                                           maxlength="16" placeholder="S0042" {% if box %}autofocus{% endif %}>
+                                           maxlength="16" placeholder="{{ prefix }}-0042" {% if box %}autofocus{% endif %}>
                                 </div>
                                 <button type="submit" class="btn btn-primary">File it</button>
                             </form>
@@ -56,7 +84,7 @@
                                 <div class="form-group">
                                     <label for="q" class="mb-0 font-weight-bold">Sleeve id or title</label>
                                     <input type="text" class="form-control" id="q" name="q" value="{{ query }}"
-                                           placeholder="S0042 or Jaws">
+                                           placeholder="{{ prefix }}-0042, 42 or Jaws">
                                 </div>
                                 <button type="submit" class="btn btn-primary">Find</button>
                             </form>

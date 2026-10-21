@@ -45,7 +45,8 @@ atexit.register(shutil.rmtree, _TMP, ignore_errors=True)
 
 def _job(**overrides):
     base = dict(job_id=7, disctype="bluray", title="Jaws", year="1975", label="JAWS_UHD", disc_barcode_title=None,
-                sleeve_id=None, box=None, status="success", config=SimpleNamespace(NOTIFY_RIP=True))
+                sleeve_id=None, label_printed=None, box=None, status="success",
+                config=SimpleNamespace(NOTIFY_RIP=True))
     base.update(overrides)
     return SimpleNamespace(**base)
 
@@ -58,7 +59,7 @@ class SleeveTestCase(unittest.TestCase):
             importlib.reload(cfg)
         cfg.arm_config.update({"LABEL_ENABLED": True, "LABEL_AUTO_PRINT": True, "LABEL_TAPE_MM": 18,
                                "LABEL_PRINTER_CMD": "ptouch print -i {image}", "LABEL_USB": "", "LABEL_TIMEOUT": 60,
-                               "LABEL_ID_PREFIX": "S", "LABEL_MAX_MM": 90, "LABEL_FONT": ""})
+                               "LABEL_ID_PREFIX": "T6", "LABEL_MAX_MM": 90, "LABEL_FONT": ""})
         self.commit = mock.patch.object(sleeve, "commit", return_value=True)
         self.commit.start()
 
@@ -74,41 +75,56 @@ class SleeveTestCase(unittest.TestCase):
 
 class TestSleeveIds(SleeveTestCase):
     def test_parse_and_normalise(self):
-        self.assertEqual(sleeve.parse_sleeve_id("S0042"), ("S", 42))
-        self.assertEqual(sleeve.parse_sleeve_id(" s42 "), ("S", 42))
-        self.assertEqual(sleeve.parse_sleeve_id("42"), ("", 42))
+        self.assertEqual(sleeve.parse_sleeve_id("T6-0042"), ("T6", 42))
+        self.assertEqual(sleeve.parse_sleeve_id(" t6-42 "), ("T6", 42))
+        self.assertEqual(sleeve.parse_sleeve_id("TS-7"), ("TS", 7))
+        self.assertIsNone(sleeve.parse_sleeve_id("42"), "a bare number needs a default prefix")
+        self.assertEqual(sleeve.parse_sleeve_id("42", default_prefix="t6"), ("T6", 42))
+        self.assertIsNone(sleeve.parse_sleeve_id("S0042"), "the old dash-less form is not an id")
         self.assertIsNone(sleeve.parse_sleeve_id("Jaws"))
         self.assertIsNone(sleeve.parse_sleeve_id(""))
         self.assertIsNone(sleeve.parse_sleeve_id(None))
-        self.assertEqual(sleeve.normalise_sleeve_id("s42"), "S0042")
-        self.assertEqual(sleeve.normalise_sleeve_id("S12345"), "S12345")
+        self.assertEqual(sleeve.normalise_sleeve_id("t6-42"), "T6-0042")
+        self.assertEqual(sleeve.normalise_sleeve_id("T6-12345"), "T6-12345")
+        self.assertEqual(sleeve.normalise_sleeve_id("42", default_prefix="TS"), "TS-0042")
         self.assertIsNone(sleeve.normalise_sleeve_id("box 3"))
 
-    def test_next_id_counts_from_the_highest_with_the_prefix(self):
-        with self.fake_ids("S0001", "S0042", "S0007", "X0099", None):
-            self.assertEqual(sleeve.next_sleeve_id(), "S0043")
-            self.assertEqual(sleeve.next_sleeve_id("X"), "X0100")
-            self.assertEqual(sleeve.next_sleeve_id("Z"), "Z0001")
-        with self.fake_ids():
-            self.assertEqual(sleeve.next_sleeve_id(), "S0001")
+    def test_prefix_from_hostname(self):
+        self.assertEqual(sleeve.prefix_from_hostname("t620"), "T6")
+        self.assertEqual(sleeve.prefix_from_hostname("ts140.lan"), "TS")
+        self.assertEqual(sleeve.prefix_from_hostname("arm"), "AR")
+        self.assertEqual(sleeve.prefix_from_hostname("-x"), "X")
+        self.assertEqual(sleeve.prefix_from_hostname(""), "S")
 
     def test_prefix_from_config_with_fallback(self):
-        cfg.arm_config["LABEL_ID_PREFIX"] = "DVD"
+        self.assertEqual(sleeve.id_prefix(), "T6")
+        cfg.arm_config["LABEL_ID_PREFIX"] = "dvd"
         self.assertEqual(sleeve.id_prefix(), "DVD")
-        cfg.arm_config["LABEL_ID_PREFIX"] = "toolong"
-        self.assertEqual(sleeve.id_prefix(), "S")
-        cfg.arm_config["LABEL_ID_PREFIX"] = ""
-        with self.fake_ids("0003"):
-            self.assertEqual(sleeve.next_sleeve_id(), "0004")
+        with mock.patch.object(sleeve, "prefix_from_hostname", return_value="HO"):
+            cfg.arm_config["LABEL_ID_PREFIX"] = "toolong"
+            self.assertEqual(sleeve.id_prefix(), "HO")
+            cfg.arm_config["LABEL_ID_PREFIX"] = "a-b"
+            self.assertEqual(sleeve.id_prefix(), "HO")
+            cfg.arm_config["LABEL_ID_PREFIX"] = ""
+            self.assertEqual(sleeve.id_prefix(), "HO")
+
+    def test_next_id_counts_from_the_highest_with_the_prefix(self):
+        with self.fake_ids("T6-0001", "T6-0042", "T6-0007", "TS-0099", None):
+            self.assertEqual(sleeve.next_sleeve_id(), "T6-0043")
+            self.assertEqual(sleeve.next_sleeve_id("TS"), "TS-0100")
+            self.assertEqual(sleeve.next_sleeve_id("Z"), "Z-0001")
+        with self.fake_ids():
+            self.assertEqual(sleeve.next_sleeve_id(), "T6-0001")
 
     def test_assign_keeps_an_existing_id(self):
-        job = _job(sleeve_id="S0005")
-        with self.fake_ids("S0009"):
-            self.assertEqual(sleeve.assign_sleeve_id(job), "S0005")
+        job = _job(sleeve_id="T6-0005")
+        with self.fake_ids("T6-0009"):
+            self.assertEqual(sleeve.assign_sleeve_id(job), "T6-0005")
         job = _job()
-        with self.fake_ids("S0009"):
-            self.assertEqual(sleeve.assign_sleeve_id(job), "S0010")
-        self.assertEqual(job.sleeve_id, "S0010")
+        with self.fake_ids("T6-0009"):
+            self.assertEqual(sleeve.assign_sleeve_id(job), "T6-0010")
+        self.assertEqual(job.sleeve_id, "T6-0010")
+        self.assertIsNone(job.label_printed, "a fresh id is pending")
 
     def test_assign_fails_loudly_when_the_save_fails(self):
         self.commit.stop()
@@ -149,7 +165,7 @@ class TestPrinting(SleeveTestCase):
         self.assertFalse(printed)
         self.assertIn("disabled", message)
 
-    def test_prints_and_cleans_up(self):
+    def test_prints_marks_printed_and_cleans_up(self):
         job = _job()
         seen = {}
 
@@ -157,24 +173,26 @@ class TestPrinting(SleeveTestCase):
             seen.update(path=path, template=template, usb=usb, timeout=timeout, existed=os.path.exists(path))
             return "ok"
 
-        with self.fake_ids("S0001"), mock.patch.object(sleeve.printer, "print_image", side_effect=fake_print):
+        with self.fake_ids("T6-0001"), mock.patch.object(sleeve.printer, "print_image", side_effect=fake_print):
             printed, message = sleeve.print_label(job, reason="test")
         self.assertTrue(printed, message)
-        self.assertEqual(job.sleeve_id, "S0002")
-        self.assertEqual(message, "Printed label S0002")
+        self.assertEqual(job.sleeve_id, "T6-0002")
+        self.assertEqual(message, "Printed label T6-0002")
+        self.assertIsNotNone(job.label_printed)
         self.assertTrue(seen["existed"], "the PNG existed while the printer ran")
         self.assertFalse(os.path.exists(seen["path"]), "the PNG is removed afterwards")
         self.assertEqual((seen["template"], seen["usb"], seen["timeout"]), ("ptouch print -i {image}", None, 60))
 
-    def test_printer_failure_keeps_the_id(self):
+    def test_printer_failure_keeps_the_id_pending(self):
         job = _job()
         with self.fake_ids(), mock.patch.object(sleeve.printer, "print_image",
                                                 side_effect=sleeve.printer.PrinterError("no printer found")):
             printed, message = sleeve.print_label(job)
         self.assertFalse(printed)
-        self.assertEqual(job.sleeve_id, "S0001")
+        self.assertEqual(job.sleeve_id, "T6-0001")
+        self.assertIsNone(job.label_printed)
         self.assertIn("no printer found", message)
-        self.assertIn("S0001", message)
+        self.assertIn("pending", message)
 
     def test_render_failure_is_reported_not_raised(self):
         cfg.arm_config["LABEL_TAPE_MM"] = 13
@@ -183,32 +201,62 @@ class TestPrinting(SleeveTestCase):
         self.assertFalse(printed)
         self.assertIn("Could not render", message)
 
-    def test_auto_print_rules(self):
-        with mock.patch.object(sleeve, "print_label", return_value=(True, "Printed label S0001")) as printer:
-            self.assertEqual(sleeve.auto_print(_job(disctype="music"))[0], False)
+    def test_auto_print_assigns_the_id_even_without_printing(self):
+        with mock.patch.object(sleeve, "print_label", return_value=(True, "Printed label T6-0001")) as printer:
+            self.assertFalse(sleeve.auto_print(_job(disctype="music"))[0])
+            cfg.arm_config["LABEL_ENABLED"] = False
+            self.assertFalse(sleeve.auto_print(_job())[0])
+            printer.assert_not_called()
+            cfg.arm_config["LABEL_ENABLED"] = True
             cfg.arm_config["LABEL_AUTO_PRINT"] = False
-            self.assertEqual(sleeve.auto_print(_job())[0], False)
+            job = _job()
+            with self.fake_ids("T6-0004"):
+                printed, message = sleeve.auto_print(job)
+            self.assertFalse(printed)
+            self.assertEqual(job.sleeve_id, "T6-0005", "the id is handed out at rip time")
+            self.assertIn("pending", message)
             printer.assert_not_called()
             cfg.arm_config["LABEL_AUTO_PRINT"] = True
-            self.assertEqual(sleeve.auto_print(_job(disctype="dvd")), (True, "Printed label S0001"))
+            with self.fake_ids():
+                self.assertEqual(sleeve.auto_print(_job(disctype="dvd")), (True, "Printed label T6-0001"))
             printer.assert_called_once()
+
+    def test_print_pending_stops_at_the_first_failure(self):
+        jobs = [_job(job_id=1, sleeve_id="T6-0001"), _job(job_id=2, sleeve_id="T6-0002"),
+                _job(job_id=3, sleeve_id="T6-0003")]
+        outcomes = {1: (True, "Printed label T6-0001"), 2: (False, "Label T6-0002 not printed (pending): out of tape"),
+                    3: (True, "Printed label T6-0003")}
+        with mock.patch.object(sleeve, "pending_jobs", return_value=jobs), \
+                mock.patch.object(sleeve, "print_label", side_effect=lambda job, reason="": outcomes[job.job_id]):
+            results = sleeve.print_pending()
+            self.assertEqual([r["job_id"] for r in results], [1, 2])
+            self.assertEqual([r["printed"] for r in results], [True, False])
+            results = sleeve.print_pending(stop_on_error=False)
+            self.assertEqual([r["job_id"] for r in results], [1, 2, 3])
+            results = sleeve.print_pending(limit=1)
+            self.assertEqual([r["job_id"] for r in results], [1])
 
     def test_backfill(self):
         jobs = [_job(job_id=1, title="A"), _job(job_id=2, title="B")]
         with mock.patch.object(sleeve, "jobs_without_sleeve_id", return_value=jobs), \
-                mock.patch.object(sleeve, "next_sleeve_id", side_effect=["S0001", "S0002"]), \
+                mock.patch.object(sleeve, "next_sleeve_id", side_effect=["T6-0001", "T6-0002"]), \
+                mock.patch.object(sleeve, "pending_jobs", return_value=jobs), \
                 mock.patch.object(sleeve, "print_label", return_value=(True, "Printed")) as printer:
             results = sleeve.backfill()
-        self.assertEqual([r["sleeve_id"] for r in results], ["S0001", "S0002"])
+        self.assertEqual([r["sleeve_id"] for r in results], ["T6-0001", "T6-0002"])
+        self.assertEqual([r["printed"] for r in results], [True, True])
         self.assertEqual(printer.call_count, 2)
-        self.assertEqual(jobs[1].sleeve_id, "S0002")
+        self.assertEqual(jobs[1].sleeve_id, "T6-0002")
         jobs = [_job(job_id=3, title="C")]
         with mock.patch.object(sleeve, "jobs_without_sleeve_id", return_value=jobs), \
-                mock.patch.object(sleeve, "next_sleeve_id", return_value="S0003"), \
+                mock.patch.object(sleeve, "next_sleeve_id", return_value="T6-0003"), \
                 mock.patch.object(sleeve, "print_label") as printer:
             results = sleeve.backfill(dry_run=True)
-        self.assertEqual(results[0]["message"], "dry run")
-        self.assertIsNone(jobs[0].sleeve_id)
+            self.assertEqual(results[0]["message"], "dry run")
+            self.assertIsNone(jobs[0].sleeve_id)
+            results = sleeve.backfill(print_labels=False)
+            self.assertEqual(jobs[0].sleeve_id, "T6-0003")
+            self.assertIn("pending", results[0]["message"])
         printer.assert_not_called()
 
 

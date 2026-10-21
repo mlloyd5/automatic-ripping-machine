@@ -5,6 +5,7 @@ Covers
 - boxes/file [POST]         scan or type a sleeve id to file it in the box named on the page
 - boxes/set [POST]          set the box of one job from its detail page
 - boxes/print [POST]        print (or reprint) a job's sleeve label
+- boxes/print_pending [POST] print every label still in the queue (rips done while the printer was away)
 - boxes/preview.png [GET]   the label as it would print, for checking the layout
 - boxes/export.csv [GET]    every labelled disc with its box, as CSV
 
@@ -90,6 +91,8 @@ def boxes():
                            groups=group_by_box(jobs),
                            labelled=len(jobs),
                            unfiled=sum(1 for job in jobs if not job.box),
+                           pending=sleeve.pending_jobs(),
+                           prefix=sleeve.id_prefix(),
                            enabled=sleeve.enabled(),
                            disc_type_name=sleeve.disc_type_name,
                            printer_ok=sleeve.printer.tool_available(
@@ -144,6 +147,23 @@ def print_label():
     return redirect(request.form.get('next') or url_for('route_jobs.jobdetail', job_id=job.job_id))
 
 
+@route_boxes.route('/boxes/print_pending', methods=['POST'])
+@login_required
+def print_pending():
+    """Print every queued label; stops at the first failure so the queue keeps its order."""
+    results = sleeve.print_pending(stop_on_error=True)
+    printed = [r["sleeve_id"] for r in results if r["printed"]]
+    failed = [r for r in results if not r["printed"]]
+    if not results:
+        flash("No labels are waiting to be printed.", "info")
+    elif failed:
+        left = len(sleeve.pending_jobs())
+        flash(f"Printed {len(printed)}, then {escape(failed[0]['message'])}. {left} still pending.", "danger")
+    else:
+        flash(f"Printed {len(printed)} label{'s' if len(printed) != 1 else ''}: {', '.join(printed)}.", "success")
+    return redirect(url_for('route_boxes.boxes'))
+
+
 @route_boxes.route('/boxes/preview.png')
 @login_required
 def preview():
@@ -169,11 +189,13 @@ def export_csv():
     """Every labelled disc with its box, for a spreadsheet or a backup of the index."""
     buffer = io.StringIO()
     writer = csv.writer(buffer)
-    writer.writerow(["sleeve_id", "title", "year", "disc_type", "box", "job_id", "ripped", "disc_barcode", "path"])
+    writer.writerow(["sleeve_id", "title", "year", "disc_type", "box", "job_id", "ripped", "label_printed",
+                     "disc_barcode", "path"])
     for job in labelled_jobs():
         writer.writerow([job.sleeve_id, job.title or job.label or "", job.year or "", sleeve.disc_type_name(job),
                          job.box or "", job.job_id,
                          job.start_time.strftime("%Y-%m-%d") if job.start_time else "",
+                         job.label_printed.strftime("%Y-%m-%d %H:%M") if job.label_printed else "",
                          job.disc_barcode or "", job.path or ""])
     response = make_response(buffer.getvalue())
     response.headers['Content-Type'] = 'text/csv; charset=utf-8'

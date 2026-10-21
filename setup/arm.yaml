@@ -466,7 +466,9 @@ BARCODE_LOOKUP: true
 # large text, the title, year and disc type. See the Sleeve Labels wiki page for the printer setup.
 LABEL_ENABLED: false
 
-# Print the label automatically when a DVD or Blu-ray rip finishes. Off: print from the job page.
+# Print the label as soon as a DVD or Blu-ray rip finishes. Off, or when the printer is on another box,
+# unplugged or out of tape, the label waits in the queue on the Boxes page ("Print pending") or
+# "python3 -m arm.labels print --pending". The sleeve id is assigned and reported either way.
 LABEL_AUTO_PRINT: true
 
 # Width of the tape in the printer, in mm (6, 9, 12, 18, 24). 18 mm gives the most readable label.
@@ -481,8 +483,10 @@ LABEL_USB: ""
 # Seconds to wait for the printer command before giving up.
 LABEL_TIMEOUT: 60
 
-# Letters in front of the number on every sleeve id. Change it only before the first label is printed.
-LABEL_ID_PREFIX: "S"
+# Machine prefix of every sleeve id (T6-0001): 1-4 letters or digits. Blank takes the first two characters
+# of the hostname (t620 -> T6, ts140 -> TS). Give each ARM box its own, so two boxes ripping at once never
+# hand out the same id, and change it only before the first label is printed.
+LABEL_ID_PREFIX: ""
 
 # Longest label to print, in mm; the title is shrunk or shortened to fit.
 LABEL_MAX_MM: 90

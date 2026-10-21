@@ -32,6 +32,7 @@ _template.update({
     "ABCDE_CONFIG_FILE": str(REPO_ROOT / "setup" / ".abcde.conf"),
     "DISABLE_LOGIN": True,
     "LABEL_ENABLED": True,
+    "LABEL_ID_PREFIX": "T6",
 })
 _CONFIG_PATH = os.path.join(_TEMP_ROOT, "arm.yaml")
 with open(_CONFIG_PATH, "w") as _handle:
@@ -91,8 +92,11 @@ class TestBoxesPage(unittest.TestCase):
         cfg.arm_config["LABEL_ENABLED"] = True
         Job.query.delete()
         db.session.commit()
-        self.jaws = make_job(title="Jaws", sleeve_id="S0001", box="Box 01")
-        self.alien = make_job(title="Alien", year="1979", sleeve_id="S0002", box=None, label="ALIEN_UHD")
+        cfg.arm_config["LABEL_ID_PREFIX"] = "T6"
+        self.jaws = make_job(title="Jaws", sleeve_id="T6-0001", box="Box 01",
+                             label_printed=datetime(2026, 10, 20, 12, 30))
+        self.alien = make_job(title="Alien", year="1979", sleeve_id="T6-0002", box=None, label="ALIEN_UHD",
+                              label_printed=None)
         self.unlabelled = make_job(title="Heat", year="1995", disctype="dvd")
 
     def test_page_lists_boxes_and_unfiled(self):
@@ -104,10 +108,13 @@ class TestBoxesPage(unittest.TestCase):
         self.assertIn("1 not filed yet", html)
         self.assertIn("<strong>Box 01</strong>", html)
         self.assertIn("Not filed in a box yet", html)
-        self.assertIn("S0002", html)
+        self.assertIn("T6-0002", html)
         self.assertIn(">UHD<", html)
         self.assertNotIn("Heat", html, "jobs without a sleeve id are not listed")
         self.assertIn('href="boxes"', html, "nav link")
+        self.assertIn("Labels to print", html)
+        self.assertIn("1 waiting", html)
+        self.assertIn("ids start with <code>T6-</code>", html)
 
     def test_disabled_warning(self):
         cfg.arm_config["LABEL_ENABLED"] = False
@@ -120,9 +127,10 @@ class TestBoxesPage(unittest.TestCase):
         return html.split("<strong>Find a disc</strong>")[1].split('<div class="card mb-3">')[0]
 
     def test_find_by_sleeve_id_and_title(self):
-        card = self.find("s1")
+        card = self.find("t6-1")
         self.assertIn("Jaws (1975)", card)
         self.assertNotIn("Alien (1979)", card)
+        self.assertIn("Alien (1979)", self.find("2"), "a bare number means this machine's prefix")
         card = self.find("ali")
         self.assertIn("Alien (1979)", card)
         self.assertIn("not filed", card)
@@ -130,18 +138,18 @@ class TestBoxesPage(unittest.TestCase):
         self.assertIn("Nothing matches", self.find("nothing-here"))
 
     def test_file_a_sleeve_into_a_box(self):
-        response = self.client.post("/boxes/file", data={"box": "Box 02", "sleeve_id": "S0002"}, follow_redirects=True)
+        response = self.client.post("/boxes/file", data={"box": "Box 02", "sleeve_id": "t6-2"}, follow_redirects=True)
         self.assertEqual(response.status_code, 200)
         html = response.data.decode()
-        self.assertIn("S0002 Alien filed in Box 02", html)
+        self.assertIn("T6-0002 Alien filed in Box 02", html)
         self.assertEqual(Job.query.get(self.alien.job_id).box, "Box 02")
         self.assertIn('value="Box 02"', html, "the box name stays in the form for the next scan")
 
     def test_file_rejects_unknown_id_and_missing_box(self):
-        html = self.client.post("/boxes/file", data={"box": "Box 02", "sleeve_id": "S0404"},
+        html = self.client.post("/boxes/file", data={"box": "Box 02", "sleeve_id": "T6-0404"},
                                 follow_redirects=True).data.decode()
-        self.assertIn("No disc has the sleeve id S0404", html)
-        html = self.client.post("/boxes/file", data={"box": "", "sleeve_id": "S0002"},
+        self.assertIn("No disc has the sleeve id T6-0404", html)
+        html = self.client.post("/boxes/file", data={"box": "", "sleeve_id": "T6-0002"},
                                 follow_redirects=True).data.decode()
         self.assertIn("Name the box first", html)
         self.assertIsNone(Job.query.get(self.alien.job_id).box)
@@ -161,14 +169,32 @@ class TestBoxesPage(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         printer.assert_called_once()
         job = Job.query.get(self.unlabelled.job_id)
-        self.assertEqual(job.sleeve_id, "S0003", "next free id, assigned on first print")
-        self.assertIn("Printed label S0003", response.data.decode())
+        self.assertEqual(job.sleeve_id, "T6-0003", "next free id, assigned on first print")
+        self.assertIsNotNone(job.label_printed)
+        self.assertIn("Printed label T6-0003", response.data.decode())
 
     def test_print_failure_is_shown(self):
         with mock.patch.object(sleeve.printer, "print_image", side_effect=sleeve.printer.PrinterError("unplugged")):
             response = self.client.post("/boxes/print", data={"job_id": self.jaws.job_id}, follow_redirects=True)
         html = response.data.decode()
-        self.assertIn("not printed: unplugged", html)
+        self.assertIn("not printed (pending): unplugged", html)
+
+    def test_print_pending(self):
+        with mock.patch.object(sleeve.printer, "print_image", return_value="ok") as printer:
+            html = self.client.post("/boxes/print_pending", follow_redirects=True).data.decode()
+        printer.assert_called_once()
+        self.assertIn("Printed 1 label: T6-0002", html)
+        self.assertIsNotNone(Job.query.get(self.alien.job_id).label_printed)
+        self.assertNotIn("Labels to print", html)
+        html = self.client.post("/boxes/print_pending", follow_redirects=True).data.decode()
+        self.assertIn("No labels are waiting", html)
+        make_job(title="Heat", sleeve_id="T6-0003")
+        make_job(title="Ronin", sleeve_id="T6-0004")
+        with mock.patch.object(sleeve.printer, "print_image",
+                               side_effect=sleeve.printer.PrinterError("out of tape")) as printer:
+            html = self.client.post("/boxes/print_pending", follow_redirects=True).data.decode()
+        printer.assert_called_once()
+        self.assertIn("Printed 0, then Label T6-0003 not printed (pending): out of tape. 2 still pending.", html)
 
     def test_preview_png(self):
         try:
@@ -185,17 +211,24 @@ class TestBoxesPage(unittest.TestCase):
         response = self.client.get("/boxes/export.csv")
         self.assertEqual(response.status_code, 200)
         lines = response.data.decode().splitlines()
-        self.assertEqual(lines[0], "sleeve_id,title,year,disc_type,box,job_id,ripped,disc_barcode,path")
+        self.assertEqual(lines[0], "sleeve_id,title,year,disc_type,box,job_id,ripped,label_printed,disc_barcode,path")
         self.assertEqual(len(lines), 3)
-        self.assertTrue(lines[1].startswith("S0001,Jaws,1975,Blu-ray,Box 01,"))
-        self.assertTrue(lines[2].startswith("S0002,Alien,1979,UHD,,"))
+        self.assertTrue(lines[1].startswith("T6-0001,Jaws,1975,Blu-ray,Box 01,"))
+        self.assertIn(",2026-10-20,2026-10-20 12:30,", lines[1])
+        self.assertTrue(lines[2].startswith("T6-0002,Alien,1979,UHD,,"))
+        self.assertIn(",2026-10-20,,", lines[2])
 
     def test_job_detail_shows_sleeve_and_box(self):
         with mock.patch("arm.ui.utils.metadata_selector", return_value=None):
             html = self.client.get(f"/jobdetail?job_id={self.jaws.job_id}").data.decode()
-        self.assertIn("<strong>S0001</strong>", html)
+        self.assertIn("<strong>T6-0001</strong>", html)
+        self.assertIn("printed 2026-10-20 12:30", html)
         self.assertIn('value="Box 01"', html)
         self.assertIn("Reprint label", html)
+        with mock.patch("arm.ui.utils.metadata_selector", return_value=None):
+            html = self.client.get(f"/jobdetail?job_id={self.alien.job_id}").data.decode()
+        self.assertIn("label pending", html)
+        self.assertIn("Print label", html)
 
     def test_json_api(self):
         response = self.client.get(f"/json?mode=set_box&job={self.alien.job_id}&box=Box%2009")
@@ -207,7 +240,16 @@ class TestBoxesPage(unittest.TestCase):
         with mock.patch.object(sleeve.printer, "print_image", return_value="ok"):
             payload = self.client.get(f"/json?mode=print_label&job={self.jaws.job_id}").get_json()
         self.assertTrue(payload["success"], payload)
-        self.assertEqual(payload["sleeve_id"], "S0001")
+        self.assertEqual(payload["sleeve_id"], "T6-0001")
+        payload = self.client.get("/json?mode=pending_labels").get_json()
+        self.assertEqual(payload["count"], 1)
+        self.assertEqual(payload["prefix"], "T6")
+        self.assertEqual(payload["jobs"][0]["sleeve_id"], "T6-0002")
+        with mock.patch.object(sleeve.printer, "print_image", return_value="ok"):
+            payload = self.client.get("/json?mode=print_pending").get_json()
+        self.assertTrue(payload["success"], payload)
+        self.assertEqual(payload["printed"], ["T6-0002"])
+        self.assertEqual(payload["pending"], 0)
 
 
 if __name__ == "__main__":

@@ -648,3 +648,28 @@ def print_label(job_id):
     printed, message = sleeve.print_label(job, reason="json api")
     return {'success': printed, 'mode': 'print_label', 'job': job.job_id, 'sleeve_id': job.sleeve_id,
             'message': message}
+
+
+def pending_labels():
+    """
+    The print queue: json?mode=pending_labels
+    :return: json with one entry per job whose label has not been printed yet
+    """
+    from arm.labels import sleeve
+    jobs = sleeve.pending_jobs()
+    return {'success': True, 'mode': 'pending_labels', 'prefix': sleeve.id_prefix(), 'count': len(jobs),
+            'jobs': [{'job_id': job.job_id, 'sleeve_id': job.sleeve_id, 'title': job.title, 'year': job.year,
+                      'disc_type': sleeve.disc_type_name(job)} for job in jobs]}
+
+
+def print_pending():
+    """
+    Print every queued label, oldest first, stopping at the first failure: json?mode=print_pending
+    :return: json with what was printed and what is still waiting
+    """
+    from arm.labels import sleeve
+    results = sleeve.print_pending(stop_on_error=True)
+    failed = [r for r in results if not r['printed']]
+    return {'success': not failed, 'mode': 'print_pending',
+            'printed': [r['sleeve_id'] for r in results if r['printed']],
+            'error': failed[0]['message'] if failed else '', 'pending': len(sleeve.pending_jobs())}

@@ -399,7 +399,9 @@ def feed_json():
             'read_notification': {'funct': json_api.read_notification, 'args': ('notify_id',)},
             'notify_timeout': {'funct': json_api.get_notify_timeout, 'args': ('notify_timeout',)},
             'set_box': {'funct': json_api.set_box, 'args': ('j_id', 'box')},
-            'print_label': {'funct': json_api.print_label, 'args': ('j_id',)}
+            'print_label': {'funct': json_api.print_label, 'args': ('j_id',)},
+            'pending_labels': {'funct': json_api.pending_labels, 'args': ()},
+            'print_pending': {'funct': json_api.print_pending, 'args': ()}
         }
     else:
         valid_data = {

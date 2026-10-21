@@ -20,11 +20,13 @@ def upgrade():
     """
     Add the sleeve label columns to the job table.
 
-    sleeve_id - short code printed on the disc's sleeve label (S0001, S0002, ...), assigned once
-    box       - name of the box the sleeve was filed in, free text
+    sleeve_id     - code printed on the disc's sleeve label (T6-0001, T6-0002, ...), assigned once
+    label_printed - when the label last came out of the printer; NULL means it is still to print
+    box           - name of the box the sleeve was filed in, free text
     """
     with op.batch_alter_table('job', schema=None) as batch_op:
         batch_op.add_column(sa.Column('sleeve_id', sa.String(length=16), nullable=True))
+        batch_op.add_column(sa.Column('label_printed', sa.DateTime(), nullable=True))
         batch_op.add_column(sa.Column('box', sa.String(length=64), nullable=True))
         batch_op.create_index('ix_job_sleeve_id', ['sleeve_id'], unique=False)
 
@@ -33,4 +35,5 @@ def downgrade():
     with op.batch_alter_table('job', schema=None) as batch_op:
         batch_op.drop_index('ix_job_sleeve_id')
         batch_op.drop_column('box')
+        batch_op.drop_column('label_printed')
         batch_op.drop_column('sleeve_id')
