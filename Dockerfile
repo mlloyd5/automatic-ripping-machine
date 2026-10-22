@@ -54,10 +54,10 @@ RUN apt-get update && \
     rm /tmp/requirements-camera.txt
 
 # Sleeve labels: Pillow and qrcode draw the label, ptouch (ptouch-rs) sends it to a Brother P-touch over USB.
-# The .deb comes from the mlloyd5/ptouch-rs fork release, which carries the PT-E310BT status fix until it is
-# upstream; a failed download must not break the image (labels are then unavailable).
-ARG PTOUCH_RS_REPO=mlloyd5/ptouch-rs
-ARG PTOUCH_RS_VERSION=0.14.1
+# The .deb is fetched from GitHub; a failed download must not break the image (labels are then unavailable).
+# Override PTOUCH_RS_REPO / PTOUCH_RS_VERSION to install a build with the PT-E310BT status fix (see the wiki).
+ARG PTOUCH_RS_REPO=vowstar/ptouch-rs
+ARG PTOUCH_RS_VERSION=0.14.0
 COPY ./requirements-labels.txt /tmp/requirements-labels.txt
 COPY ./setup/99-arm-ptouch.rules /etc/udev/rules.d/99-arm-ptouch.rules
 RUN pip3 install --no-cache-dir --prefer-binary -r /tmp/requirements-labels.txt && \

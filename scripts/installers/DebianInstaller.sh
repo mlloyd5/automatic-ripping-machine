@@ -988,10 +988,10 @@ function InstallSleeveLabels() {
   sudo -u arm /opt/arm/venv/bin/pip3 install -r /opt/arm/requirements-labels.txt || \
     echo -e "${RED}Could not install the sleeve label Python packages; labels will be unavailable${NC}"
   apt-get install -y fonts-dejavu-core libusb-1.0-0
-  # ptouch (ptouch-rs) talks to the printer: the mlloyd5/ptouch-rs fork release carries the PT-E310BT
-  # status fix until it is upstream; pinned, downloaded from GitHub, skipped when offline
-  local ptouch_repo="mlloyd5/ptouch-rs"
-  local ptouch_version="0.14.1"
+  # ptouch (ptouch-rs) talks to the printer; pinned, downloaded from GitHub, skipped when offline.
+  # A build with the PT-E310BT status fix can replace it later (see the Sleeve Labels wiki page).
+  local ptouch_repo="vowstar/ptouch-rs"
+  local ptouch_version="0.14.0"
   local arch
   arch="$(dpkg --print-architecture)"
   if ! command -v ptouch >/dev/null 2>&1; then
