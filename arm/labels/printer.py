@@ -15,11 +15,10 @@ DEFAULT_COMMAND = "ptouch print -i {image}"
 IMAGE_PLACEHOLDER = "{image}"
 UNCONFIRMED_MARKER = "completion is unconfirmed"
 """
-Released ptouch-rs (0.14.0) never switches the PT-E310BT's status notification on, so the label prints but
-the tool waits for a "printing completed" status that never comes and exits 1 after --job-timeout with
-"Label sent, but completion is unconfirmed". That outcome counts as printed here, so a stock build works
-with a short --job-timeout. The build the installer makes (mlloyd5/ptouch-rs, pinned commit, fix proposed
-upstream) returns as soon as the printer reports completion.
+ptouch-rs before 0.14.1 never switches the PT-E310BT's status notification on, so the label prints but the
+tool waits for a "printing completed" status that never comes and exits 1 after --job-timeout with "Label
+sent, but completion is unconfirmed". That outcome counts as printed here, so an older build works with a
+short --job-timeout; 0.14.1 and later return as soon as the printer reports completion.
 """
 
 

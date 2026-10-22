@@ -988,24 +988,28 @@ function InstallSleeveLabels() {
   sudo -u arm /opt/arm/venv/bin/pip3 install -r /opt/arm/requirements-labels.txt || \
     echo -e "${RED}Could not install the sleeve label Python packages; labels will be unavailable${NC}"
   apt-get install -y fonts-dejavu-core libusb-1.0-0 libusb-1.0-0-dev pkg-config build-essential
-  # ptouch (ptouch-rs) talks to the printer. It is built from a pinned commit of the mlloyd5/ptouch-rs
-  # fork, which carries the PT-E310BT status fix until it is released upstream (a git dependency, no
-  # release involved), with a throwaway Rust toolchain; the upstream .deb is the fallback.
-  local ptouch_git="https://github.com/mlloyd5/ptouch-rs.git"
-  local ptouch_commit="30ca09e"
-  local ptouch_fallback="https://github.com/vowstar/ptouch-rs/releases/download/v0.14.0/ptouch_0.14.0_$(dpkg --print-architecture).deb"
+  # ptouch (ptouch-rs 0.14.1, the first release that handles the PT-E310BT) talks to the printer. The
+  # release .deb is tried first; it needs glibc 2.38 (Debian 13 / Ubuntu 24.04), so on an older system it
+  # is built from the release tag with a throwaway Rust toolchain instead.
+  local ptouch_version="0.14.1"
+  local ptouch_git="https://github.com/vowstar/ptouch-rs.git"
+  local ptouch_deb="https://github.com/vowstar/ptouch-rs/releases/download/v${ptouch_version}/ptouch_${ptouch_version}_$(dpkg --print-architecture).deb"
   if ! command -v ptouch >/dev/null 2>&1; then
-    if curl -fsSL https://sh.rustup.rs -o /tmp/rustup.sh && \
-        sudo -u arm sh /tmp/rustup.sh -y --profile minimal --no-modify-path >/dev/null && \
-        sudo -u arm /home/arm/.cargo/bin/cargo install --git "$ptouch_git" --rev "$ptouch_commit" --locked \
-          --root /home/arm/ptouch ptouch-cli; then
-      install -m 0755 /home/arm/ptouch/bin/ptouch /usr/local/bin/ptouch
-      rm -rf /home/arm/.rustup /home/arm/.cargo /home/arm/ptouch
-    elif curl -fsSL -o /tmp/ptouch.deb "$ptouch_fallback"; then
-      echo -e "${RED}Could not build ptouch from ${ptouch_git}; installing the upstream release instead${NC}"
-      dpkg -i /tmp/ptouch.deb || echo -e "${RED}ptouch-rs could not be installed; sleeve labels will not print${NC}"
+    if curl -fsSL -o /tmp/ptouch.deb "$ptouch_deb" && dpkg -i /tmp/ptouch.deb >/dev/null 2>&1 && \
+        ptouch --version >/dev/null 2>&1; then
+      echo "Installed ptouch ${ptouch_version} from the release package"
     else
-      echo -e "${RED}ptouch could be neither built nor downloaded; sleeve labels will not print${NC}"
+      dpkg -r ptouch >/dev/null 2>&1 || true
+      echo "The ptouch release package does not run here; building ${ptouch_version} from source"
+      if curl -fsSL https://sh.rustup.rs -o /tmp/rustup.sh && \
+          sudo -u arm sh /tmp/rustup.sh -y --profile minimal --no-modify-path >/dev/null && \
+          sudo -u arm /home/arm/.cargo/bin/cargo install --git "$ptouch_git" --tag "v${ptouch_version}" --locked \
+            --root /home/arm/ptouch ptouch-cli; then
+        install -m 0755 /home/arm/ptouch/bin/ptouch /usr/local/bin/ptouch
+      else
+        echo -e "${RED}ptouch could be neither installed nor built; sleeve labels will not print${NC}"
+      fi
+      rm -rf /home/arm/.rustup /home/arm/.cargo /home/arm/ptouch
     fi
     rm -f /tmp/rustup.sh /tmp/ptouch.deb
   fi

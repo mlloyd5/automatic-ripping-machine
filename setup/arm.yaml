@@ -474,10 +474,10 @@ LABEL_AUTO_PRINT: true
 # Width of the tape in the printer, in mm (6, 9, 12, 18, 24). 18 mm gives the most readable label.
 LABEL_TAPE_MM: 18
 
-# Command that prints a PNG; {image} is replaced by the file. Default is ptouch (ptouch-rs) as the installer
-# builds it, with the PT-E310BT status fix. --precut makes the printer feed and wait for you to cut the blank
-# lead before printing (raise LABEL_TIMEOUT to match; not for LABEL_AUTO_PRINT). With a stock ptouch-rs
-# release add --job-timeout 20: it never sees a PT-E310BT finish, and ARM counts that outcome as printed.
+# Command that prints a PNG; {image} is replaced by the file. Default is ptouch from ptouch-rs 0.14.1 or
+# later. --precut makes the printer feed and wait for you to cut the blank lead before printing (raise
+# LABEL_TIMEOUT to match; not for LABEL_AUTO_PRINT). With ptouch-rs older than 0.14.1 add --job-timeout 20:
+# it never sees a PT-E310BT finish, and ARM counts that outcome as printed.
 LABEL_PRINTER_CMD: "ptouch print -i {image}"
 
 # ptouch-rs --usb BUS:ADDRESS selector (from "ptouch doctor") when more than one printer is attached.
