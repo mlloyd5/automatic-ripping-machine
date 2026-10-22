@@ -45,10 +45,11 @@ RUN \
 RUN rm -rf /etc/service/sshd /etc/my_init.d/00_regen_ssh_host_keys.sh
 
 # Disc camera: OpenCV for the webcam daemon, evdev for the USB barcode scanner (built from source,
-# the base image has gcc and python3-dev), tesseract for reading disc labels
+# the base image has gcc and python3-dev), tesseract for reading disc labels. mkvtoolnix so that
+# mkvmerge/mkvinfo are at hand in the ripper for joining multi-disc rips and inspecting MKVs.
 COPY ./requirements-camera.txt /tmp/requirements-camera.txt
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends tesseract-ocr tesseract-ocr-eng && \
+    apt-get install -y --no-install-recommends tesseract-ocr tesseract-ocr-eng mkvtoolnix && \
     rm -rf /var/lib/apt/lists/* && \
     pip3 install --no-cache-dir --prefer-binary -r /tmp/requirements-camera.txt && \
     rm /tmp/requirements-camera.txt
