@@ -4,7 +4,7 @@
 # dependency. Debian bullseye (glibc 2.31) so the binary runs on the Ubuntu 22.04 base below.
 FROM rust:1-bullseye AS ptouch-build
 ARG PTOUCH_RS_REPO=https://github.com/mlloyd5/ptouch-rs.git
-ARG PTOUCH_RS_COMMIT=c6478c5
+ARG PTOUCH_RS_COMMIT=30ca09e
 RUN apt-get update && apt-get install -y --no-install-recommends libusb-1.0-0-dev pkg-config && \
     rm -rf /var/lib/apt/lists/* && \
     cargo install --git "${PTOUCH_RS_REPO}" --rev "${PTOUCH_RS_COMMIT}" --locked --root /opt/ptouch ptouch-cli

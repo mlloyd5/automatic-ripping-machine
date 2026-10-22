@@ -9,11 +9,11 @@
 # Copy the result to /usr/local/bin/ptouch on the ARM box (or into the container) before running the
 # installer: it keeps a ptouch that is already on PATH instead of downloading the upstream release.
 # With a Rust toolchain on the box itself this is simply:
-#   cargo install --git https://github.com/mlloyd5/ptouch-rs.git --rev c6478c5 --locked ptouch-cli
+#   cargo install --git https://github.com/mlloyd5/ptouch-rs.git --rev 30ca09e --locked ptouch-cli
 set -euo pipefail
 
 PTOUCH_RS_REPO="${PTOUCH_RS_REPO:-https://github.com/mlloyd5/ptouch-rs.git}"
-PTOUCH_RS_COMMIT="${PTOUCH_RS_COMMIT:-c6478c5}"   # pt-e310bt-status-notification on top of v0.14.0
+PTOUCH_RS_COMMIT="${PTOUCH_RS_COMMIT:-30ca09e}"   # pt-e310bt-status-notification on top of v0.14.0
 RUST_IMAGE="${RUST_IMAGE:-rust:1-bullseye}"
 
 arch="${1:-$(uname -m)}"

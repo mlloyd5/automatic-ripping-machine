@@ -992,7 +992,7 @@ function InstallSleeveLabels() {
   # fork, which carries the PT-E310BT status fix until it is released upstream (a git dependency, no
   # release involved), with a throwaway Rust toolchain; the upstream .deb is the fallback.
   local ptouch_git="https://github.com/mlloyd5/ptouch-rs.git"
-  local ptouch_commit="c6478c5"
+  local ptouch_commit="30ca09e"
   local ptouch_fallback="https://github.com/vowstar/ptouch-rs/releases/download/v0.14.0/ptouch_0.14.0_$(dpkg --print-architecture).deb"
   if ! command -v ptouch >/dev/null 2>&1; then
     if curl -fsSL https://sh.rustup.rs -o /tmp/rustup.sh && \
