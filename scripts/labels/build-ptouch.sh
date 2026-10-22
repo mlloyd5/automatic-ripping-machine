@@ -1,7 +1,8 @@
 #!/bin/bash
 # Build the ptouch command line tool (ptouch-rs) from a pinned commit of the mlloyd5/ptouch-rs fork,
 # which carries the PT-E310BT status fix until it is released upstream. Needs Docker; the build runs in
-# a Debian bookworm Rust image, so the binary runs on Debian 12+/Ubuntu 24.04+ (glibc 2.36 or newer).
+# a Debian bullseye Rust image (glibc 2.31), so the binary runs on Debian 11+/Ubuntu 22.04+, including
+# the ARM Docker image. The Dockerfile and the Debian installer do the same build themselves.
 #
 #   scripts/labels/build-ptouch.sh [amd64|arm64] [output dir]
 #
@@ -13,7 +14,7 @@ set -euo pipefail
 
 PTOUCH_RS_REPO="${PTOUCH_RS_REPO:-https://github.com/mlloyd5/ptouch-rs.git}"
 PTOUCH_RS_COMMIT="${PTOUCH_RS_COMMIT:-c6478c5}"   # pt-e310bt-status-notification on top of v0.14.0
-RUST_IMAGE="${RUST_IMAGE:-rust:1-bookworm}"
+RUST_IMAGE="${RUST_IMAGE:-rust:1-bullseye}"
 
 arch="${1:-$(uname -m)}"
 case "$arch" in
@@ -31,4 +32,9 @@ docker run --rm --platform "$platform" -v "$(cd "$out" && pwd):/out" "$RUST_IMAG
   cp /opt/ptouch/bin/ptouch /out/ptouch-linux-$suffix
   /out/ptouch-linux-$suffix --version
 "
+if [ ! -f "$out/ptouch-linux-$suffix" ]; then
+  echo "the container built ptouch but nothing arrived in $out: Docker cannot write there (on Docker Desktop" \
+       "only shared folders such as your home directory work)" >&2
+  exit 1
+fi
 echo "wrote $out/ptouch-linux-$suffix"

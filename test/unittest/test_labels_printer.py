@@ -16,10 +16,10 @@ _spec.loader.exec_module(printer)
 class TestBuildCommand(unittest.TestCase):
     def test_default_template(self):
         self.assertEqual(printer.build_command(printer.DEFAULT_COMMAND, "/tmp/l.png"),
-                         ["ptouch", "print", "--job-timeout", "20", "-i", "/tmp/l.png"])
+                         ["ptouch", "print", "-i", "/tmp/l.png"])
 
     def test_blank_template_uses_default(self):
-        default = ["ptouch", "print", "--job-timeout", "20", "-i", "/tmp/l.png"]
+        default = ["ptouch", "print", "-i", "/tmp/l.png"]
         self.assertEqual(printer.build_command("", "/tmp/l.png"), default)
         self.assertEqual(printer.build_command(None, "/tmp/l.png"), default)
 
@@ -76,7 +76,7 @@ class TestPrintImage(unittest.TestCase):
             output = printer.print_image("/tmp/l.png", timeout=7, runner=run)
         self.assertEqual(output, "printed 1 label")
         argv, kwargs = run.calls[0]
-        self.assertEqual(argv, ["ptouch", "print", "--job-timeout", "20", "-i", "/tmp/l.png"])
+        self.assertEqual(argv, ["ptouch", "print", "-i", "/tmp/l.png"])
         self.assertEqual(kwargs["timeout"], 7)
 
     def test_unconfirmed_completion_counts_as_printed(self):
