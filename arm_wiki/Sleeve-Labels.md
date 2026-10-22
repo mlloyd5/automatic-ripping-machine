@@ -48,26 +48,10 @@ sudo udevadm control --reload-rules && sudo udevadm trigger
 
 Check it from the `arm` user: `ptouch doctor` lists the printer and the tape it has loaded, `ptouch print "hello"` prints a test label.
 
-### Docker
+Two things seen with the PT-E310BT (checked over USB from a Mac, 2026-10-21):
 
-Pass the USB bus into the container (the device path changes when the printer is re-plugged, so pass the whole bus rather than one device) in `start_arm_container.sh`:
-
-```bash
-    --device="/dev/bus/usb:/dev/bus/usb" \
-```
-
-The image installs ptouch-rs and the udev rule, but udev does not run inside the container: install the rule on the host as above so `usblp` is unbound there. The container runs `--privileged` already, which covers the device permissions.
-
-### Proxmox LXC
-
-For an unprivileged container, allow USB character devices and bind the bus in the container's config (`/etc/pve/lxc/<id>.conf`):
-
-```
-lxc.cgroup2.devices.allow: c 189:* rwm
-lxc.mount.entry: /dev/bus/usb dev/bus/usb none bind,optional,create=dir
-```
-
-and install the udev rule on the Proxmox host, not in the container, since the host's kernel owns `usblp`. Inside the container the device must be readable by the `arm` user's group; the host rule's `GROUP="plugdev"` maps to a host gid, so either give the container's `arm` user that mapped gid or use `MODE="0666"` in the rule on the host.
+- **Stock ptouch-rs never sees the job finish.** Brother's raster reference for this model says automatic status notification is off until the host sends `ESC i !`, and ptouch-rs 0.14.0 only sends it to the PT-P710BT. So the label prints, but the tool waits for a "printing completed" status that never comes and exits 1 after its `--job-timeout` with *Label sent, but completion is unconfirmed*. ARM treats that outcome as printed, and the default `LABEL_PRINTER_CMD` sets `--job-timeout 20` so the wait is short. The fix is a device-table change in ptouch-rs: [mlloyd5/ptouch-rs](https://github.com/mlloyd5/ptouch-rs) branch `pt-e310bt-status-notification` opts the PT-E310BT into notification, the readiness wait and precut, and was checked on the printer (plain print returns in 5 s with completion; `--precut` feeds, waits for the cut, prints). With that build, drop `--job-timeout 20` from the command. Keep `LABEL_TIMEOUT` above whatever `--job-timeout` is in use.
+- **Each print starts with about 24 mm of blank tape**, the distance from the print head to the cutter; the label image itself has no margin before the QR code. The printer's cutter is manual. With the patched tool, `--precut` in `LABEL_PRINTER_CMD` makes the printer feed, stop and wait for the blank lead to be cut, then print the label with no white space in front, exactly as a print from the keypad does; `--chain` skips the feed after each label, which suits flushing a queue as one strip to cut between labels.
 
 ## Configuration
 
@@ -78,9 +62,9 @@ All settings live in `arm.yaml` (Settings > Ripper Settings in the UI) under the
 | `LABEL_ENABLED` | `false` | Turn the feature on. Boxes can be assigned without it; nothing prints. |
 | `LABEL_AUTO_PRINT` | `true` | Print as soon as a DVD or Blu-ray rip finishes. Off: the label waits in the queue (the id is assigned either way). |
 | `LABEL_TAPE_MM` | `18` | Tape width loaded: 6, 9, 12, 18 or 24. Sets the label height. |
-| `LABEL_PRINTER_CMD` | `ptouch print -i {image}` | Command that prints a PNG; `{image}` is the file. Any tool works, e.g. `ptouch-print --image {image}`. |
+| `LABEL_PRINTER_CMD` | `ptouch print --job-timeout 20 -i {image}` | Command that prints a PNG; `{image}` is the file. Any tool works, e.g. `ptouch-print --image {image}`. |
 | `LABEL_USB` | blank | ptouch-rs `--usb BUS:ADDRESS` (from `ptouch doctor`) when more than one printer is attached. |
-| `LABEL_TIMEOUT` | `60` | Seconds to wait for the printer command. |
+| `LABEL_TIMEOUT` | `60` | Seconds to wait for the printer command before killing it; keep it above the tool's own `--job-timeout`. |
 | `LABEL_ID_PREFIX` | blank | Machine prefix of the ids, 1-4 letters or digits. Blank: the first two characters of the hostname. Give each box its own; changing it later starts a second sequence. |
 | `LABEL_MAX_MM` | `90` | Longest label. Long titles are shrunk, then shortened with an ellipsis. |
 | `LABEL_FONT` | blank | TrueType font for the text. Blank finds DejaVu Sans Bold (installed by the installer and the image) or another bold font. |
@@ -110,4 +94,4 @@ The backfill goes through jobs oldest first, so the ids follow the order the dis
 
 ## What was tested
 
-The renderer, printer wrapper, id assignment, Boxes page and API have unit tests (`test/unittest/test_labels_*.py`, `test_ui_boxes.py`). Nothing has been run against a real printer yet: the ptouch-rs support for the PT-E310BT comes from its model list, and the udev rule, the Docker and LXC device passthrough and the tape sizing were written from Brother's raster documentation. The first print on real hardware is the real check; `python3 -m arm.labels test out.png` followed by `ptouch print -i out.png` as the `arm` user is the way to do it before enabling auto-print.
+The renderer, printer wrapper, id assignment, Boxes page and API have unit tests (`test/unittest/test_labels_*.py`, `test_ui_boxes.py`). The label bitmaps were printed on a PT-E310BT over USB from a Mac (18 mm tape, USB id `04f9:2201`) with stock ptouch-rs 0.14.0 and with the patched build: the printer is detected, the label comes out at the right size, the QR scans, and the patched build reports completion and the cut wait. Not yet tried: the udev rule, the Docker and LXC device passthrough, and printing from inside ARM on the ripping box. `python3 -m arm.labels test out.png` followed by `ptouch print -i out.png` as the `arm` user is the check to run there before enabling auto-print.

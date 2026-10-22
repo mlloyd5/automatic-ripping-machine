@@ -146,7 +146,9 @@ def render_label(sleeve_id: str, lines: List[str], tape_mm: int = 18, font_path:
     gap = max(height // 14, 3)
 
     qr = qr_image(sleeve_id, height)
-    text_x = qr.width + gap * 2
+    # The QR code starts at the very edge: the printer adds its own blank lead (the head-to-cutter distance,
+    # about 24 mm on a P-touch), so any margin drawn here only adds to it. The QR's quiet zone is inside qr.
+    text_x = qr.width + gap
     max_width = mm_to_px(max_mm)
     text_width_limit = max_width - text_x - gap
 
@@ -162,7 +164,7 @@ def render_label(sleeve_id: str, lines: List[str], tape_mm: int = 18, font_path:
     width = max(min(text_x + widest + gap * 2, max_width), mm_to_px(min_mm))
 
     image = Image.new("1", (width, height), 1)
-    image.paste(qr, (gap, 0))
+    image.paste(qr, (0, 0))
     draw = ImageDraw.Draw(image)
     y = 0
     draw.text((text_x, y), headline, font=headline_font, fill=0)

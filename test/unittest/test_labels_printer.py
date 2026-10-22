@@ -16,11 +16,12 @@ _spec.loader.exec_module(printer)
 class TestBuildCommand(unittest.TestCase):
     def test_default_template(self):
         self.assertEqual(printer.build_command(printer.DEFAULT_COMMAND, "/tmp/l.png"),
-                         ["ptouch", "print", "-i", "/tmp/l.png"])
+                         ["ptouch", "print", "--job-timeout", "20", "-i", "/tmp/l.png"])
 
     def test_blank_template_uses_default(self):
-        self.assertEqual(printer.build_command("", "/tmp/l.png"), ["ptouch", "print", "-i", "/tmp/l.png"])
-        self.assertEqual(printer.build_command(None, "/tmp/l.png"), ["ptouch", "print", "-i", "/tmp/l.png"])
+        default = ["ptouch", "print", "--job-timeout", "20", "-i", "/tmp/l.png"]
+        self.assertEqual(printer.build_command("", "/tmp/l.png"), default)
+        self.assertEqual(printer.build_command(None, "/tmp/l.png"), default)
 
     def test_placeholder_inside_an_argument_and_missing_placeholder(self):
         self.assertEqual(printer.build_command("tool --image={image}", "/tmp/l.png"), ["tool", "--image=/tmp/l.png"])
@@ -28,9 +29,9 @@ class TestBuildCommand(unittest.TestCase):
                          ["ptouch-print", "--image", "/tmp/l.png"])
 
     def test_usb_selector_goes_after_the_program(self):
-        self.assertEqual(printer.build_command(printer.DEFAULT_COMMAND, "/tmp/l.png", usb="1:4"),
+        self.assertEqual(printer.build_command("ptouch print -i {image}", "/tmp/l.png", usb="1:4"),
                          ["ptouch", "--usb", "1:4", "print", "-i", "/tmp/l.png"])
-        self.assertEqual(printer.build_command(printer.DEFAULT_COMMAND, "/tmp/l.png", usb="  "),
+        self.assertEqual(printer.build_command("ptouch print -i {image}", "/tmp/l.png", usb="  "),
                          ["ptouch", "print", "-i", "/tmp/l.png"])
 
     def test_paths_with_spaces_survive(self):
@@ -75,8 +76,17 @@ class TestPrintImage(unittest.TestCase):
             output = printer.print_image("/tmp/l.png", timeout=7, runner=run)
         self.assertEqual(output, "printed 1 label")
         argv, kwargs = run.calls[0]
-        self.assertEqual(argv, ["ptouch", "print", "-i", "/tmp/l.png"])
+        self.assertEqual(argv, ["ptouch", "print", "--job-timeout", "20", "-i", "/tmp/l.png"])
         self.assertEqual(kwargs["timeout"], 7)
+
+    def test_unconfirmed_completion_counts_as_printed(self):
+        """The PT-E310BT never reports the job done; ptouch-rs then exits 1 after its job timeout."""
+        message = ("Error: Label sent, but completion is unconfirmed. "
+                   "Check the printer before retrying; the label may already have printed\n")
+        run = self._runner(returncode=1, stderr=message)
+        with mock.patch.object(printer.shutil, "which", return_value="/usr/bin/ptouch"):
+            output = printer.print_image("/tmp/l.png", runner=run)
+        self.assertIn("does not confirm", output)
 
     def test_missing_tool_is_a_printer_error_before_running(self):
         run = self._runner()

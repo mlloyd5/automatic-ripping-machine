@@ -11,8 +11,15 @@ import shutil
 import subprocess
 from typing import List, Optional, Tuple
 
-DEFAULT_COMMAND = "ptouch print -i {image}"
+DEFAULT_COMMAND = "ptouch print --job-timeout 20 -i {image}"
 IMAGE_PLACEHOLDER = "{image}"
+UNCONFIRMED_MARKER = "completion is unconfirmed"
+"""
+ptouch-rs sends the label, then waits for a "job done" status. The PT-E310BT never sends one (checked
+2026-10-21: the label prints, the tool waits until --job-timeout and exits 1 with "Label sent, but
+completion is unconfirmed"). That outcome counts as printed here; the short job timeout in the default
+command keeps a queue flush at seconds per label.
+"""
 
 
 class PrinterError(Exception):
@@ -58,7 +65,7 @@ def print_image(image_path: str, template: str = DEFAULT_COMMAND, usb: Optional[
 
     :param template: command template, see :func:`build_command`
     :param usb: ptouch-rs ``--usb BUS:ADDRESS`` selector, blank for the only printer
-    :param timeout: seconds before the tool is killed (a printer with an open cover hangs some tools)
+    :param timeout: seconds before the tool is killed; keep it above the tool's own --job-timeout
     :param runner: ``subprocess.run`` or a stand-in for tests
     :return: the tool's output, for the log
     :raises PrinterError: when the tool is missing, times out or exits non-zero
@@ -75,6 +82,8 @@ def print_image(image_path: str, template: str = DEFAULT_COMMAND, usb: Optional[
         raise PrinterError(f"printer command could not run: {error}") from None
     output = ((result.stdout or "") + (result.stderr or "")).strip()
     if result.returncode != 0:
+        if UNCONFIRMED_MARKER in output:
+            return "label sent; the printer does not confirm completion (normal for the PT-E310BT)"
         summary = output.splitlines()[-1] if output else "no output"
         raise PrinterError(f"printer command exited {result.returncode}: {summary}")
     return output
