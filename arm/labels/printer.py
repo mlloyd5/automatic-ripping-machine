@@ -11,14 +11,15 @@ import shutil
 import subprocess
 from typing import List, Optional, Tuple
 
-DEFAULT_COMMAND = "ptouch print --job-timeout 20 -i {image}"
+DEFAULT_COMMAND = "ptouch print -i {image}"
 IMAGE_PLACEHOLDER = "{image}"
 UNCONFIRMED_MARKER = "completion is unconfirmed"
 """
-ptouch-rs sends the label, then waits for a "job done" status. The PT-E310BT never sends one (checked
-2026-10-21: the label prints, the tool waits until --job-timeout and exits 1 with "Label sent, but
-completion is unconfirmed"). That outcome counts as printed here; the short job timeout in the default
-command keeps a queue flush at seconds per label.
+Stock ptouch-rs (up to 0.14.0) never switches the PT-E310BT's status notification on, so the label prints
+but the tool waits for a "printing completed" status that never comes and exits 1 after --job-timeout with
+"Label sent, but completion is unconfirmed". That outcome counts as printed here, so a stock build still
+works (give it a short --job-timeout). The build the installer fetches (mlloyd5/ptouch-rs 0.14.1) has the
+fix and returns as soon as the printer reports completion.
 """
 
 
