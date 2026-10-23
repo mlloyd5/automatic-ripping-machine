@@ -982,6 +982,43 @@ function CreateAndStartCameraService() {
   systemctl start armcamera
 }
 
+function InstallSleeveLabels() {
+  echo -e "${RED}Installing sleeve label support (Brother P-touch over USB)${NC}"
+  # Pillow and qrcode draw the label; a failure here must not stop the rest of the install
+  sudo -u arm /opt/arm/venv/bin/pip3 install -r /opt/arm/requirements-labels.txt || \
+    echo -e "${RED}Could not install the sleeve label Python packages; labels will be unavailable${NC}"
+  apt-get install -y fonts-dejavu-core libusb-1.0-0 libusb-1.0-0-dev pkg-config build-essential
+  # ptouch (ptouch-rs 0.14.1, the first release that handles the PT-E310BT) talks to the printer. The
+  # release .deb is tried first; it needs glibc 2.38 (Debian 13 / Ubuntu 24.04), so on an older system it
+  # is built from the release tag with a throwaway Rust toolchain instead.
+  local ptouch_version="0.14.1"
+  local ptouch_git="https://github.com/vowstar/ptouch-rs.git"
+  local ptouch_deb="https://github.com/vowstar/ptouch-rs/releases/download/v${ptouch_version}/ptouch_${ptouch_version}_$(dpkg --print-architecture).deb"
+  if ! command -v ptouch >/dev/null 2>&1; then
+    if curl -fsSL -o /tmp/ptouch.deb "$ptouch_deb" && dpkg -i /tmp/ptouch.deb >/dev/null 2>&1 && \
+        ptouch --version >/dev/null 2>&1; then
+      echo "Installed ptouch ${ptouch_version} from the release package"
+    else
+      dpkg -r ptouch >/dev/null 2>&1 || true
+      echo "The ptouch release package does not run here; building ${ptouch_version} from source"
+      if curl -fsSL https://sh.rustup.rs -o /tmp/rustup.sh && \
+          sudo -u arm sh /tmp/rustup.sh -y --profile minimal --no-modify-path >/dev/null && \
+          sudo -u arm /home/arm/.cargo/bin/cargo install --git "$ptouch_git" --tag "v${ptouch_version}" --locked \
+            --root /home/arm/ptouch ptouch-cli; then
+        install -m 0755 /home/arm/ptouch/bin/ptouch /usr/local/bin/ptouch
+      else
+        echo -e "${RED}ptouch could be neither installed nor built; sleeve labels will not print${NC}"
+      fi
+      rm -rf /home/arm/.rustup /home/arm/.cargo /home/arm/ptouch
+    fi
+    rm -f /tmp/rustup.sh /tmp/ptouch.deb
+  fi
+  # Let the arm user reach the printer and keep the kernel's usblp driver off it
+  cp /opt/arm/setup/99-arm-ptouch.rules /etc/udev/rules.d/99-arm-ptouch.rules
+  usermod -aG plugdev arm
+  udevadm control --reload-rules && udevadm trigger
+}
+
 function LaunchSetup() {
   echo -e "${RED}Launching ArmUI first-time setup${NC}"
 
@@ -1058,4 +1095,5 @@ MountDrives
 SetupFolders
 CreateAndStartService
 CreateAndStartCameraService
+InstallSleeveLabels
 LaunchSetup

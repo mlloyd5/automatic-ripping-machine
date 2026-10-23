@@ -374,6 +374,7 @@ def feed_json():
             'mode': mode,
             'config_id': request.args.get('config_id'),
             'notify_id': request.args.get('notify_id'),
+            'box': request.args.get('box'),
             'notify_timeout': {'funct': json_api.get_notify_timeout, 'args': ('notify_timeout',)},
             'restart': {'funct': json_api.restart_ui, 'args': ()},
         }
@@ -396,7 +397,11 @@ def feed_json():
             'send_item': {'funct': ui_utils.send_to_remote_db, 'args': ('j_id',)},
             'change_job_params': {'funct': json_api.change_job_params, 'args': ('config_id',)},
             'read_notification': {'funct': json_api.read_notification, 'args': ('notify_id',)},
-            'notify_timeout': {'funct': json_api.get_notify_timeout, 'args': ('notify_timeout',)}
+            'notify_timeout': {'funct': json_api.get_notify_timeout, 'args': ('notify_timeout',)},
+            'set_box': {'funct': json_api.set_box, 'args': ('j_id', 'box')},
+            'print_label': {'funct': json_api.print_label, 'args': ('j_id',)},
+            'pending_labels': {'funct': json_api.pending_labels, 'args': ()},
+            'print_pending': {'funct': json_api.print_pending, 'args': ()}
         }
     else:
         valid_data = {

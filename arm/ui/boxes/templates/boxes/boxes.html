@@ -1,0 +1,148 @@
+{% extends "base.html" %}
+{% block title %}Boxes{% endblock %}
+{% block nav %}{{ super() }}{% endblock %}
+
+{% block content %}
+<div class="container content">
+    <div class="row">
+        <div class="col-12">
+            <div class="jumbotron">
+                <div class="row">
+                    <div class="col-sm-12 rounded text-center">
+                        <h3>Sleeves and boxes</h3>
+                        <p class="mb-1">{{ labelled }} labelled disc{{ 's' if labelled != 1 }},
+                            {{ groups|box_count }} box{{ 'es' if groups|box_count != 1 }},
+                            {{ unfiled }} not filed yet. This machine's ids start with <code>{{ prefix }}-</code>.</p>
+                        {% if not enabled %}
+                            <p class="text-warning mb-1">Sleeve labels are off: set <code>LABEL_ENABLED</code> to true in
+                                Settings &gt; Ripper Settings to print labels. Boxes can be assigned either way.</p>
+                        {% elif not printer_ok[0] %}
+                            <p class="text-warning mb-1">Printer tool not found: {{ printer_ok[1] }}</p>
+                        {% endif %}
+                        <a class="btn btn-secondary btn-sm mt-2" href="boxes/export.csv">Export CSV</a>
+                    </div>
+                </div>
+            </div>
+
+            {% if pending %}
+                <div class="card mb-3 border-warning">
+                    <div class="card-header">
+                        <strong>Labels to print</strong>
+                        <span class="text-muted">{{ pending|length }} waiting</span>
+                        <form method="post" action="boxes/print_pending" class="d-inline float-right">
+                            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                            <button type="submit" class="btn btn-sm btn-primary" {% if not enabled %}disabled{% endif %}>Print pending</button>
+                        </form>
+                    </div>
+                    <div class="table-responsive">
+                        <table class="table table-sm table-striped mb-0">
+                            <thead><tr><th>Sleeve</th><th>Title</th><th>Type</th><th>Ripped</th></tr></thead>
+                            <tbody>
+                            {% for job in pending %}
+                                <tr>
+                                    <td><a href="jobdetail?job_id={{ job.job_id }}">{{ job.sleeve_id }}</a></td>
+                                    <td>{{ job.title or job.label or 'Title unknown' }}{% if job.year %} ({{ job.year }}){% endif %}</td>
+                                    <td>{{ disc_type_name(job) }}</td>
+                                    <td>{{ job.start_time.strftime('%Y-%m-%d') if job.start_time else '' }}</td>
+                                </tr>
+                            {% endfor %}
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            {% endif %}
+
+            <div class="row">
+                <div class="col-md-6">
+                    <div class="card mb-3">
+                        <div class="card-header"><strong>File sleeves into a box</strong></div>
+                        <div class="card-body">
+                            <p class="text-muted small">Name the box, then scan each sleeve's QR code (or type its id and
+                                press Enter). The box name stays until you change it.</p>
+                            <form method="post" action="boxes/file" id="fileForm" autocomplete="off">
+                                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                                <div class="form-group">
+                                    <label for="box" class="mb-0 font-weight-bold">Box</label>
+                                    <input type="text" class="form-control" id="box" name="box" value="{{ box }}"
+                                           maxlength="64" placeholder="e.g. Box 03" {% if not box %}autofocus{% endif %}>
+                                </div>
+                                <div class="form-group">
+                                    <label for="sleeve_id" class="mb-0 font-weight-bold">Sleeve id</label>
+                                    <input type="text" class="form-control" id="sleeve_id" name="sleeve_id" value=""
+                                           maxlength="16" placeholder="{{ prefix }}-0042" {% if box %}autofocus{% endif %}>
+                                </div>
+                                <button type="submit" class="btn btn-primary">File it</button>
+                            </form>
+                        </div>
+                    </div>
+                </div>
+                <div class="col-md-6">
+                    <div class="card mb-3">
+                        <div class="card-header"><strong>Find a disc</strong></div>
+                        <div class="card-body">
+                            <form method="get" action="boxes" autocomplete="off">
+                                <div class="form-group">
+                                    <label for="q" class="mb-0 font-weight-bold">Sleeve id or title</label>
+                                    <input type="text" class="form-control" id="q" name="q" value="{{ query }}"
+                                           placeholder="{{ prefix }}-0042, 42 or Jaws">
+                                </div>
+                                <button type="submit" class="btn btn-primary">Find</button>
+                            </form>
+                            {% if results is not none %}
+                                <hr>
+                                {% if results %}
+                                    <table class="table table-sm table-striped mb-0">
+                                        <thead><tr><th>Sleeve</th><th>Title</th><th>Box</th></tr></thead>
+                                        <tbody>
+                                        {% for job in results %}
+                                            <tr>
+                                                <td><a href="jobdetail?job_id={{ job.job_id }}">{{ job.sleeve_id or '—' }}</a></td>
+                                                <td>{{ job.title or job.label or 'Title unknown' }}{% if job.year %} ({{ job.year }}){% endif %}
+                                                    <small class="text-muted">{{ disc_type_name(job) }}</small></td>
+                                                <td>{% if job.box %}<strong>{{ job.box }}</strong>{% elif job.sleeve_id %}<em>not filed</em>{% else %}<em>no label</em>{% endif %}</td>
+                                            </tr>
+                                        {% endfor %}
+                                        </tbody>
+                                    </table>
+                                {% else %}
+                                    <p class="mb-0">Nothing matches <strong>{{ query }}</strong>.</p>
+                                {% endif %}
+                            {% endif %}
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            {% for name, jobs in groups.items() %}
+                <div class="card mb-3">
+                    <div class="card-header">
+                        <strong>{{ name if name else 'Not filed in a box yet' }}</strong>
+                        <span class="text-muted">{{ jobs|length }} disc{{ 's' if jobs|length != 1 }}</span>
+                        {% if name %}<a class="btn btn-sm btn-outline-secondary float-right" href="boxes?box={{ name|urlencode }}">Add to this box</a>{% endif %}
+                    </div>
+                    <div class="table-responsive">
+                        <table class="table table-sm table-striped mb-0">
+                            <thead><tr><th>Sleeve</th><th>Title</th><th>Type</th><th>Ripped</th></tr></thead>
+                            <tbody>
+                            {% for job in jobs %}
+                                <tr>
+                                    <td><a href="jobdetail?job_id={{ job.job_id }}">{{ job.sleeve_id }}</a></td>
+                                    <td>{{ job.title or job.label or 'Title unknown' }}{% if job.year %} ({{ job.year }}){% endif %}</td>
+                                    <td>{{ disc_type_name(job) }}</td>
+                                    <td>{{ job.start_time.strftime('%Y-%m-%d') if job.start_time else '' }}</td>
+                                </tr>
+                            {% endfor %}
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            {% else %}
+                <div class="card mb-3"><div class="card-body">No labels printed yet. Labels are printed when a rip finishes
+                    (with <code>LABEL_AUTO_PRINT</code>) or from a job's page; discs ripped before the feature was turned on get
+                    theirs with <code>python3 -m arm.labels backfill</code>.</div></div>
+            {% endfor %}
+        </div>
+    </div>
+</div>
+{% endblock %}
+{% block footer %}{{ super() }}{% endblock %}

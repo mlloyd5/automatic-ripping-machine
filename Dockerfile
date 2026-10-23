@@ -1,4 +1,15 @@
 ###########################################################
+# Sleeve labels: build ptouch (ptouch-rs, 0.14.1 or later for the PT-E310BT) from its release tag. The
+# upstream .deb is built on Ubuntu 24.04 and needs glibc 2.38, which the Ubuntu 22.04 base below lacks,
+# so it is built here on Debian bullseye (glibc 2.31) instead.
+FROM rust:1-bullseye AS ptouch-build
+ARG PTOUCH_RS_REPO=https://github.com/vowstar/ptouch-rs.git
+ARG PTOUCH_RS_TAG=v0.14.1
+RUN apt-get update && apt-get install -y --no-install-recommends libusb-1.0-0-dev pkg-config && \
+    rm -rf /var/lib/apt/lists/* && \
+    cargo install --git "${PTOUCH_RS_REPO}" --tag "${PTOUCH_RS_TAG}" --locked --root /opt/ptouch ptouch-cli
+
+###########################################################
 # setup default directories and configs
 FROM automaticrippingmachine/arm-dependencies:1.8.0 AS base
 
@@ -53,6 +64,17 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/* && \
     pip3 install --no-cache-dir --prefer-binary -r /tmp/requirements-camera.txt && \
     rm /tmp/requirements-camera.txt
+
+# Sleeve labels: Pillow and qrcode draw the label, ptouch (built above) sends it to a Brother P-touch over
+# USB; the udev rule gives the arm user the printer and keeps usblp off it.
+COPY ./requirements-labels.txt /tmp/requirements-labels.txt
+COPY ./setup/99-arm-ptouch.rules /etc/udev/rules.d/99-arm-ptouch.rules
+COPY --from=ptouch-build /opt/ptouch/bin/ptouch /usr/local/bin/ptouch
+RUN pip3 install --no-cache-dir --prefer-binary -r /tmp/requirements-labels.txt && \
+    rm /tmp/requirements-labels.txt && \
+    apt-get update && apt-get install -y --no-install-recommends fonts-dejavu-core libusb-1.0-0 && \
+    rm -rf /var/lib/apt/lists/* && \
+    ptouch --version
 
 # Add ARMui service
 RUN mkdir /etc/service/armui

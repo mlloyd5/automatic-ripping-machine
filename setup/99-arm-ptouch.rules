@@ -1,0 +1,7 @@
+# Brother P-touch label printers for ARM sleeve labels (arm/labels).
+# The ptouch-rs package ships its own rule with the uaccess tag, which only helps users logged in at
+# a seat; ARM runs as a service, so this one gives the arm group (plugdev on a stock install) the
+# device, and unbinds the kernel's usblp driver so libusb can claim the printer.
+SUBSYSTEM=="usb", ATTRS{idVendor}=="04f9", ENV{ID_USB_INTERFACES}=="*:0701??:*", MODE="0660", GROUP="plugdev"
+ACTION=="add", SUBSYSTEM=="usb", ATTRS{idVendor}=="04f9", ENV{ID_USB_INTERFACES}=="*:0701??:*", \
+  RUN+="/bin/sh -c 'for i in /sys/bus/usb/drivers/usblp/%k:*; do [ -e \"$i\" ] && echo \"${i##*/}\" > /sys/bus/usb/drivers/usblp/unbind; done'"

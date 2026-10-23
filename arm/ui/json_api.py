@@ -605,3 +605,71 @@ def restart_ui():
     app.logger.debug(f"Arm ui shutdown ran into a problem... exit code: {shutdown_code}")
     return_json = {'success': False, 'error': f"Shutting down A.R.M UI....exit code: {shutdown_code}"}
     return return_json
+
+
+def _sleeve_job(job_id, mode):
+    try:
+        job = Job.query.get(int(job_id))
+    except (TypeError, ValueError):
+        job = None
+    if job is None:
+        return None, {'success': False, 'mode': mode, 'job': job_id, 'error': 'Not a valid job'}
+    return job, None
+
+
+def set_box(job_id, box):
+    """
+    Record the box a sleeve was filed in: json?mode=set_box&job=42&box=Box%2003 (blank box clears it)
+    :param job_id: the job whose sleeve was filed
+    :param box: box name
+    :return: json
+    """
+    from arm.labels import sleeve
+    job, error = _sleeve_job(job_id, 'set_box')
+    if error:
+        return error
+    try:
+        stored = sleeve.set_box(job, box)
+    except RuntimeError as err:
+        return {'success': False, 'mode': 'set_box', 'job': job.job_id, 'error': str(err)}
+    return {'success': True, 'mode': 'set_box', 'job': job.job_id, 'sleeve_id': job.sleeve_id, 'box': stored}
+
+
+def print_label(job_id):
+    """
+    Print (or reprint) a job's sleeve label: json?mode=print_label&job=42
+    :param job_id: the job
+    :return: json with the sleeve id and the printer's message
+    """
+    from arm.labels import sleeve
+    job, error = _sleeve_job(job_id, 'print_label')
+    if error:
+        return error
+    printed, message = sleeve.print_label(job, reason="json api")
+    return {'success': printed, 'mode': 'print_label', 'job': job.job_id, 'sleeve_id': job.sleeve_id,
+            'message': message}
+
+
+def pending_labels():
+    """
+    The print queue: json?mode=pending_labels
+    :return: json with one entry per job whose label has not been printed yet
+    """
+    from arm.labels import sleeve
+    jobs = sleeve.pending_jobs()
+    return {'success': True, 'mode': 'pending_labels', 'prefix': sleeve.id_prefix(), 'count': len(jobs),
+            'jobs': [{'job_id': job.job_id, 'sleeve_id': job.sleeve_id, 'title': job.title, 'year': job.year,
+                      'disc_type': sleeve.disc_type_name(job)} for job in jobs]}
+
+
+def print_pending():
+    """
+    Print every queued label, oldest first, stopping at the first failure: json?mode=print_pending
+    :return: json with what was printed and what is still waiting
+    """
+    from arm.labels import sleeve
+    results = sleeve.print_pending(stop_on_error=True)
+    failed = [r for r in results if not r['printed']]
+    return {'success': not failed, 'mode': 'print_pending',
+            'printed': [r['sleeve_id'] for r in results if r['printed']],
+            'error': failed[0]['message'] if failed else '', 'pending': len(sleeve.pending_jobs())}
