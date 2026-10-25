@@ -33,22 +33,51 @@ Safety rules:
 The shipper may run outside ARM's container (e.g. on the Docker or Proxmox
 host): ``arm_completed_path`` is COMPLETED_PATH as ARM writes it into
 ``job.path`` and ``completed_path`` is the same folder as seen by this script.
+
+Catalog records:
+
+* With ``remote_catalog_path`` set, every recognized folder that ships also
+  leaves a small TOML record there: what ARM knew about the disc (title, year,
+  type, metadata id, disc label and type, sleeve id, case barcode) and every
+  media file shipped with what its Matroska header says (size, duration,
+  resolution, codecs, chapters).  A media catalog that keeps discs, cases and
+  files as records can be fed from these instead of a separate probe.
+* The record is built while the files are still local, written to
+  ``catalog_spool_path`` once rsync has delivered the folder, then shipped
+  with its own rsync and removed from the spool.  A record whose transfer
+  failed waits in the spool and goes on the next run, before anything else.
 """
 
 import argparse
 import configparser
+import datetime
 import fcntl
 import logging
 import os
 import shlex
+import socket
 import sqlite3
 import subprocess
 import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import mkvheader  # noqa: E402
 
 RECOGNIZED = ("movies", "tv")
 UNIDENTIFIED = "unidentified"
 SUCCESS_STATUS = "success"
 FINISHED_STATUSES = ("success", "fail")
+VIDEO_TYPES = {"movies": "movie", "tv": "series"}
+RECORD_SUFFIX = ".toml"
+MEDIA_EXTENSIONS = (".mkv", ".mp4", ".m4v", ".webm", ".avi", ".ts")
+"""Files a job folder holds that belong in a media catalog; sidecars (disc.jpg, disc.barcode, posters) do not."""
+UHD_MIN_WIDTH = 3000
+HD_MIN_WIDTH = 1280
+
+JOB_COLUMNS = ("job_id", "status", "path", "title", "title_manual", "year", "year_manual", "video_type",
+               "imdb_id", "label", "disctype", "disc_barcode", "disc_barcode_title", "sleeve_id", "box",
+               "stop_time")
+"""Columns read from ARM's job table when present; a stock ARM lacks the fork's disc_barcode and sleeve ones."""
 
 DEFAULTS = {
     "db_path": "/home/arm/db/arm.db",
@@ -58,6 +87,9 @@ DEFAULTS = {
     "remote_movies_path": "",
     "remote_tv_path": "",
     "remote_unidentified_path": "",
+    "remote_catalog_path": "",
+    "catalog_spool_path": "",
+    "ripper_name": "",
     "bwlimit_recognized": "0",
     "bwlimit_unidentified": "0",
     "ssh_options": "-o BatchMode=yes",
@@ -97,6 +129,11 @@ def load_config(path, overrides=None):
     for key in ("remote_movies_path", "remote_tv_path", "remote_unidentified_path"):
         if not cfg[key]:
             raise ShipperError(f"{key} must be set")
+    # Catalog records are optional; the spool sits beside movies/, tv/ and unidentified/,
+    # which the shipper never lists, and the ripper is named after this box by default.
+    cfg["catalog_spool_path"] = os.path.realpath(cfg["catalog_spool_path"]
+                                                 or os.path.join(cfg["completed_path"], "catalog"))
+    cfg["ripper_name"] = cfg["ripper_name"].strip() or socket.gethostname().split(".")[0]
     return cfg
 
 
@@ -117,47 +154,74 @@ def bwlimit_for(cfg, sub_folder):
 
 # --------------------------------------------------------------------------- database
 
-def finished_job_paths(db_path, completed_path, arm_completed_path=None):
+def read_jobs(db_path):
     """
-    Return the set of local job folders under COMPLETED_PATH that are safe to ship.
+    Every job row that has a path, as a dict of the :data:`JOB_COLUMNS` this database has.
 
-    A folder qualifies when at least one job with that path has status
-    ``success`` and no job with that path is still unfinished.  The DB is only
-    read; ARM keeps writing to it while we run.
-
-    ``job.path`` holds the path as ARM sees it (``arm_completed_path``, e.g. a
-    path inside ARM's container).  Rows outside that prefix are ignored; the rest
-    are translated to ``completed_path`` (the same folder on this box) and
-    resolved so they compare equal to what :func:`pending_folders` returns.
+    The DB is opened read-only; ARM keeps writing to it while we run.  Columns the
+    fork added (sleeve id, barcode) are simply absent on a stock ARM database.
     """
     if not os.path.exists(db_path):
         raise ShipperError(f"ARM database not found: {db_path}")
     uri = f"file:{db_path}?mode=ro"
     conn = sqlite3.connect(uri, uri=True, timeout=30)
     try:
-        rows = conn.execute("SELECT path, status FROM job WHERE path IS NOT NULL AND path != ''").fetchall()
+        present = {row[1] for row in conn.execute("PRAGMA table_info(job)")}
+        columns = [column for column in JOB_COLUMNS if column in present]
+        if "path" not in columns or "status" not in columns:
+            raise ShipperError(f"{db_path} has no job table with path and status columns")
+        rows = conn.execute(f"SELECT {', '.join(columns)} FROM job WHERE path IS NOT NULL AND path != ''").fetchall()
     finally:
         conn.close()
+    return [dict(zip(columns, row)) for row in rows]
 
+
+def local_folder_for(job_path, completed_path, arm_completed_path=None):
+    """
+    Translate ``job.path`` to the same folder on this box, or None when it is not under COMPLETED_PATH.
+
+    ``job.path`` holds the path as ARM sees it (``arm_completed_path``, e.g. a
+    path inside ARM's container).  The rest is translated to ``completed_path``
+    and resolved so it compares equal to what :func:`pending_folders` returns.
+    """
     arm_root = os.path.normpath(arm_completed_path or completed_path)
     prefix = arm_root.rstrip(os.sep) + os.sep
-    statuses = {}
-    for path, status in rows:
-        norm = os.path.normpath(path)
-        if not norm.startswith(prefix):
-            continue
-        local = os.path.realpath(os.path.join(completed_path, norm[len(prefix):]))
-        statuses.setdefault(local, set()).add(status)
+    norm = os.path.normpath(job_path)
+    if not norm.startswith(prefix):
+        return None
+    return os.path.realpath(os.path.join(completed_path, norm[len(prefix):]))
 
-    shippable = set()
-    for path, seen in statuses.items():
+
+def finished_jobs(db_path, completed_path, arm_completed_path=None):
+    """
+    Return ``{local job folder: job row}`` for every folder under COMPLETED_PATH that is safe to ship.
+
+    A folder qualifies when at least one job with that path has status
+    ``success`` and no job with that path is still unfinished.  The row kept is
+    the newest successful job, which is the one whose rip the folder holds.
+    """
+    by_folder = {}
+    for job in read_jobs(db_path):
+        local = local_folder_for(job["path"], completed_path, arm_completed_path)
+        if local is not None:
+            by_folder.setdefault(local, []).append(job)
+
+    shippable = {}
+    for path, jobs in by_folder.items():
+        seen = {job["status"] for job in jobs}
         if SUCCESS_STATUS not in seen:
             continue
         if any(status not in FINISHED_STATUSES for status in seen):
             log.debug("skipping %s: another job on that path is still %s", path, sorted(seen))
             continue
-        shippable.add(path)
+        successes = [job for job in jobs if job["status"] == SUCCESS_STATUS]
+        shippable[path] = max(successes, key=lambda job: job.get("job_id") or 0)
     return shippable
+
+
+def finished_job_paths(db_path, completed_path, arm_completed_path=None):
+    """The set of local job folders under COMPLETED_PATH that are safe to ship (see :func:`finished_jobs`)."""
+    return set(finished_jobs(db_path, completed_path, arm_completed_path))
 
 
 def pending_folders(cfg, sub_folder, shippable):
@@ -244,8 +308,19 @@ def run_post_ship_command(cfg, sub_folder, local_folder):
         log.warning("post_ship_command exited %d for %s", result.returncode, local_folder)
 
 
-def ship_folder(cfg, sub_folder, local_folder, dry_run=False, verbose=False):
-    """Rsync one job folder and remove the local copy on success.  Returns True on success."""
+def ship_folder(cfg, sub_folder, local_folder, dry_run=False, verbose=False, job=None, stats=None):
+    """
+    Rsync one job folder and remove the local copy on success.  Returns True on success.
+
+    With ``job`` (its ARM database row) and ``remote_catalog_path`` set, a catalog
+    record is built from the files before rsync removes them and shipped after
+    the folder.  A record that fails to ship stays in the spool for the next run;
+    the folder, already on the media box, still counts as shipped, but the run
+    exits 1 (``stats["failed"]``) so the problem is noticed.
+    """
+    record = None
+    if job is not None and cfg["remote_catalog_path"] and sub_folder != UNIDENTIFIED:
+        record = catalog_record(cfg, sub_folder, local_folder, job)
     cmd = build_rsync_command(cfg, sub_folder, local_folder, dry_run=dry_run, verbose=verbose)
     log.info("shipping [%s] %s -> %s", sub_folder, local_folder, cmd[-1])
     log.debug("rsync argv: %s", " ".join(shlex.quote(part) for part in cmd))
@@ -255,21 +330,257 @@ def ship_folder(cfg, sub_folder, local_folder, dry_run=False, verbose=False):
         return False
     if dry_run:
         log.info("dry run: would remove %s", local_folder)
+        if record:
+            log.info("dry run: would write catalog record %s", record[0])
+            log.debug("catalog record:\n%s", record[1])
         return True
     prune_empty_dirs(local_folder)
     if os.path.exists(local_folder):
         log.error("rsync succeeded but %s still has content; not treating as shipped", local_folder)
         return False
     log.info("shipped and removed %s", local_folder)
+    if record:
+        spooled = spool_record(cfg, *record)
+        if spooled and ship_record(cfg, spooled):
+            if stats is not None:
+                stats["records"] += 1
+        elif stats is not None:
+            stats["failed"] += 1
     run_post_ship_command(cfg, sub_folder, local_folder)
     return True
+
+
+# --------------------------------------------------------------------------- catalog records
+
+def _toml_string(value):
+    """A TOML basic string literal for ``value``."""
+    escaped = str(value).replace("\\", "\\\\").replace('"', '\\"')
+    escaped = "".join(ch if ch >= " " and ch != "\x7f" else "\\u%04X" % ord(ch) for ch in escaped)
+    return f'"{escaped}"'
+
+
+def _toml_value(value):
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int):
+        return str(value)
+    return _toml_string(value)
+
+
+def _toml_lines(pairs):
+    """``key = value`` lines for the (key, value) pairs whose value is not None."""
+    return [f"{key} = {_toml_value(value)}" for key, value in pairs if value is not None]
+
+
+def _clean(value):
+    """A stripped string, or None for an empty or missing database value."""
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _job_year(job):
+    year = _clean(job.get("year_manual")) or _clean(job.get("year"))
+    return int(year) if year and year.isdigit() and year != "0000" else None
+
+
+def _metadata_id(job):
+    """(key, value) for ARM's metadata id: ``imdb`` for tt..., ``tmdb`` for a bare number, else nothing."""
+    ident = _clean(job.get("imdb_id"))
+    if not ident:
+        return None, None
+    if ident.lower().startswith("tt") and ident[2:].isdigit():
+        return "imdb", ident.lower()
+    if ident.isdigit():
+        return "tmdb", int(ident)
+    return "metadata_id", ident
+
+
+def folder_media_files(local_folder):
+    """Relative paths (``/`` separated, sorted) of the media files under a job folder."""
+    found = []
+    for root, dirs, files in os.walk(local_folder):
+        dirs[:] = sorted(d for d in dirs if not d.startswith("."))
+        for name in sorted(files):
+            if name.startswith(".") or not name.lower().endswith(MEDIA_EXTENSIONS):
+                continue
+            relative = os.path.relpath(os.path.join(root, name), local_folder)
+            found.append(relative.replace(os.sep, "/"))
+    return found
+
+
+def disc_format(job, rows):
+    """``dvd``, ``bd`` or ``uhd`` from ARM's disc type and the widest picture in the shipped files."""
+    widths = []
+    for row in rows:
+        if row["resolution"]:
+            try:
+                widths.append(int(row["resolution"].split("x")[0]))
+            except ValueError:
+                pass
+    widest = max(widths) if widths else 0
+    disctype = (_clean(job.get("disctype")) or "").lower()
+    if disctype == "dvd":
+        return "dvd"
+    if widest >= UHD_MIN_WIDTH:
+        return "uhd"
+    if disctype == "bluray" or widest >= HD_MIN_WIDTH:
+        return "bd"
+    return "dvd" if widest else "bd"
+
+
+def record_name(cfg, job):
+    """``<stop time>-<ripper>-job<id>.toml``: sorts by rip time and is the same whenever the job is re-shipped."""
+    stamp = _clean(job.get("stop_time"))
+    try:
+        when = datetime.datetime.fromisoformat(stamp) if stamp else datetime.datetime.now()
+    except ValueError:
+        when = datetime.datetime.now()
+    return f"{when.strftime('%Y%m%d-%H%M%S')}-{cfg['ripper_name']}-job{job.get('job_id') or 0}{RECORD_SUFFIX}"
+
+
+def catalog_record(cfg, sub_folder, local_folder, job):
+    """
+    Build the catalog record for one job folder about to ship.
+
+    Reads the Matroska header of every media file in the folder, so it must run
+    before rsync removes them.  Returns ``(file name, TOML text)``, or None when
+    the folder holds no media file (nothing for a catalog to register).
+    """
+    files = folder_media_files(local_folder)
+    if not files:
+        log.warning("no media file in %s; no catalog record written", local_folder)
+        return None
+    folder = os.path.basename(local_folder.rstrip(os.sep))
+    library = f"{sub_folder}/{folder}"
+    rows = []
+    for relative in files:
+        row = mkvheader.probe_row(os.path.join(local_folder, relative))
+        stem = relative.rsplit(".", 1)[0]
+        row["path"] = f"{library}/{relative}"
+        row["main"] = "/" not in relative and stem == folder
+        if not row["probed"]:
+            log.debug("%s is not Matroska or unreadable; listed by size only", relative)
+        rows.append(row)
+    id_key, id_value = _metadata_id(job)
+    title = _clean(job.get("title_manual")) or _clean(job.get("title")) or folder
+    lines = ["# Catalog record written by the ARM completed-rip shipper for one shipped rip.",
+             "# What the ripper knew about the disc, then every media file it delivered with what the",
+             "# file's Matroska header says.  Consumed by the media catalog's import; safe to re-import."]
+    lines += _toml_lines([
+        ("ripper", cfg["ripper_name"]),
+        ("job", int(job.get("job_id") or 0)),
+        ("shipped", datetime.datetime.now().replace(microsecond=0).isoformat()),
+        ("type", VIDEO_TYPES.get(sub_folder, _clean(job.get("video_type")) or "unknown")),
+        ("title", title),
+        ("year", _job_year(job)),
+        (id_key, id_value),
+        ("library", library),
+        ("destination", os.path.join(remote_root_for(cfg, sub_folder), folder)),
+        ("label", _clean(job.get("label")) or ""),
+        ("format", disc_format(job, rows)),
+        ("role", "feature" if sub_folder == "tv" or any(row["main"] for row in rows) else "bonus"),
+        ("sleeve", _clean(job.get("sleeve_id"))),
+        ("box", _clean(job.get("box"))),
+        ("barcode", _clean(job.get("disc_barcode"))),
+        ("barcode_title", _clean(job.get("disc_barcode_title"))),
+    ])
+    for row in rows:
+        lines += ["", "[[files]]"] + _toml_lines([
+            ("path", row["path"]),
+            ("main", row["main"]),
+            ("size", int(row["size"])),
+            ("seconds", int(row["seconds"]) if row["seconds"] else None),
+            ("resolution", row["resolution"] or None),
+            ("video", row["video"] or None),
+            ("audio", row["audio"] or None),
+            ("subs", int(row["subs"]) if row["subs"] else None),
+            ("chapters", int(row["chapters"]) if row["chapters"] else None),
+            ("title", row["title"] or None),
+        ])
+    return record_name(cfg, job), "\n".join(lines) + "\n"
+
+
+def spool_record(cfg, name, text):
+    """Write a record into the spool.  Returns its path, or None when the spool is not writable."""
+    try:
+        os.makedirs(cfg["catalog_spool_path"], exist_ok=True)
+        path = os.path.join(cfg["catalog_spool_path"], name)
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(text)
+    except OSError as err:
+        log.error("could not write catalog record %s: %s", name, err)
+        return None
+    log.info("catalog record %s written", path)
+    return path
+
+
+def record_destination(cfg):
+    remote_dir = cfg["remote_catalog_path"].rstrip("/") + "/"
+    return f"{cfg['remote_host']}:{remote_dir}" if cfg["remote_host"] else remote_dir
+
+
+def build_record_rsync_command(cfg, record_path):
+    """rsync argv for one spooled record: the same ssh and timeout as the folders, no bwlimit, source kept."""
+    cmd = [cfg["rsync_path"], "-t", f"--timeout={int(cfg['rsync_timeout'])}"]
+    if cfg["remote_host"]:
+        ssh = "ssh"
+        if cfg["ssh_options"]:
+            ssh += " " + cfg["ssh_options"]
+        cmd.extend(["-s", "-e", ssh])
+    cmd.append(record_path)
+    cmd.append(record_destination(cfg))
+    return cmd
+
+
+def ship_record(cfg, record_path):
+    """Copy one spooled record to remote_catalog_path and drop it from the spool.  Returns True on success."""
+    cmd = build_record_rsync_command(cfg, record_path)
+    log.debug("rsync argv: %s", " ".join(shlex.quote(part) for part in cmd))
+    result = subprocess.run(cmd)
+    if result.returncode != 0:
+        log.error("rsync exited %d for catalog record %s; it stays in the spool for the next run",
+                  result.returncode, record_path)
+        return False
+    try:
+        os.remove(record_path)
+    except OSError as err:
+        log.warning("catalog record %s shipped but could not be removed from the spool: %s", record_path, err)
+    log.info("catalog record %s -> %s", os.path.basename(record_path), cmd[-1])
+    return True
+
+
+def pending_records(cfg):
+    """Spooled records, oldest name first."""
+    spool = cfg["catalog_spool_path"]
+    if not os.path.isdir(spool):
+        return []
+    return [os.path.join(spool, name) for name in sorted(os.listdir(spool)) if name.endswith(RECORD_SUFFIX)]
+
+
+def ship_pending_records(cfg, dry_run, stats):
+    """Ship records left over from earlier runs.  Returns True when none is left."""
+    if not cfg["remote_catalog_path"]:
+        return True
+    all_clear = True
+    for record_path in pending_records(cfg):
+        if dry_run:
+            log.info("dry run: would ship catalog record %s", record_path)
+            continue
+        if ship_record(cfg, record_path):
+            stats["records"] += 1
+        else:
+            stats["failed"] += 1
+            all_clear = False
+    return all_clear
 
 
 # --------------------------------------------------------------------------- orchestration
 
 def shippable_folders(cfg):
-    """finished_job_paths() for the configured DB and path mapping."""
-    return finished_job_paths(cfg["db_path"], cfg["completed_path"], cfg["arm_completed_path"])
+    """finished_jobs() for the configured DB and path mapping."""
+    return finished_jobs(cfg["db_path"], cfg["completed_path"], cfg["arm_completed_path"])
 
 
 def ship_recognized(cfg, dry_run, verbose, stats):
@@ -278,7 +589,7 @@ def ship_recognized(cfg, dry_run, verbose, stats):
     all_clear = True
     for sub_folder in RECOGNIZED:
         for folder in pending_folders(cfg, sub_folder, shippable):
-            if ship_folder(cfg, sub_folder, folder, dry_run, verbose):
+            if ship_folder(cfg, sub_folder, folder, dry_run, verbose, job=shippable[folder], stats=stats):
                 stats["shipped"] += 1
             else:
                 stats["failed"] += 1
@@ -288,8 +599,9 @@ def ship_recognized(cfg, dry_run, verbose, stats):
 
 def run(cfg, dry_run=False, verbose=False):
     """One full pass.  Returns the exit code for the process."""
-    stats = {"shipped": 0, "failed": 0}
+    stats = {"shipped": 0, "failed": 0, "records": 0}
     attempted_unidentified = set()
+    ship_pending_records(cfg, dry_run, stats)
     while True:
         recognized_clear = ship_recognized(cfg, dry_run, verbose, stats)
         if dry_run:
@@ -309,11 +621,12 @@ def run(cfg, dry_run=False, verbose=False):
         # One unidentified folder at a time, then loop back and re-check movies/ and tv/.
         folder = unidentified[0]
         attempted_unidentified.add(folder)
-        if ship_folder(cfg, UNIDENTIFIED, folder, dry_run, verbose):
+        if ship_folder(cfg, UNIDENTIFIED, folder, dry_run, verbose, stats=stats):
             stats["shipped"] += 1
         else:
             stats["failed"] += 1
-    log.info("done: %d shipped, %d failed", stats["shipped"], stats["failed"])
+    log.info("done: %d shipped, %d failed, %d catalog record(s) shipped", stats["shipped"], stats["failed"],
+             stats["records"])
     return 1 if stats["failed"] else 0
 
 
