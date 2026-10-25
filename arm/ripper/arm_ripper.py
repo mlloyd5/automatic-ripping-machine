@@ -16,6 +16,10 @@ from arm.ripper import utils, makemkv, handbrake, ffmpeg  # noqa E402
 from arm.ui import app, db, constants  # noqa E402
 from arm.models.job import JobState  # noqa E402
 
+# A ripped title must be at least this fraction of the longest title (by runtime, or by file size when
+# no runtime is known) to be considered as the main feature. Keeps a many-chapter bonus reel from winning.
+MAIN_FEATURE_MIN_FRACTION = 0.7
+
 
 def rip_visual_media(have_dupes, job, logfile, protection):
     """
@@ -192,7 +196,7 @@ def move_files_post(transcode_out_path, job):
     """
     Logic for moving files post transcoding\n
     if series move all to 1 folder\n
-    if movie check what source we got them from, for MakeMKV use skip_transcode_movie, so we can check filesize\n
+    if movie check what source we got them from, for MakeMKV use skip_transcode_movie to pick the main feature\n
     :param transcode_out_path: This should either be the RAW_PATH from MakeMKV, /dev/srX or TRANSCODE_PATH
     :param job: current job
     :return: None
@@ -240,9 +244,112 @@ def rip_with_mkv(current_job, protection=0):
     return mkv_ripped
 
 
+def _file_size(raw_path, filename, fallback=0):
+    """
+    Size of a ripped file on disk, or the given fallback (MakeMKV's estimate) when it cannot be read\n
+    :param raw_path: RAW_PATH of ripped mkv files
+    :param filename: file name inside raw_path
+    :param fallback: size to report when the file cannot be read
+    :return: int size in bytes
+    """
+    try:
+        return os.stat(os.path.join(raw_path, filename)).st_size
+    except OSError:
+        return int(fallback or 0)
+
+
+def _track_sort_key(raw_path):
+    """
+    Sort key for picking the main feature: most chapters, then largest file, then lowest track number.
+    This is the ordering MakeMKV's MAINFEATURE path and find_duplicate_titles use\n
+    :param raw_path: RAW_PATH of ripped mkv files (sizes are read from disk when possible)
+    :return: key function for sorted()
+    """
+    def key(track):
+        try:
+            number = int(track.track_number)
+        except (TypeError, ValueError):
+            number = 9999
+        return (-int(track.chapters or 0), -_file_size(raw_path, track.filename, track.filesize), number)
+    return key
+
+
+def _feature_length_tracks(candidates, raw_path):
+    """
+    Drop the ripped tracks that are too short to be the main feature\n
+    A track must reach MAIN_FEATURE_MIN_FRACTION of the longest track's runtime; when a runtime is
+    missing for any track, file size is compared instead. Keeps a bonus reel with one chapter per
+    clip from beating the film on the chapter count\n
+    :param candidates: ripped tracks that have a file in raw_path
+    :param raw_path: RAW_PATH of ripped mkv files
+    :return: the tracks long enough to be the main feature
+    """
+    if len(candidates) < 2:
+        return candidates
+    if all(int(track.length or 0) > 0 for track in candidates):
+        measure, unit = "runtime", "s"
+
+        def value(track):
+            return int(track.length)
+    else:
+        measure, unit = "size", " bytes"
+
+        def value(track):
+            return _file_size(raw_path, track.filename, track.filesize)
+    longest = max(value(track) for track in candidates)
+    threshold = longest * MAIN_FEATURE_MIN_FRACTION
+    kept = []
+    for track in candidates:
+        if value(track) >= threshold:
+            kept.append(track)
+        else:
+            logging.info(f"Title {track.track_number} ({track.filename}) is too short to be the main feature: "
+                         f"{measure} {value(track)}{unit} is under {MAIN_FEATURE_MIN_FRACTION:.0%} of the "
+                         f"longest title ({longest}{unit}) - treating it as an extra")
+    return kept
+
+
+def pick_main_feature(files, job, raw_path):
+    """
+    Choose the main feature among the files MakeMKV ripped\n
+    Only tracks that are feature-length count (see _feature_length_tracks). Among them prefers the
+    one with the most chapters, then the largest file, then the lowest track number. Falls back to
+    the largest file in raw_path when none of the feature-length tracks carry chapter information
+    (HandBrake-sourced tracks, or MakeMKV reporting zero chapters everywhere)\n
+    :param files: os.listdir(RAW_PATH)
+    :param job: Current job
+    :param raw_path: RAW_PATH of ripped mkv files (mkvoutpath)
+    :return: file name of the main feature
+    """
+    present = set(files)
+    ripped = [track for track in job.tracks.filter_by(ripped=True) if track.filename in present]
+    candidates = _feature_length_tracks(ripped, raw_path)
+    if not any(int(track.chapters or 0) > 0 for track in candidates):
+        largest_file_name = utils.find_largest_file(files, raw_path)
+        logging.info(f"No chapter info on the feature-length ripped tracks ({len(candidates)} of {len(ripped)} "
+                     f"with files) - main feature is the largest file: {largest_file_name}")
+        return largest_file_name
+    ranked = sorted(candidates, key=_track_sort_key(raw_path))
+    chosen = ranked[0]
+    chosen_size = _file_size(raw_path, chosen.filename, chosen.filesize)
+    reason = "most chapters"
+    if len(ranked) > 1:
+        runner_up = ranked[1]
+        if int(runner_up.chapters or 0) == int(chosen.chapters or 0):
+            reason = f"tied on chapters with title {runner_up.track_number}, larger file"
+            if _file_size(raw_path, runner_up.filename, runner_up.filesize) == chosen_size:
+                reason = f"tied on chapters and size with title {runner_up.track_number}, lower title number"
+    logging.info(f"Main feature is title {chosen.track_number} ({chosen.filename}): {chosen.chapters} chapters, "
+                 f"{chosen_size} bytes - chosen for {reason}")
+    for track in ranked[1:]:
+        logging.debug(f"Not the main feature: title {track.track_number} ({track.filename}) - "
+                      f"{track.chapters} chapters, {_file_size(raw_path, track.filename, track.filesize)} bytes")
+    return chosen.filename
+
+
 def skip_transcode_movie(files, job, raw_path):
     """
-    Only ran if job is a movie - find the largest file use it as mainfeature\n
+    Only ran if job is a movie - pick the main feature (see pick_main_feature)\n
     Move everything else to extras folder\n
     If mainfeature is enabled skip moving everything but the main file\n
     :param files: os.listdir(RAW_PATH)
@@ -251,21 +358,17 @@ def skip_transcode_movie(files, job, raw_path):
     :return: None
     """
     logging.debug(f"Videotype: {job.video_type}")
-    # if video_type is movie, then move the biggest title to media_dir
+    # if video_type is movie, then move the main feature to media_dir
     # move the rest of the files to the extras' folder
-    # find largest filesize
-    logging.debug("Finding largest file")
-    largest_file_name = utils.find_largest_file(files, raw_path)
-    # largest_file_name should be the largest file
-    logging.debug(f"Largest file is: {largest_file_name}")
-    temp_path = os.path.join(raw_path, largest_file_name)
+    main_feature_name = pick_main_feature(files, job, raw_path)
+    temp_path = os.path.join(raw_path, main_feature_name)
     if os.stat(temp_path).st_size <= 1:  # sanity check for filesize
         logging.info(f"{raw_path} is empty or very small size. - Folder size: {os.stat(temp_path).st_size}")
     for file in files:
         # move main into main folder
         # move others into extras folder
-        if file == largest_file_name:
-            # largest movie
+        if file == main_feature_name:
+            # main feature
             utils.move_files(raw_path, file, job, True)
         else:
             # If mainfeature is enabled - skip to the next file
