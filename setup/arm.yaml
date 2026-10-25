@@ -99,10 +99,11 @@ DATA_RIP_PARAMETERS: ""
 
 # This selects the metadata provider, Each provider has their own ups and downs
 # But a general rule would be
-#    OMDB for movies and shows
-#    TMDB for movies only
-# You will still need to provide an api key for the provider you have selected
-METADATA_PROVIDER: "omdb"
+#    OMDB for movies and shows (its series coverage is better)
+#    TMDB mainly for movies; a TMDB search tries movies first and then TV series
+# There is no fallback from one provider to the other, and you will still need to provide an api key
+# (TMDB_API_KEY or OMDB_API_KEY) for the provider you have selected
+METADATA_PROVIDER: "tmdb"
 
 # Set to one of "none", "musicbrainz", "freecddb"
 # if "musicbrainz" is used the disc information are asked from musicbrainz.org

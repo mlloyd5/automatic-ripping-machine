@@ -32,7 +32,7 @@
   "MAX_CONCURRENT_TRANSCODES": "# Number of Transcodes that runs at the same time.\n# Certain Video cards are limited to how many encodes they can run at the same time.\n# Also useful for diminishing returns on CPU based encodes.\n# Set to 0 to disable",
   "MAX_CONCURRENT_MAKEMKVINFO": "# Number of MakeMKV info calls that are allowed to run.\n#This can be set to 1 if makemkvcon info calls lead to crashes on backup or mkv calls.\n# Set to 0 to disable",
   "DATA_RIP_PARAMETERS": "# Additional parameters for dd. e.g. \"conv=noerror,sync\" for ignoring read errors",
-  "METADATA_PROVIDER": "# This selects the metadata provider, Each provider has their own ups and downs\n# But a general rule would be \n# OMDB for movies and shows \n# TMDB for movies only\n# You will still need to provide an api key for the provider you have selected",
+  "METADATA_PROVIDER": "# This selects the metadata provider, Each provider has their own ups and downs\n# But a general rule would be\n#    OMDB for movies and shows (its series coverage is better)\n#    TMDB mainly for movies; a TMDB search tries movies first and then TV series\n# There is no fallback from one provider to the other, and you will still need to provide an api key\n# (TMDB_API_KEY or OMDB_API_KEY) for the provider you have selected",
   "GET_AUDIO_TITLE": "# Set to one of \"none\", \"musicbrainz\", \"freecddb\"\n# if \"musicbrainz\" is used the disc information are asked from musicbrainz.org\n# if \"none\" is used no label is identified",
   "RIP_POSTER": "# Rip DVD Posters from JACKET_P folder\n# Requires FFmpeg",
   "AUTO_EJECT": "# Auto-ejects disks\n# Auto-ejects disks when complete etc\n# Set to false to disable auto-ejection",
