@@ -8,6 +8,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -25,6 +26,28 @@ TINY_JPEG = bytes.fromhex(
     "ffc40014000100000000000000000000000000000009ffc40014100100000000000000000000000000000000ffda0008010100"
     "003f00d2cf20ffd9"
 )
+
+
+class ToggleSource:
+    """A camera that can be unplugged: ``present()`` is False until ``plugged`` is set."""
+
+    def __init__(self):
+        self.plugged = False
+        self.opens = 0
+        self.device = "/dev/video9"
+
+    def present(self):
+        return self.plugged
+
+    def open(self):
+        self.opens += 1
+        return True
+
+    def read(self):
+        return b"frame"
+
+    def release(self):
+        pass
 
 
 class FailingSource:
@@ -114,6 +137,59 @@ class TestFrameBuffer(unittest.TestCase):
         buffer._thread.join(5.0)
         self.assertEqual(source.opens, 2)
         buffer.stop()
+
+    def test_unplugged_camera_is_waited_for_not_opened(self):
+        source = ToggleSource()
+        buffer = capture.FrameBuffer(source=source, fps=50, buffer_seconds=1.0)
+        buffer.absent_poll_seconds = 0.02
+        buffer.start()
+        time.sleep(0.2)
+        self.assertTrue(buffer.running, "waiting for a camera keeps the thread alive")
+        self.assertFalse(buffer.camera_present)
+        self.assertFalse(buffer.camera_open)
+        self.assertEqual(source.opens, 0, "an unplugged camera is not opened")
+        source.plugged = True
+        self.assertTrue(buffer.wait_for_frame(5.0))
+        self.assertTrue(buffer.camera_present)
+        self.assertTrue(buffer.camera_open)
+        self.assertEqual(source.opens, 1)
+        buffer.stop()
+
+    def test_read_failure_releases_the_dead_handle(self):
+        source = ToggleSource()
+        source.plugged = True
+        source.releases = 0
+        source.reads = 0
+
+        def read():
+            source.reads += 1
+            return None if source.reads == 1 else b"frame"
+
+        def release():
+            source.releases += 1
+
+        source.read = read
+        source.release = release
+        buffer = capture.FrameBuffer(source=source, fps=50, buffer_seconds=1.0)
+        buffer.absent_poll_seconds = 0.02
+        buffer.start()
+        self.assertTrue(buffer.wait_for_frame(5.0))
+        self.assertEqual(source.releases, 1, "the dead handle is released as soon as the read fails")
+        self.assertEqual(source.opens, 2, "a failed read reopens the camera")
+        buffer.stop()
+
+    def test_camera_present_needs_a_character_device(self):
+        folder = tempfile.mkdtemp()
+        try:
+            placeholder = os.path.join(folder, "video0")
+            with open(placeholder, "w") as handle:
+                handle.write("")
+            self.assertFalse(capture.CameraSource(placeholder).present(), "a leftover regular file is unplugged")
+            self.assertFalse(capture.CameraSource(os.path.join(folder, "video1")).present())
+            self.assertTrue(capture.CameraSource("/dev/null").present())
+            self.assertTrue(capture.CameraSource("0").present(), "an index is always present")
+        finally:
+            shutil.rmtree(folder)
 
     def test_crop_and_encode_pass_bytes_through(self):
         self.assertEqual(capture.crop(TINY_JPEG, (0, 0, 1, 1)), TINY_JPEG)
@@ -220,6 +296,7 @@ class TestDaemonTick(unittest.TestCase):
         self.assertTrue(status["running"])
         self.assertTrue(status["enabled"])
         self.assertTrue(status["camera_open"])
+        self.assertTrue(status["camera_present"])
         self.assertEqual(status["device"], "/dev/video7")
         self.assertEqual(status["drives"], ["sr0", "sr1"])
         self.assertEqual(status["tray_state"], {"sr0": "TRAY_OPEN", "sr1": "DISC_OK"})
@@ -316,11 +393,15 @@ class TestDaemonTick(unittest.TestCase):
         self.assertIsNone(status["pending_scan"])
 
     def test_barcode_only_mode_watches_trays_without_camera(self):
-        self.write_cfg("CAMERA_ENABLED: false\nBARCODE_ENABLED: true\nBARCODE_DEVICE: /nonexistent/input/event9\n")
+        self.fake_device_nodes()
+        scanner = os.path.join(self.folder, "event9")
+        with open(scanner, "w") as handle:
+            handle.write("")
+        self.write_cfg(f"CAMERA_ENABLED: false\nBARCODE_ENABLED: true\nBARCODE_DEVICE: {scanner}\n")
         dmn = self.make_daemon(watch_config=True)
         self.assertTrue(dmn.barcode_enabled)
-        self.assertIsNotNone(dmn.reader, "a configured device is used as given")
-        self.assertEqual(dmn.reader.device, "/nonexistent/input/event9")
+        self.assertIsNotNone(dmn.reader, "a configured, present device is used as given")
+        self.assertEqual(dmn.reader.device, scanner)
         dmn.tick(10.0)
         self.assertFalse(dmn.buffer.running, "no camera in barcode-only mode")
         dmn.scans.hold("5050582868043", now=10.0)
@@ -332,13 +413,60 @@ class TestDaemonTick(unittest.TestCase):
         status = self.read_status()
         self.assertFalse(status["running"])
         self.assertTrue(status["barcode_enabled"])
-        self.assertEqual(status["barcode_device"], "/nonexistent/input/event9")
+        self.assertEqual(status["barcode_device"], scanner)
+        self.assertTrue(status["scanner_present"])
         # turning the scanner off at runtime releases it
         time.sleep(0.02)
         self.write_cfg("CAMERA_ENABLED: false\nBARCODE_ENABLED: false\n")
         dmn.tick(12.0)
         self.assertIsNone(dmn.reader)
         self.assertFalse(self.read_status()["barcode_enabled"])
+
+    def test_scanner_plugged_in_later_is_picked_up_and_released_when_pulled(self):
+        self.fake_device_nodes()
+        scanner = os.path.join(self.folder, "event9")
+        self.write_cfg(f"CAMERA_ENABLED: false\nBARCODE_ENABLED: true\nBARCODE_DEVICE: {scanner}\n")
+        dmn = self.make_daemon()
+        self.assertIsNone(dmn.reader, "an unplugged scanner is not read")
+        dmn.tick(10.0)
+        status = self.read_status()
+        self.assertTrue(status["barcode_enabled"])
+        self.assertFalse(status["scanner_present"])
+        self.assertIsNone(status["barcode_device"])
+        with open(scanner, "w") as handle:
+            handle.write("")
+        dmn.tick(11.0)
+        self.assertIsNone(dmn.reader, "not looked for again within peripheral_check_interval")
+        dmn.tick(16.0)
+        self.assertIsNotNone(dmn.reader, "a scanner plugged in later is picked up")
+        self.assertEqual(dmn.reader.device, scanner)
+        self.assertTrue(self.read_status()["scanner_present"])
+        os.remove(scanner)
+        dmn.tick(22.0)
+        self.assertIsNone(dmn.reader, "a pulled scanner is released")
+        self.assertFalse(self.read_status()["scanner_present"])
+
+    def test_missing_scanner_is_reported_once_not_on_every_recheck(self):
+        self.write_cfg("CAMERA_ENABLED: false\nBARCODE_ENABLED: true\nBARCODE_DEVICE: \"\"\n")
+        keyboard = "/dev/input/by-id/usb-Foo_Keyboard-event-kbd"
+        with mock.patch.object(daemon.barcode, "find_scanner_device", return_value=None) as find, \
+                mock.patch.object(daemon.barcode, "keyboard_candidates", return_value=[keyboard]):
+            with self.assertLogs(level="DEBUG") as logs:
+                dmn = self.make_daemon()
+                for now in (0.0, 5.0, 10.0, 15.0):
+                    dmn.tick(now)
+        self.assertGreaterEqual(find.call_count, 4, "looked for again at every peripheral_check_interval")
+        self.assertTrue(all(call.kwargs.get("warn") is False for call in find.call_args_list))
+        scanner_lines = [r for r in logs.records if r.levelno >= 20 and "scanner" in r.getMessage()]
+        self.assertEqual(len(scanner_lines), 1, [r.getMessage() for r in scanner_lines])
+        self.assertIn(keyboard, scanner_lines[0].getMessage(), "the one message names the candidates")
+        self.assertIsNone(dmn.reader)
+
+    def fake_device_nodes(self):
+        """Let regular files stand in for device nodes (no root to mknod a real one)."""
+        patcher = mock.patch.object(daemon.barcode, "is_device_node", os.path.exists)
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def test_preview_written_while_requested_and_stops_when_stale(self):
         dmn = self.make_daemon()

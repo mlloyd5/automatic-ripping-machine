@@ -10,6 +10,7 @@ import collections
 import glob
 import logging
 import os
+import stat
 import threading
 import time
 from typing import Any, Deque, Dict, List, Optional, Tuple
@@ -21,6 +22,14 @@ Region = Tuple[int, int, int, int]
 def _cv2():
     import cv2  # pylint: disable=import-outside-toplevel
     return cv2
+
+
+def is_device_node(path) -> bool:
+    """True when ``path`` is a character device; a missing path or a leftover regular file counts as unplugged."""
+    try:
+        return stat.S_ISCHR(os.stat(path).st_mode)
+    except (OSError, ValueError):
+        return False
 
 
 class CameraSource:
@@ -39,6 +48,11 @@ class CameraSource:
         if base.startswith("video") and base[5:].isdigit():
             return int(base[5:])
         return self.device
+
+    def present(self) -> bool:
+        """True when the device node is a character device (plugged in); paths only, an index is always "present"."""
+        device = str(self.device)
+        return is_device_node(device) if device.startswith("/") else True
 
     def open(self) -> bool:
         cv2 = _cv2()
@@ -131,6 +145,11 @@ class FrameBuffer:
         self.frames_read = 0
         self.camera_open = False
         """True while the source is delivering frames (updated by the capture thread)."""
+        self.camera_present = True
+        """False while the source says its device is not plugged in (``source.present()``), so the daemon
+        and the UI can tell "unplugged" from "cannot open"."""
+        self.absent_poll_seconds = 3.0
+        """How often to look for an unplugged camera; a hotplugged device is picked up within this."""
 
     def start(self) -> None:
         """Start the capture thread, or restart it after it died (see ``_run``)."""
@@ -171,23 +190,51 @@ class FrameBuffer:
             except Exception:  # pylint: disable=broad-except
                 pass
 
+    def _present(self) -> bool:
+        probe = getattr(self.source, "present", None)
+        return bool(probe()) if callable(probe) else True
+
     def _capture_loop(self) -> None:
         backoff = 1.0
-        opened = self.source.open()
+        opened = False
+        waiting_logged = False
+        device = getattr(self.source, "device", "camera")
         while not self._stop.is_set():
-            self.camera_open = opened
             if not opened:
-                self._logger.warning(f"Camera unavailable, retrying in {backoff:.0f}s")
-                if self._stop.wait(backoff):
-                    break
-                backoff = min(backoff * 2, 60.0)
+                self.camera_open = False
+                self.camera_present = self._present()
+                if not self.camera_present:
+                    # Unplugged: no point trying to open it. Say so once, then look again every few seconds
+                    # (udev on the host passes a plugged-in camera through within a second or two).
+                    if not waiting_logged:
+                        self._logger.info(f"Camera {device} is not plugged in; waiting for it")
+                        waiting_logged = True
+                    backoff = 1.0
+                    if self._stop.wait(self.absent_poll_seconds):
+                        break
+                    continue
+                if waiting_logged:
+                    self._logger.info(f"Camera {device} plugged in")
+                    waiting_logged = False
                 opened = self.source.open()
-                continue
+                if not opened:
+                    self._logger.warning(f"Camera unavailable, retrying in {backoff:.0f}s")
+                    if self._stop.wait(backoff):
+                        break
+                    backoff = min(backoff * 2, 60.0)
+                    continue
+                self.camera_open = True
             started = time.monotonic()
             frame = self.source.read()
             if frame is None:
                 self._logger.warning("Camera read failed, reopening")
                 opened = False
+                self.camera_open = False
+                # Let go of the dead handle now, so an unplugged node is not held open while we wait for it
+                try:
+                    self.source.release()
+                except Exception:  # pylint: disable=broad-except
+                    pass
                 continue
             backoff = 1.0
             self._append(time.monotonic(), frame)

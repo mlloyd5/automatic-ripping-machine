@@ -126,6 +126,17 @@ class TestCameraPage(unittest.TestCase):
         self.assertIn("camera/photo?name=sr0_20261018-120000.jpg", html)
         self.assertNotIn("not-a-photo.jpg", html)
 
+    def test_page_tells_unplugged_from_cannot_open(self):
+        self.write_status(camera_open=False, camera_present=False, barcode_enabled=True, scanner_present=False)
+        html = self.client.get("/camera").data.decode()
+        self.assertIn("Running, camera not plugged in", html)
+        self.assertIn("not plugged in</td>", html)
+        self.write_status(camera_open=False, camera_present=True, barcode_enabled=True, scanner_present=True,
+                          barcode_device="/dev/input/event5")
+        html = self.client.get("/camera").data.decode()
+        self.assertIn("Running, camera not open", html)
+        self.assertIn("reading /dev/input/event5", html)
+
     def test_status_endpoint(self):
         response = self.client.get("/camera/status")
         self.assertEqual(response.status_code, 200)
