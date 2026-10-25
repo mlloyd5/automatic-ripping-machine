@@ -14,12 +14,13 @@ for you to rename by hand, at lower priority and with a bandwidth cap.
 ## What it does on every run
 
 1. Opens ARM's sqlite database read-only and collects every `job` whose `path`
-   is under `completed_path` and whose `status` is `success`.  A folder is only
+   is under `arm_completed_path` (ARM's own `COMPLETED_PATH`) and whose
+   `status` is `success`, translated to the same folder under `completed_path`.  A folder is only
    eligible if no other job (for example a re-rip of the same disc) is still
    unfinished on that same path.  Logs are never tailed.
 2. Ships every eligible folder in `movies/`, then `tv/`, with
-   `rsync -a --partial --remove-source-files`.  After rsync exits 0 the now-empty
-   job folder is pruned.  Anything else is left in place for the next run.
+   `rsync -a -s --partial-dir=.rsync-partial --remove-source-files`.  After rsync
+   exits 0 the now-empty job folder is pruned.  Anything else is left in place for the next run.
 3. Only when no recognized folder is pending, ships **one** eligible
    `unidentified/` folder with `--bwlimit=bwlimit_unidentified`, then goes back
    to step 1.  A movie that finishes while a long unidentified transfer is
@@ -30,17 +31,24 @@ for you to rename by hand, at lower priority and with a bandwidth cap.
    still holds the lock.
 
 Interrupting the script, rebooting, or a dropped link are all safe: rsync keeps
-partial files, nothing local is deleted before rsync reports success, and the
-next timer run simply resumes.  Running it twice in a row is a no-op.
+partial files in a hidden `.rsync-partial` folder inside the destination job
+folder (never under their final name), nothing local is deleted before rsync
+has transferred it, and the next timer run simply resumes.  Running it twice in a row is a no-op.
 
 Folders whose job is still `active`, `ripping`, `transcoding`, `waiting` or
 `fail`, and folders ARM knows nothing about, are never touched.
 
 ## Requirements
 
-* Ripping box: Python 3.6+ (stdlib only), `rsync`, `ssh` client.
-* Media box: `rsync`, an ssh account that can write to the destination folders.
-* Key-based ssh from the ripping box's `arm` user to the media box
+* Ripping box (wherever the shipper runs): Python 3.6+ (stdlib only),
+  `rsync` 3.0 or newer, `ssh` client.
+* Media box: `rsync` 3.0 or newer, an ssh account that can write to the
+  destination folders.  rsync is always run with `-s` (`--protect-args`) so
+  paths with spaces and parentheses (`Title (Year)`) reach the media box
+  intact whatever the rsync versions and remote shell; both ends need 3.0+ for
+  that.
+* Key-based ssh from the user the shipper runs as (`arm` on a native install,
+  `root` on a Proxmox host) to the media box
   (`ssh_options` defaults to `BatchMode=yes` so a missing key fails fast
   instead of hanging on a password prompt).
 
@@ -65,9 +73,62 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now arm-completed-shipper.timer
 ```
 
-The service unit assumes ARM is checked out at `/opt/arm` and runs as user
-`arm`; adjust `ExecStart`, `User` and `Group` if yours differ.  Logs go to the
+The service unit assumes a native install: ARM checked out at `/opt/arm` and
+an `arm` user.  If yours differs, override it with a drop-in instead of editing
+the unit (see the Proxmox section below for an example).  Logs go to the
 journal: `journalctl -u arm-completed-shipper.service`.
+
+## Running on the Proxmox host (Docker-in-LXC)
+
+When ARM runs in Docker inside an LXC, run the shipper on the Proxmox host, not
+in the container: it then works over whichever uplink the host has, and needs
+nothing inside ARM's container.  The catch is that ARM writes **container**
+paths into `job.path`, while the host sees the same folders elsewhere.  Set
+`completed_path` to the host path and `arm_completed_path` to `COMPLETED_PATH`
+as it appears in `arm.yaml`; the shipper maps one onto the other.
+
+Example for the ts140 (host `/var/lib/arm-ripper` -> `/srv/arm` in LXC 140 ->
+`/home/arm` in the container, and host `/scratch/rips` -> `/srv/arm-media` ->
+`/home/arm/media`), shipping to the t620 as root:
+
+```ini
+[shipper]
+db_path = /var/lib/arm-ripper/home/db/arm.db
+completed_path = /scratch/rips/completed
+arm_completed_path = /home/arm/media/completed
+remote_host = root@t620
+remote_movies_path = /tank/media/movies
+remote_tv_path = /tank/media/tv
+remote_unidentified_path = /tank/rips/unidentified
+lock_file = /run/lock/arm-completed-shipper.lock
+```
+
+There is no `arm` user on the host and the checkout lives in
+`/var/lib/arm-ripper/src`, so override the unit with a drop-in
+(`sudo systemctl edit arm-completed-shipper.service`):
+
+```ini
+[Service]
+User=root
+Group=root
+# An empty ExecStart= clears the one from the unit before setting the new one.
+ExecStart=
+ExecStart=/usr/bin/python3 /var/lib/arm-ripper/src/scripts/completed_shipper/arm_completed_shipper.py --config /etc/arm-completed-shipper.conf
+```
+
+The ssh key is then **root's** on the host:
+
+```bash
+sudo ssh-keygen -t ed25519 -f /root/.ssh/id_ed25519 -N ''
+sudo ssh-copy-id root@t620
+sudo ssh -o BatchMode=yes root@t620 'mkdir -p /tank/media/movies /tank/media/tv /tank/rips/unidentified'
+sudo python3 /var/lib/arm-ripper/src/scripts/completed_shipper/arm_completed_shipper.py \
+    -c /etc/arm-completed-shipper.conf --dry-run -v
+```
+
+The "ship immediately" hook below does not apply here: a `BASH_SCRIPT` inside
+ARM's container cannot start a unit on the host.  The 15-minute timer is the
+mechanism on this setup.
 
 ## Configuration
 
@@ -77,7 +138,8 @@ All settings live in one `[shipper]` section.  Defaults match a stock
 | Key | Meaning |
 | --- | --- |
 | `db_path` | ARM's sqlite file, `DBFILE` in `arm.yaml`.  Read-only. |
-| `completed_path` | ARM's `COMPLETED_PATH`.  Must be the same path ARM writes into `job.path`, so copy it from `arm.yaml` rather than using an alternative mount. |
+| `completed_path` | ARM's `COMPLETED_PATH` as seen by **this** script.  On a native install copy it from `arm.yaml`; when the shipper runs outside ARM's container, use the host path of the same folder. |
+| `arm_completed_path` | `COMPLETED_PATH` exactly as in `arm.yaml`, i.e. the prefix ARM writes into `job.path`.  Defaults to `completed_path`; set it when the two differ (container vs host).  DB rows outside this prefix are ignored. |
 | `remote_host` | `user@host` of the media box.  Leave empty if the destination paths are local mounts (NFS/SMB) on the ripping box. |
 | `remote_movies_path` / `remote_tv_path` | Plex library folders on the media box.  Each rip lands as `<path>/<Title (Year)>/`. |
 | `remote_unidentified_path` | Staging folder on the media box for manual review.  Keep it **outside** any Plex library. |
@@ -91,7 +153,7 @@ All settings live in one `[shipper]` section.  Defaults match a stock
 
 Command-line flags: `-c/--config`, `-n/--dry-run` (passes `--dry-run` to
 rsync and deletes nothing), `-v/--verbose`, plus `--db-path`,
-`--completed-path` and `--lock-file` overrides.
+`--completed-path`, `--arm-completed-path` and `--lock-file` overrides.
 
 Destination parent folders must already exist.  rsync creates the per-title
 folder itself.
@@ -116,7 +178,10 @@ media box's **local** disks.  Because this shipper writes with rsync over ssh
 would not fire if Plex were watching a network mount instead.
 
 rsync writes each file as a hidden temporary name (`.Title.mkv.XXXXXX`) and
-renames it when complete, so Plex never sees a half-copied file.
+renames it when complete.  If a transfer is interrupted, the partial file is
+moved into a hidden `.rsync-partial` folder inside the job folder (Plex skips
+dot-folders) and the next run resumes from it, so Plex never sees a
+half-copied file under its real name.
 
 If you prefer an explicit trigger, or your Plex lives in a container where
 inotify is unreliable, use `post_ship_command` to call the Plex API from the
@@ -133,6 +198,9 @@ is never scanned.  (Finding the token: Plex support article "Finding an
 authentication token / X-Plex-Token".)
 
 ## Optional: ship immediately when ARM finishes
+
+This recipe is for a **native** install, where ARM and the shipper's unit run
+on the same system.  It does not work from inside ARM's Docker container.
 
 The timer alone is enough; it fires every 15 minutes and catches up on anything
 pending.  If you want rips to leave the box within seconds of ARM finishing,
@@ -162,7 +230,9 @@ The test builds a fake `COMPLETED_PATH`, a temporary ARM database and local
 destination folders, and runs the shipper end to end through a wrapper around
 the real `rsync` that records every call.  It covers priority order, the
 bandwidth cap, skipped unfinished/failed/unknown folders, the failure
-behaviour, resume after an interrupted copy, dry run and the lock.
+behaviour, resume after an interrupted copy, dry run, the lock, container to
+host path mapping (`arm_completed_path`) and the rsync command shape (`-s`,
+`--partial-dir`, unquoted remote path).
 
 ```bash
 python3 -m unittest scripts/completed_shipper/test_arm_completed_shipper.py
@@ -170,10 +240,19 @@ python3 -m unittest scripts/completed_shipper/test_arm_completed_shipper.py
 
 ## Troubleshooting
 
+* **First smoke test.**  Run it by hand, as the user the unit runs as, on the
+  box where it will run:
+  `python3 arm_completed_shipper.py -c /etc/arm-completed-shipper.conf --dry-run -v`.
+  It lists every folder it would ship and the exact rsync command, and moves
+  nothing.
 * **Nothing ships, log says "not shippable yet".**  Run with `-v`: either the
-  job is not `success` yet, or `completed_path` differs from what ARM wrote
-  into `job.path`.  Check with
+  job is not `success` yet, or `arm_completed_path` differs from what ARM wrote
+  into `job.path` (typical when running outside ARM's container without
+  setting it).  Check with
   `sqlite3 /home/arm/db/arm.db "select job_id,status,path from job order by job_id desc limit 5"`.
+* **"unable to open database file".**  The DB is opened read-only
+  (`?mode=ro`), but sqlite still needs read access to the db file **and** its
+  directory (for the `-journal`/`-wal` file next to it).
 * **rsync exits 255.**  ssh could not connect or authenticate as the `arm`
   user non-interactively.  Test with
   `sudo -u arm ssh -o BatchMode=yes arm@t620 true`.

@@ -6,9 +6,16 @@
 # ARM's sqlite database (DBFILE in arm.yaml).  Opened read-only.
 db_path = /home/arm/db/arm.db
 
-# ARM's COMPLETED_PATH from arm.yaml.  Only its movies/, tv/ and unidentified/
-# sub-folders are shipped.
+# ARM's COMPLETED_PATH as seen by this script.  Only its movies/, tv/ and
+# unidentified/ sub-folders are shipped.  On the Proxmox host of a
+# Docker-in-LXC install this is the host path, e.g. /scratch/rips/completed.
 completed_path = /home/arm/media/completed
+
+# COMPLETED_PATH exactly as in arm.yaml: the prefix ARM writes into job.path.
+# Empty means the same as completed_path (native install, or the shipper runs
+# where ARM's paths are valid).  When running outside ARM's container set it,
+# e.g. /home/arm/media/completed, and completed_path to the host path.
+arm_completed_path =
 
 # ssh target on the media box, e.g. "arm@t620".  Leave empty when the
 # destination paths below are local (an NFS or SMB mount on this box).
@@ -42,6 +49,7 @@ lock_file = /run/lock/arm-completed-shipper.lock
 
 # Optional shell command run after each folder ships.  SHIPPER_TYPE (movies,
 # tv, unidentified), SHIPPER_FOLDER and SHIPPER_DESTINATION are set in its
-# environment.  Example: kick a Plex library scan on the media box.
+# environment.  Example: kick a Plex library scan on the media box.  A % is
+# taken literally (no interpolation), so URL-encoded values are fine.
 # post_ship_command = curl -fsS "http://t620:32400/library/sections/all/refresh?X-Plex-Token=XXXX"
 post_ship_command =

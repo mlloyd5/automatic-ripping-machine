@@ -172,6 +172,7 @@ post_ship_command = echo "$SHIPPER_TYPE $SHIPPER_FOLDER" >> {self.tmp}/hook.log
         for call in calls[:2]:
             self.assertNotIn("--bwlimit", call)
             self.assertIn("--remove-source-files", call)
+            self.assertIn("--partial-dir=.rsync-partial", call)
         for call in calls[2:]:
             self.assertIn("--bwlimit=500", call)
 
@@ -238,6 +239,43 @@ post_ship_command = echo "$SHIPPER_TYPE $SHIPPER_FOLDER" >> {self.tmp}/hook.log
         finally:
             held.close()
 
+    def _use_container_paths_in_db(self, arm_root="/home/arm/media/completed"):
+        # ARM runs in a container: job.path holds the container path, not this box's path.
+        conn = sqlite3.connect(self.db)
+        conn.execute("UPDATE job SET path = replace(path, ?, ?)", (self.completed, arm_root))
+        # Same layout under another prefix: must be ignored even though a local folder of that name exists.
+        conn.execute("INSERT INTO job (status, path) VALUES ('success', '/srv/other/completed/movies/Movie C (2003)')")
+        conn.commit()
+        conn.close()
+
+    def _assert_container_path_run(self):
+        movie_a = self._shipped("Movies", "Movie A (2001)")
+        self.assertTrue(os.path.isfile(os.path.join(movie_a, "extras", "trailer.mkv")))
+        self.assertFalse(os.path.exists(self._local("movies", "Movie A (2001)")))
+        self.assertTrue(os.path.isfile(os.path.join(self._shipped("TV", "Show A (2010)"), "S01E02.mkv")))
+        for name in ("UNKNOWN_DISC", "UNKNOWN_2"):
+            self.assertTrue(os.path.isfile(os.path.join(self._shipped("staging", name), "title_t00.mkv")))
+            self.assertFalse(os.path.exists(self._local("unidentified", name)))
+        for name in ("Movie B (2002)", "Movie C (2003)", "Movie D (2004)", "Movie E (2005)"):
+            self.assertTrue(os.path.isdir(self._local("movies", name)), name)
+            self.assertFalse(os.path.exists(self._shipped("Movies", name)), name)
+        self.assertEqual(len(self._calls()), 4)
+
+    def test_db_paths_from_container_are_mapped_to_local_path(self):
+        self._use_container_paths_in_db()
+        # Without the mapping nothing in the DB is under completed_path, so nothing ships.
+        self.assertEqual(self._run(), 0)
+        self.assertEqual(self._calls(), [])
+        with open(self.conf, "a") as handle:
+            handle.write("arm_completed_path = /home/arm/media/completed/\n")
+        self.assertEqual(self._run(), 0)
+        self._assert_container_path_run()
+
+    def test_arm_completed_path_cli_override(self):
+        self._use_container_paths_in_db("/home/arm/media/completed")
+        self.assertEqual(self._run("--arm-completed-path", "/home/arm/media/completed"), 0)
+        self._assert_container_path_run()
+
     def test_job_newly_finished_between_passes_is_picked_up(self):
         # Movie B finishes while the shipper is working: a later pass must ship it.
         self.assertEqual(self._run(), 0)
@@ -250,7 +288,7 @@ post_ship_command = echo "$SHIPPER_TYPE $SHIPPER_FOLDER" >> {self.tmp}/hook.log
 
 
 class RsyncCommandShape(unittest.TestCase):
-    def test_remote_destination_uses_ssh_and_quotes_path(self):
+    def test_remote_destination_uses_ssh_and_protects_args(self):
         cfg = dict(shipper.DEFAULTS, remote_host="arm@t620", remote_movies_path="/srv/plex/Movies",
                    remote_tv_path="/srv/plex/TV", remote_unidentified_path="/srv/staging",
                    bwlimit_unidentified="8000", ssh_options="-o BatchMode=yes -i /home/arm/.ssh/shipper",
@@ -259,11 +297,16 @@ class RsyncCommandShape(unittest.TestCase):
         self.assertEqual(cmd[0], "rsync")
         self.assertIn("--bwlimit=8000", cmd)
         self.assertIn("--remove-source-files", cmd)
-        self.assertIn("--partial", cmd)
+        self.assertIn("--partial-dir=.rsync-partial", cmd)
+        self.assertNotIn("--partial", cmd)
         self.assertIn("--chown=plex:plex", cmd)
+        # -s (--protect-args): the raw path travels inside the protocol, never through the remote shell.
+        self.assertIn("-s", cmd)
         self.assertEqual(cmd[cmd.index("-e") + 1], "ssh -o BatchMode=yes -i /home/arm/.ssh/shipper")
         self.assertEqual(cmd[-2], "/home/arm/media/completed/unidentified/DISC X/")
-        self.assertEqual(cmd[-1], "arm@t620:'/srv/staging/DISC X'/")
+        self.assertEqual(cmd[-1], "arm@t620:/srv/staging/DISC X/")
+        self.assertEqual(shipper.destination(cfg, "unidentified", "/x/unidentified/DISC X"),
+                         "arm@t620:/srv/staging/DISC X/")
 
     def test_recognized_without_bwlimit(self):
         cfg = dict(shipper.DEFAULTS, remote_movies_path="/m", remote_tv_path="/t", remote_unidentified_path="/u",
@@ -271,6 +314,7 @@ class RsyncCommandShape(unittest.TestCase):
         cmd = shipper.build_rsync_command(cfg, "movies", "/c/movies/Film (1999)")
         self.assertFalse(any(part.startswith("--bwlimit") for part in cmd))
         self.assertNotIn("-e", cmd)
+        self.assertIn("--partial-dir=.rsync-partial", cmd)
         self.assertEqual(cmd[-1], "/m/Film (1999)/")
 
     def test_missing_destination_is_a_config_error(self):
@@ -280,6 +324,17 @@ class RsyncCommandShape(unittest.TestCase):
                 handle.write("[shipper]\nremote_movies_path = /m\n")
             with self.assertRaises(shipper.ShipperError):
                 shipper.load_config(conf)
+
+    def test_percent_in_config_is_literal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            conf = os.path.join(tmp, "c.conf")
+            hook = 'curl -fsS "http://t620:32400/library/sections/all/refresh?path=/tank/media/Movie%20A"; date +%s'
+            with open(conf, "w") as handle:
+                handle.write(f"[shipper]\nremote_movies_path = /m\nremote_tv_path = /t\n"
+                             f"remote_unidentified_path = /u\npost_ship_command = {hook}\n")
+            cfg = shipper.load_config(conf)
+            self.assertEqual(cfg["post_ship_command"], hook)
+            self.assertEqual(cfg["arm_completed_path"], cfg["completed_path"])
 
 
 if __name__ == "__main__":

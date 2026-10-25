@@ -20,11 +20,19 @@ Priority rules:
 
 Safety rules:
 
-* Source files are removed only by ``rsync --remove-source-files`` after rsync
-  exited 0, then the empty job folder is pruned.  A failed or interrupted run
-  leaves the job folder in place and the next run resumes it.
+* Source files are removed only by ``rsync --remove-source-files``, each one
+  once rsync has transferred it; the empty job folder is pruned only after rsync
+  exited 0.  A failed or interrupted run leaves the job folder (and every file
+  not yet transferred) in place and the next run resumes it.
+* Interrupted files are kept in a ``.rsync-partial`` directory on the
+  destination, never under their final name, so Plex never indexes a
+  truncated file.
 * A lock file stops two runs overlapping.
 * Only the standard library plus ``rsync`` are needed.
+
+The shipper may run outside ARM's container (e.g. on the Docker or Proxmox
+host): ``arm_completed_path`` is COMPLETED_PATH as ARM writes it into
+``job.path`` and ``completed_path`` is the same folder as seen by this script.
 """
 
 import argparse
@@ -45,6 +53,7 @@ FINISHED_STATUSES = ("success", "fail")
 DEFAULTS = {
     "db_path": "/home/arm/db/arm.db",
     "completed_path": "/home/arm/media/completed",
+    "arm_completed_path": "",
     "remote_host": "",
     "remote_movies_path": "",
     "remote_tv_path": "",
@@ -70,7 +79,8 @@ class ShipperError(Exception):
 
 def load_config(path, overrides=None):
     """Read the INI config file and return a dict of settings with defaults applied."""
-    parser = configparser.ConfigParser()
+    # No interpolation: post_ship_command may well contain a literal % (URL encoding, date +%s).
+    parser = configparser.ConfigParser(interpolation=None)
     parser.read_dict({"shipper": DEFAULTS})
     if path:
         if not os.path.exists(path):
@@ -80,6 +90,9 @@ def load_config(path, overrides=None):
     for key, value in (overrides or {}).items():
         if value is not None:
             cfg[key] = str(value)
+    # arm_completed_path is the path ARM itself uses (and writes into job.path); it may
+    # not exist on this box, so it is only normalised, never resolved.
+    cfg["arm_completed_path"] = os.path.normpath(cfg["arm_completed_path"] or cfg["completed_path"])
     cfg["completed_path"] = os.path.realpath(cfg["completed_path"])
     for key in ("remote_movies_path", "remote_tv_path", "remote_unidentified_path"):
         if not cfg[key]:
@@ -104,13 +117,18 @@ def bwlimit_for(cfg, sub_folder):
 
 # --------------------------------------------------------------------------- database
 
-def finished_job_paths(db_path, completed_path):
+def finished_job_paths(db_path, completed_path, arm_completed_path=None):
     """
-    Return the set of job folders under COMPLETED_PATH that are safe to ship.
+    Return the set of local job folders under COMPLETED_PATH that are safe to ship.
 
     A folder qualifies when at least one job with that path has status
     ``success`` and no job with that path is still unfinished.  The DB is only
     read; ARM keeps writing to it while we run.
+
+    ``job.path`` holds the path as ARM sees it (``arm_completed_path``, e.g. a
+    path inside ARM's container).  Rows outside that prefix are ignored; the rest
+    are translated to ``completed_path`` (the same folder on this box) and
+    resolved so they compare equal to what :func:`pending_folders` returns.
     """
     if not os.path.exists(db_path):
         raise ShipperError(f"ARM database not found: {db_path}")
@@ -121,13 +139,15 @@ def finished_job_paths(db_path, completed_path):
     finally:
         conn.close()
 
+    arm_root = os.path.normpath(arm_completed_path or completed_path)
+    prefix = arm_root.rstrip(os.sep) + os.sep
     statuses = {}
-    prefix = completed_path.rstrip(os.sep) + os.sep
     for path, status in rows:
-        norm = os.path.realpath(path)
+        norm = os.path.normpath(path)
         if not norm.startswith(prefix):
             continue
-        statuses.setdefault(norm, set()).add(status)
+        local = os.path.realpath(os.path.join(completed_path, norm[len(prefix):]))
+        statuses.setdefault(local, set()).add(status)
 
     shippable = set()
     for path, seen in statuses.items():
@@ -160,16 +180,25 @@ def pending_folders(cfg, sub_folder, shippable):
 # --------------------------------------------------------------------------- rsync
 
 def destination(cfg, sub_folder, local_folder):
-    """Build the rsync destination string for one job folder."""
+    """
+    Build the rsync destination string for one job folder.
+
+    The remote path is deliberately not shell-quoted: rsync is run with ``-s``
+    (``--protect-args``), so the path travels inside the rsync protocol and the
+    remote shell never parses it.  Quoting it as well would make the quotes part
+    of the path on rsync >= 3.2.4, which escapes remote args itself.
+    """
     remote_dir = os.path.join(remote_root_for(cfg, sub_folder), os.path.basename(local_folder))
     if cfg["remote_host"]:
-        return f"{cfg['remote_host']}:{shlex.quote(remote_dir)}/"
+        return f"{cfg['remote_host']}:{remote_dir}/"
     return remote_dir + os.sep
 
 
 def build_rsync_command(cfg, sub_folder, local_folder, dry_run=False, verbose=False):
     """Compose the full rsync argv for shipping one job folder."""
-    cmd = [cfg["rsync_path"], "-a", "--partial", "--remove-source-files",
+    # --partial-dir keeps an interrupted file out of the library folder (under its final
+    # name Plex would index a truncated file); a dot-directory is ignored by Plex.
+    cmd = [cfg["rsync_path"], "-a", "--partial-dir=.rsync-partial", "--remove-source-files",
            f"--timeout={int(cfg['rsync_timeout'])}"]
     if verbose:
         cmd.append("-v")
@@ -182,7 +211,8 @@ def build_rsync_command(cfg, sub_folder, local_folder, dry_run=False, verbose=Fa
         ssh = "ssh"
         if cfg["ssh_options"]:
             ssh += " " + cfg["ssh_options"]
-        cmd.extend(["-e", ssh])
+        # -s: send paths inside the protocol, safe from remote shell word splitting/quoting.
+        cmd.extend(["-s", "-e", ssh])
     if cfg["rsync_extra_args"]:
         cmd.extend(shlex.split(cfg["rsync_extra_args"]))
     cmd.append(local_folder.rstrip(os.sep) + os.sep)
@@ -237,9 +267,14 @@ def ship_folder(cfg, sub_folder, local_folder, dry_run=False, verbose=False):
 
 # --------------------------------------------------------------------------- orchestration
 
+def shippable_folders(cfg):
+    """finished_job_paths() for the configured DB and path mapping."""
+    return finished_job_paths(cfg["db_path"], cfg["completed_path"], cfg["arm_completed_path"])
+
+
 def ship_recognized(cfg, dry_run, verbose, stats):
     """Ship every pending movies/ and tv/ folder.  Returns True when none is left pending."""
-    shippable = finished_job_paths(cfg["db_path"], cfg["completed_path"])
+    shippable = shippable_folders(cfg)
     all_clear = True
     for sub_folder in RECOGNIZED:
         for folder in pending_folders(cfg, sub_folder, shippable):
@@ -259,14 +294,14 @@ def run(cfg, dry_run=False, verbose=False):
         recognized_clear = ship_recognized(cfg, dry_run, verbose, stats)
         if dry_run:
             # Nothing moves in a dry run, so list the unidentified folders once and stop.
-            shippable = finished_job_paths(cfg["db_path"], cfg["completed_path"])
+            shippable = shippable_folders(cfg)
             for folder in pending_folders(cfg, UNIDENTIFIED, shippable):
                 ship_folder(cfg, UNIDENTIFIED, folder, dry_run, verbose)
             break
         if not recognized_clear:
             log.warning("recognized folders still pending; not starting unidentified transfers this run")
             break
-        shippable = finished_job_paths(cfg["db_path"], cfg["completed_path"])
+        shippable = shippable_folders(cfg)
         unidentified = [f for f in pending_folders(cfg, UNIDENTIFIED, shippable)
                         if f not in attempted_unidentified]
         if not unidentified:
@@ -301,6 +336,7 @@ def parse_args(argv):
     parser.add_argument("-v", "--verbose", action="store_true", help="debug logging and rsync -v")
     parser.add_argument("--db-path", help="override db_path")
     parser.add_argument("--completed-path", help="override completed_path")
+    parser.add_argument("--arm-completed-path", help="override arm_completed_path")
     parser.add_argument("--lock-file", help="override lock_file")
     return parser.parse_args(argv)
 
@@ -311,6 +347,7 @@ def main(argv=None):
                         format="%(asctime)s %(levelname)s %(message)s")
     try:
         cfg = load_config(args.config, {"db_path": args.db_path, "completed_path": args.completed_path,
+                                        "arm_completed_path": args.arm_completed_path,
                                         "lock_file": args.lock_file})
         lock = acquire_lock(cfg["lock_file"])
     except ShipperError as err:
