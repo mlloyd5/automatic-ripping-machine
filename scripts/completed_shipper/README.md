@@ -19,8 +19,12 @@ for you to rename by hand, at lower priority and with a bandwidth cap.
    eligible if no other job (for example a re-rip of the same disc) is still
    unfinished on that same path.  Logs are never tailed.
 2. Ships every eligible folder in `movies/`, then `tv/`, with
-   `rsync -a -s --partial-dir=.rsync-partial --remove-source-files`.  After rsync
-   exits 0 the now-empty job folder is pruned.  Anything else is left in place for the next run.
+   `rsync -a -s --partial-dir=.rsync-partial --remove-source-files`.  First,
+   though, two rsync dry runs ask the media box whether the destination folder
+   already holds a file the transfer would replace (see **Never overwriting**
+   below); if it does, the folder ships as `Title (Year) - <disc label>`
+   beside the original instead.  After rsync exits 0 the now-empty job folder
+   is pruned.  Anything else is left in place for the next run.
 3. Only when no recognized folder is pending, ships **one** eligible
    `unidentified/` folder with `--bwlimit=bwlimit_unidentified`, then goes back
    to step 1.  A movie that finishes while a long unidentified transfer is
@@ -40,6 +44,40 @@ has transferred it, and the next timer run simply resumes.  Running it twice in 
 
 Folders whose job is still `active`, `ripping`, `transcoding`, `waiting` or
 `fail`, and folders ARM knows nothing about, are never touched.
+
+### Never overwriting what the media box holds
+
+ARM names every movie's main feature `<Title (Year)>.mkv`, so the second disc
+of a title the pool already has (the Blu-ray after the UHD, or a re-rip) would
+land on the feature Plex serves, and `--remove-source-files` would then delete
+the only other copy.  The shipper therefore never replaces a file on the media
+box:
+
+* Before a folder moves, two rsync dry runs (`-a --dry-run --itemize-changes`,
+  the second with `--ignore-existing`) list what the transfer would send.
+  Files in the first list but not the second exist at the destination and
+  differ, so the real transfer would replace them.  A file an interrupted run
+  already delivered is identical to its source (`-a` keeps size and time),
+  appears in neither list, and resumes in place as before.  Different file
+  names are no collision either: a second disc of a TV season joins the season
+  folder.
+* On a collision the folder ships as `<Title (Year)> - <disc label>` (the
+  disc's volume label, e.g. `Movie A (2001) - MOVIE_A_BD`), or
+  `<Title (Year)> - job<id>` when that name is taken as well.  Plex groups the
+  two folders as versions of one title, since the file inside is still called
+  `<Title (Year)>.mkv`; which one it serves, and whether both stay, is your
+  call, not the shipper's.  The catalog record names the folder that actually
+  received the files.
+* When every name is taken, or a probe fails, the folder stays on the ripper,
+  the log names the files that collided, and the run exits 1 (which also holds
+  back unidentified transfers, like any failed recognized folder).
+* Unidentified folders get the same treatment with the job id, since many
+  discs share labels like `DVD_VIDEO`.
+
+The dry runs are ordinary rsync pushes, so they need no listing or reading
+rights on the media box: a key confined to receiving rsync transfers (see the
+Proxmox section) allows them.  `--dry-run` runs them too, so a smoke test
+shows the name each folder would get.
 
 ## Requirements
 
@@ -134,6 +172,18 @@ The "ship immediately" hook below does not apply here: a `BASH_SCRIPT` inside
 ARM's container cannot start a unit on the host.  The 15-minute timer is the
 mechanism on this setup.
 
+The media box can confine that key to receiving rsync transfers with an
+`authorized_keys` forced command (the home-ansible-projects repo installs one,
+`arm-shipper-rsync`, that accepts `rsync --server` plus one cluster of short
+flags and refuses everything else, including `rsync --sender`): the shipper
+only ever pushes and never lists the media box.  The collision check before
+each folder is two `rsync --dry-run` pushes with the same ssh, `-s` and extra
+arguments as the transfer, so a forced command that accepts the transfer's
+command line accepts them too; on the remote side they differ from the
+transfer by one short flag (`n`).  Stock `rrsync -wo` does **not** work here:
+it refuses `-s`, which the shipper relies on to keep paths with spaces and
+parentheses off the remote command line.
+
 ## Configuration
 
 All settings live in one `[shipper]` section.  Defaults match a stock
@@ -145,8 +195,8 @@ All settings live in one `[shipper]` section.  Defaults match a stock
 | `completed_path` | ARM's `COMPLETED_PATH` as seen by **this** script.  On a native install copy it from `arm.yaml`; when the shipper runs outside ARM's container, use the host path of the same folder. |
 | `arm_completed_path` | `COMPLETED_PATH` exactly as in `arm.yaml`, i.e. the prefix ARM writes into `job.path`.  Defaults to `completed_path`; set it when the two differ (container vs host).  DB rows outside this prefix are ignored. |
 | `remote_host` | `user@host` of the media box.  Leave empty if the destination paths are local mounts (NFS/SMB) on the ripping box. |
-| `remote_movies_path` / `remote_tv_path` | Plex library folders on the media box.  Each rip lands as `<path>/<Title (Year)>/`. |
-| `remote_unidentified_path` | Staging folder on the media box for manual review.  Keep it **outside** any Plex library. |
+| `remote_movies_path` / `remote_tv_path` | Plex library folders on the media box.  Each rip lands as `<path>/<Title (Year)>/`, or as `<path>/<Title (Year)> - <disc label>/` when that folder already holds a file the rip would replace (see "Never overwriting"). |
+| `remote_unidentified_path` | Staging folder on the media box for manual review.  Keep it **outside** any Plex library.  Same rule for a folder name already in use, with the job id as the suffix. |
 | `remote_catalog_path` | Optional.  Directory on the media box that receives one catalog record per shipped movie or tv folder.  Must exist.  Empty turns records off. |
 | `catalog_spool_path` | Where records wait between being written and shipped.  Default `<completed_path>/catalog`. |
 | `ripper_name` | The ripper's name written into each record.  Default: this box's hostname. |
@@ -156,7 +206,7 @@ All settings live in one `[shipper]` section.  Defaults match a stock
 | `rsync_path` / `rsync_extra_args` | rsync binary and extra flags, e.g. `--chown=plex:plex` or `--chmod=D775,F664` so Plex can read the files. |
 | `rsync_timeout` | Seconds of I/O silence before rsync gives up; the folder is retried next run. |
 | `lock_file` | Prevents overlapping runs. |
-| `post_ship_command` | Optional shell command run after each folder ships, with `SHIPPER_TYPE`, `SHIPPER_FOLDER` and `SHIPPER_DESTINATION` in the environment. |
+| `post_ship_command` | Optional shell command run after each folder ships, with `SHIPPER_TYPE`, `SHIPPER_FOLDER` (ARM's folder name) and `SHIPPER_DESTINATION` (where it landed, suffix included) in the environment. |
 
 Command-line flags: `-c/--config`, `-n/--dry-run` (passes `--dry-run` to
 rsync and deletes nothing), `-v/--verbose`, plus `--db-path`,
@@ -217,6 +267,11 @@ Matroska header reader shipped next to the script (`python3 mkvheader.py
 listed by size alone.  Keys ARM did not fill (no barcode scanned, no sleeve
 label, a stock ARM database without those columns) are left out rather than
 written empty.
+
+`library`, `destination` and every file `path` name the folder the files
+actually landed in: a rip that had to ship as `Movie A (2001) - MOVIE_A_BD`
+because `Movie A (2001)` already held a feature is recorded under that name,
+while `main` still marks the feature (ARM names it after its own folder).
 
 The record is built before the folder's rsync starts, while every file is
 still local, and written atomically (via a `.tmp` file and a rename) to
@@ -339,7 +394,14 @@ whose transfer fails and ships on the next run, an interrupted folder transfer
 whose record still lists every file, pending records (atomic writes, never
 shipped early, finished when their folder is gone), an unwritable spool, a
 corrupt header or failing record build that still ships the folder, and that
-dry runs, unidentified rips and media-less folders leave none.
+dry runs, unidentified rips and media-less folders leave none.  For the
+collision check: a feature already on the media box is kept and the rip
+delivered beside it under the disc label, then under the job id, then left on
+the ripper with exit 1 when every name is taken; a second TV disc joins its
+season folder; a resumed transfer is not a collision; the record names the
+delivered folder; the probe command shape; and the itemized output of both
+rsync and openrsync (the one on macOS), which the test runs under whichever
+`rsync` is on `PATH`.
 
 ```bash
 python3 -m unittest scripts/completed_shipper/test_arm_completed_shipper.py
@@ -366,5 +428,14 @@ python3 -m unittest scripts/completed_shipper/test_arm_completed_shipper.py
 * **Unidentified rips never move.**  A recognized folder keeps failing (the
   log says which) and blocks them by design.  Fix or move that folder, then the
   next run proceeds.
+* **A folder arrived as `Title (Year) - LABEL`.**  `Title (Year)` on the media
+  box already held a file of the same name that differed; the log names it.
+  Nothing was overwritten or deleted.  Decide which copy Plex should keep (or
+  keep both as versions) and tidy by hand on the media box.
+* **"every destination name for ... already holds a file it would replace".**
+  ARM's name, the label name and the job-id name all exist on the media box
+  with that file.  Move or remove one there, or rename the folder on the
+  ripper; the next run retries.  Until then the run exits 1 and unidentified
+  transfers wait.
 * **Permissions on the media box.**  Use `rsync_extra_args = --chmod=D775,F664`
   (and `--chown=` if the ssh user may chown) so the Plex user can read the files.

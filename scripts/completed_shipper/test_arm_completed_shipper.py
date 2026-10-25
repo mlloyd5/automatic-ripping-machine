@@ -29,8 +29,8 @@ import mkvheader  # noqa: E402
 
 FAKE_RSYNC = """#!/bin/sh
 # Test double: log the call, optionally fail, otherwise run the real rsync.
-# SHIPPER_TEST_INTERRUPT_FOR / _BEFORE: for a matching call, transfer (and remove) everything except
-# the files matching the _BEFORE exclude pattern, then exit as if the run had been killed.
+# SHIPPER_TEST_INTERRUPT_FOR / _BEFORE: for a matching transfer (never a --dry-run probe), transfer (and
+# remove) everything except the files matching the _BEFORE exclude pattern, then exit as if killed.
 printf '%s\\n' "$*" >> "$SHIPPER_TEST_LOG"
 if [ -n "$SHIPPER_TEST_FAIL_FOR" ]; then
     case "$*" in
@@ -39,6 +39,7 @@ if [ -n "$SHIPPER_TEST_FAIL_FOR" ]; then
 fi
 if [ -n "$SHIPPER_TEST_INTERRUPT_FOR" ]; then
     case "$*" in
+        *--dry-run*) ;;
         *"$SHIPPER_TEST_INTERRUPT_FOR"*)
             "$SHIPPER_TEST_REAL_RSYNC" --exclude="$SHIPPER_TEST_INTERRUPT_BEFORE" "$@"
             echo "fake rsync: interrupted" >&2; exit 20 ;;
@@ -150,6 +151,10 @@ post_ship_command = echo "$SHIPPER_TYPE $SHIPPER_FOLDER" >> {self.tmp}/hook.log
         with open(self.log) as handle:
             return [line.rstrip("\n") for line in handle if line.strip()]
 
+    def _transfers(self):
+        """The rsync calls that move files: every call but the collision probes (dry runs)."""
+        return [c for c in self._calls() if "--dry-run" not in c]
+
     def _local(self, sub, name):
         return os.path.join(self.completed, sub, name)
 
@@ -197,16 +202,28 @@ class ShipperEndToEnd(ShipperFixture):
         self.assertFalse(os.path.exists(self.spool))
 
         calls = self._calls()
-        self.assertEqual(len(calls), 4)
+        transfers = self._transfers()
+        self.assertEqual(len(transfers), 4)
         kinds = ["/completed/movies/" in c and "movies" or "/completed/tv/" in c and "tv" or "unidentified"
-                 for c in calls]
+                 for c in transfers]
         self.assertEqual(kinds, ["movies", "tv", "unidentified", "unidentified"])
-        for call in calls[:2]:
+        for call in transfers[:2]:
             self.assertNotIn("--bwlimit", call)
             self.assertIn("--remove-source-files", call)
             self.assertIn("--partial-dir=.rsync-partial", call)
-        for call in calls[2:]:
+        for call in transfers[2:]:
             self.assertIn("--bwlimit=500", call)
+        # Every transfer was preceded by its two collision probes: itemized dry runs, one of them
+        # with --ignore-existing, that remove nothing and are not throttled.
+        probes = [c for c in calls if "--dry-run" in c]
+        self.assertEqual(len(probes), 8)
+        self.assertEqual([c for c in calls if "--dry-run" not in c], transfers)
+        self.assertEqual(calls.index(transfers[0]), 2)
+        self.assertEqual(sum("--ignore-existing" in c for c in probes), 4)
+        for probe in probes:
+            self.assertIn("--itemize-changes", probe)
+            for flag in ("--remove-source-files", "--partial-dir", "--bwlimit"):
+                self.assertNotIn(flag, probe)
 
         with open(os.path.join(self.tmp, "hook.log")) as handle:
             hooks = handle.read().splitlines()
@@ -244,14 +261,17 @@ class ShipperEndToEnd(ShipperFixture):
         self.assertTrue(os.path.isfile(os.path.join(self._shipped("staging", "UNKNOWN_2"), "title_t00.mkv")))
 
     def test_interrupted_transfer_resumes_on_rerun(self):
-        # Pretend an earlier run copied one episode and was killed before removing the source.
+        # Pretend an earlier run copied one episode and was killed before removing the source.  rsync -a
+        # leaves the delivered file with its source's size and time (copy2 does the same), which is how
+        # the next run tells a resume from a file it would replace.
         partial = self._shipped("TV", "Show A (2010)")
         os.makedirs(partial)
-        shutil.copy(os.path.join(self._local("tv", "Show A (2010)"), "S01E01.mkv"), partial)
+        shutil.copy2(os.path.join(self._local("tv", "Show A (2010)"), "S01E01.mkv"), partial)
         self.assertEqual(self._run(), 0)
         self.assertTrue(os.path.isfile(os.path.join(partial, "S01E01.mkv")))
         self.assertTrue(os.path.isfile(os.path.join(partial, "S01E02.mkv")))
         self.assertFalse(os.path.exists(self._local("tv", "Show A (2010)")))
+        self.assertEqual(os.listdir(os.path.join(self.dest, "TV")), ["Show A (2010)"])
 
     def test_dry_run_moves_nothing(self):
         rc = self._run("--dry-run")
@@ -259,8 +279,9 @@ class ShipperEndToEnd(ShipperFixture):
         self.assertTrue(os.path.isdir(self._local("movies", "Movie A (2001)")))
         self.assertFalse(os.path.exists(self._shipped("Movies", "Movie A (2001)")))
         calls = self._calls()
-        self.assertEqual(len(calls), 4)
+        self.assertEqual(len(calls), 12)
         self.assertTrue(all("--dry-run" in c for c in calls))
+        self.assertEqual(sum("--remove-source-files" in c for c in calls), 4)
 
     def test_lock_prevents_overlapping_runs(self):
         cfg = shipper.load_config(self.conf)
@@ -291,7 +312,7 @@ class ShipperEndToEnd(ShipperFixture):
         for name in ("Movie B (2002)", "Movie C (2003)", "Movie D (2004)", "Movie E (2005)"):
             self.assertTrue(os.path.isdir(self._local("movies", name)), name)
             self.assertFalse(os.path.exists(self._shipped("Movies", name)), name)
-        self.assertEqual(len(self._calls()), 4)
+        self.assertEqual(len(self._transfers()), 4)
 
     def test_db_paths_from_container_are_mapped_to_local_path(self):
         self._use_container_paths_in_db()
@@ -349,6 +370,26 @@ class RsyncCommandShape(unittest.TestCase):
         self.assertIn("--partial-dir=.rsync-partial", cmd)
         self.assertEqual(cmd[-1], "/m/Film (1999)/")
 
+    def test_probe_command_shape(self):
+        cfg = dict(shipper.DEFAULTS, remote_host="root@t620", remote_movies_path="/tank/media/movies",
+                   remote_tv_path="/t", remote_unidentified_path="/u", bwlimit_recognized="4000",
+                   ssh_options="-o BatchMode=yes", rsync_extra_args="--chmod=D755,F644")
+        cmd = shipper.build_probe_rsync_command(cfg, "movies", "/c/movies/Film (1999)", "Film (1999) - FILM_BD",
+                                                ignore_existing=True)
+        self.assertEqual(cmd[:5], ["rsync", "-a", "--dry-run", "--itemize-changes", "--timeout=300"])
+        self.assertIn("--ignore-existing", cmd)
+        self.assertIn("-s", cmd)
+        self.assertEqual(cmd[cmd.index("-e") + 1], "ssh -o BatchMode=yes")
+        # The transfer's extra arguments apply (an --exclude there must hold here too); nothing moves.
+        self.assertIn("--chmod=D755,F644", cmd)
+        for flag in ("--remove-source-files", "--partial-dir=.rsync-partial", "--bwlimit=4000"):
+            self.assertNotIn(flag, cmd)
+        self.assertEqual(cmd[-2:], ["/c/movies/Film (1999)/", "root@t620:/tank/media/movies/Film (1999) - FILM_BD/"])
+        plain = shipper.build_probe_rsync_command(cfg, "movies", "/c/movies/Film (1999)", "Film (1999)")
+        self.assertNotIn("--ignore-existing", plain)
+        self.assertEqual(plain[-1], "root@t620:/tank/media/movies/Film (1999)/")
+        self.assertEqual(shipper.destination(cfg, "movies", "/c/movies/Film (1999)"), "root@t620:/tank/media/movies/Film (1999)/")
+
     def test_missing_destination_is_a_config_error(self):
         with tempfile.TemporaryDirectory() as tmp:
             conf = os.path.join(tmp, "c.conf")
@@ -367,6 +408,164 @@ class RsyncCommandShape(unittest.TestCase):
             cfg = shipper.load_config(conf)
             self.assertEqual(cfg["post_ship_command"], hook)
             self.assertEqual(os.path.realpath(cfg["arm_completed_path"]), cfg["completed_path"])
+
+
+# ---------------------------------------------------------------------- collision probes
+
+class CollisionProbe(unittest.TestCase):
+    def test_transferred_files_reads_both_rsync_dialects(self):
+        output = "\n".join([
+            "cd+++++++++ ./",
+            ">f+++++++++ Movie A (2001).mkv",            # rsync 3.x, local destination, new file
+            "cd+++++++++ extras/",
+            ">f.st...... extras/trailer.mkv",            # existing file that differs
+            "<f......... Movie B (2002).mkv",            # rsync 3.x over ssh: dry run into a folder not there yet
+            ">f....... Movie C (2003).mkv",              # openrsync, same case
+            ">f+++++++ extras/t 2.mkv",                  # openrsync, new file in an existing folder
+            ".f...p..... perms only.mkv",                # attributes only: no content sent
+            "cL+++++++++ link.mkv -> target",
+            "created directory x",
+            "",
+        ])
+        self.assertEqual(shipper.transferred_files(output),
+                         ["Movie A (2001).mkv", "extras/trailer.mkv", "Movie B (2002).mkv", "Movie C (2003).mkv",
+                          "extras/t 2.mkv"])
+        self.assertEqual(shipper.transferred_files(""), [])
+
+    def test_remote_folder_names_fall_back_from_label_to_job_id(self):
+        job = {"job_id": 7, "label": " MOVIE/A:BD\t"}
+        self.assertEqual(shipper.remote_folder_names("/c/movies/Movie A (2001)/", job),
+                         ["Movie A (2001)", "Movie A (2001) - MOVIE A:BD", "Movie A (2001) - job7"])
+        self.assertEqual(shipper.remote_folder_names("/c/movies/X", {"job_id": 3, "label": None}), ["X", "X - job3"])
+        self.assertEqual(shipper.remote_folder_names("/c/movies/X", {"job_id": 3, "label": "  "}), ["X", "X - job3"])
+        self.assertEqual(shipper.remote_folder_names("/c/movies/X", None), ["X"])
+        long_label = "L" * 100
+        names = shipper.remote_folder_names("/c/movies/X", {"job_id": 1, "label": long_label})
+        self.assertEqual(names[1], "X - " + "L" * shipper.SUFFIX_MAX_LENGTH)
+
+
+class NoOverwrite(ShipperFixture):
+    """The media box already holds a file the transfer would replace: it is kept and the rip lands beside it."""
+
+    def setUp(self):
+        super().setUp()
+        os.makedirs(self.records)
+        with open(self.conf, "a") as handle:
+            handle.write(f"remote_catalog_path = {self.records}\nripper_name = ts140\n")
+        self._set_job("Movie A (2001)", title="Movie A", year="2001", label="MOVIE_A_BD", disctype="bluray",
+                      stop_time="2026-10-25 14:03:11")
+
+    def _plant(self, dest_sub, folder, name, content="an earlier rip\n"):
+        """A file on the media box as an earlier rip left it, old and different, so rsync would replace it."""
+        path = os.path.join(self.dest, dest_sub, folder, name)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as handle:
+            handle.write(content)
+        os.utime(path, (1500000000, 1500000000))
+        return path
+
+    def _read(self, path):
+        with open(path) as handle:
+            return handle.read()
+
+    def _dest_folders(self, dest_sub):
+        return sorted(os.listdir(os.path.join(self.dest, dest_sub)))
+
+    def test_existing_feature_is_kept_and_the_rip_lands_beside_it(self):
+        kept = self._plant("Movies", "Movie A (2001)", "Movie A (2001).mkv")
+        self.assertEqual(self._run(), 0)
+        # The feature Plex serves is untouched and nothing else landed in its folder.
+        self.assertEqual(self._read(kept), "an earlier rip\n")
+        self.assertEqual(os.listdir(self._shipped("Movies", "Movie A (2001)")), ["Movie A (2001).mkv"])
+        # The new rip was neither dropped nor deleted: it is complete under the disc label.
+        beside = self._shipped("Movies", "Movie A (2001) - MOVIE_A_BD")
+        self.assertEqual(self._read(os.path.join(beside, "Movie A (2001).mkv")), "content of Movie A (2001).mkv\n")
+        self.assertEqual(self._read(os.path.join(beside, "extras", "trailer.mkv")), "content of extras/trailer.mkv\n")
+        self.assertFalse(os.path.exists(self._local("movies", "Movie A (2001)")))
+        self.assertEqual(self._dest_folders("Movies"), ["Movie A (2001)", "Movie A (2001) - MOVIE_A_BD"])
+        # The catalog record names the folder that received the files; the main feature is still recognized.
+        movie = next(n for n in os.listdir(self.records) if "-job1" in n)
+        top, files = parse_record(self._read(os.path.join(self.records, movie)))
+        self.assertEqual(top["library"], "movies/Movie A (2001) - MOVIE_A_BD")
+        self.assertEqual(top["destination"], os.path.join(self.dest, "Movies", "Movie A (2001) - MOVIE_A_BD"))
+        self.assertEqual([f["path"] for f in files],
+                         ["movies/Movie A (2001) - MOVIE_A_BD/Movie A (2001).mkv",
+                          "movies/Movie A (2001) - MOVIE_A_BD/extras/trailer.mkv"])
+        self.assertEqual([f["main"] for f in files], [True, False])
+        self.assertEqual(top["role"], "feature")
+        # Two probes against ARM's name, two against the label name, then the one transfer, to the label name.
+        movie_calls = [c for c in self._calls() if "/completed/movies/Movie A (2001)/" in c]
+        self.assertEqual([("--dry-run" in c, c.endswith("/Movie A (2001) - MOVIE_A_BD/")) for c in movie_calls],
+                         [(True, False), (True, False), (True, True), (True, True), (False, True)])
+        # Other folders shipped as usual.
+        self.assertTrue(os.path.isfile(os.path.join(self._shipped("TV", "Show A (2010)"), "S01E02.mkv")))
+        self.assertFalse(os.path.exists(self._local("unidentified", "UNKNOWN_DISC")))
+
+    def test_label_name_taken_too_falls_back_to_the_job_id(self):
+        self._plant("Movies", "Movie A (2001)", "Movie A (2001).mkv")
+        self._plant("Movies", "Movie A (2001) - MOVIE_A_BD", "Movie A (2001).mkv")
+        self.assertEqual(self._run(), 0)
+        self.assertEqual(self._dest_folders("Movies"),
+                         ["Movie A (2001)", "Movie A (2001) - MOVIE_A_BD", "Movie A (2001) - job1"])
+        self.assertTrue(os.path.isfile(os.path.join(self._shipped("Movies", "Movie A (2001) - job1"), "extras", "trailer.mkv")))
+        self.assertFalse(os.path.exists(self._local("movies", "Movie A (2001)")))
+        for folder in ("Movie A (2001)", "Movie A (2001) - MOVIE_A_BD"):
+            self.assertEqual(self._read(os.path.join(self._shipped("Movies", folder), "Movie A (2001).mkv")),
+                             "an earlier rip\n")
+
+    def test_every_name_taken_leaves_the_folder_and_fails_the_run(self):
+        taken = ("Movie A (2001)", "Movie A (2001) - MOVIE_A_BD", "Movie A (2001) - job1")
+        for folder in taken:
+            self._plant("Movies", folder, "Movie A (2001).mkv")
+        self.assertEqual(self._run(), 1)
+        # Nothing on the media box changed, the rip is still on the ripper, no transfer ran for it.
+        self.assertEqual(self._dest_folders("Movies"), sorted(taken))
+        for folder in taken:
+            self.assertEqual(os.listdir(self._shipped("Movies", folder)), ["Movie A (2001).mkv"])
+            self.assertEqual(self._read(os.path.join(self._shipped("Movies", folder), "Movie A (2001).mkv")),
+                             "an earlier rip\n")
+        self.assertEqual(self._read(os.path.join(self._local("movies", "Movie A (2001)"), "Movie A (2001).mkv")),
+                         "content of Movie A (2001).mkv\n")
+        self.assertTrue(os.path.isfile(os.path.join(self._local("movies", "Movie A (2001)"), "extras", "trailer.mkv")))
+        self.assertFalse(any("Movie A (2001)" in c for c in self._transfers()))
+        self.assertFalse(any("-job1" in n for n in os.listdir(self.records)))
+        self.assertFalse(os.path.isdir(self.spool) and os.listdir(self.spool))
+        # A recognized folder failed, so tv still shipped but no unidentified transfer started.
+        self.assertTrue(os.path.isfile(os.path.join(self._shipped("TV", "Show A (2010)"), "S01E01.mkv")))
+        self.assertTrue(os.path.isdir(self._local("unidentified", "UNKNOWN_DISC")))
+        self.assertFalse(any("unidentified" in c for c in self._calls()))
+
+    def test_another_disc_of_a_show_joins_its_folder(self):
+        # Different file names are not a collision: a second disc's episodes join the season folder.
+        kept = self._plant("TV", "Show A (2010)", "S01E03.mkv")
+        self.assertEqual(self._run(), 0)
+        show = self._shipped("TV", "Show A (2010)")
+        self.assertEqual(sorted(os.listdir(show)), ["S01E01.mkv", "S01E02.mkv", "S01E03.mkv"])
+        self.assertEqual(self._read(kept), "an earlier rip\n")
+        self.assertEqual(self._dest_folders("TV"), ["Show A (2010)"])
+        self.assertFalse(os.path.exists(self._local("tv", "Show A (2010)")))
+
+    def test_unidentified_folder_of_a_repeated_label_lands_beside_the_first(self):
+        # Unidentified folders are named after the disc label, which many discs share.
+        kept = self._plant("staging", "UNKNOWN_DISC", "title_t00.mkv")
+        conn = sqlite3.connect(self.db)
+        job_id = conn.execute("SELECT job_id FROM job WHERE path LIKE '%UNKNOWN_DISC%'").fetchone()[0]
+        conn.close()
+        self.assertEqual(self._run(), 0)
+        self.assertEqual(self._read(kept), "an earlier rip\n")
+        beside = self._shipped("staging", f"UNKNOWN_DISC - job{job_id}")
+        self.assertEqual(self._read(os.path.join(beside, "title_t00.mkv")), "content of title_t00.mkv\n")
+        self.assertFalse(os.path.exists(self._local("unidentified", "UNKNOWN_DISC")))
+        self.assertEqual(self._dest_folders("staging"), ["UNKNOWN_2", "UNKNOWN_DISC", f"UNKNOWN_DISC - job{job_id}"])
+
+    def test_dry_run_names_the_free_folder_and_moves_nothing(self):
+        self._plant("Movies", "Movie A (2001)", "Movie A (2001).mkv")
+        self.assertEqual(self._run("--dry-run"), 0)
+        self.assertTrue(os.path.isfile(os.path.join(self._local("movies", "Movie A (2001)"), "Movie A (2001).mkv")))
+        self.assertEqual(self._dest_folders("Movies"), ["Movie A (2001)"])
+        transfer = next(c for c in self._calls() if "--remove-source-files" in c and "Movie A (2001)" in c)
+        self.assertTrue(transfer.endswith("/Movie A (2001) - MOVIE_A_BD/"), transfer)
+        self.assertFalse(os.path.exists(self.spool))
 
 
 # ---------------------------------------------------------------------- minimal Matroska files

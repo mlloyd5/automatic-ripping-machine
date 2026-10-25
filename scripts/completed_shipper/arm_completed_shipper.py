@@ -27,6 +27,15 @@ Safety rules:
 * Interrupted files are kept in a ``.rsync-partial`` directory on the
   destination, never under their final name, so Plex never indexes a
   truncated file.
+* Nothing already on the media box is overwritten.  ARM names every main
+  feature ``<Title (Year)>.mkv``, so a second disc of a title the pool holds
+  (the Blu-ray after the UHD, a re-rip) would otherwise replace the feature
+  Plex serves, and ``--remove-source-files`` would then delete the only other
+  copy.  Before a folder moves, two rsync dry runs find out which of its files
+  the transfer would replace; if any, the folder ships as
+  ``<Title (Year)> - <disc label>`` (or ``- job<id>``) beside the original,
+  and if that collides too it stays on the ripper and the run exits 1.  The
+  dry runs need no listing rights: a write-only destination key allows them.
 * A lock file stops two runs overlapping.
 * Only the standard library plus ``rsync`` are needed.
 
@@ -48,7 +57,9 @@ Catalog records:
   describing only the files still left.  Once rsync has delivered the whole
   folder the record is renamed to ``<name>.toml``, shipped with its own rsync
   and removed from the spool.  A record whose transfer failed waits in the
-  spool and goes on the next run, before anything else.
+  spool and goes on the next run, before anything else.  Its ``library``,
+  ``destination`` and file paths name the folder that actually received the
+  files, suffix included.
 * The record is optional metadata: nothing about building or spooling it can
   stop a folder from shipping.
 """
@@ -82,6 +93,10 @@ MEDIA_EXTENSIONS = (".mkv", ".mp4", ".m4v", ".webm", ".avi", ".ts")
 """Files a job folder holds that belong in a media catalog; sidecars (disc.jpg, disc.barcode, posters) do not."""
 UHD_MIN_WIDTH = 3000
 HD_MIN_WIDTH = 1280
+SUFFIX_MAX_LENGTH = 64
+"""Longest disc label appended to a destination folder name that already holds a file the transfer would replace."""
+TRANSFER_ITEM = re.compile(r"^[<>]f\S* (.+)$")
+"""An ``rsync --itemize-changes`` line for a file the transfer sends (``<`` to a remote, ``>`` locally): flags, space, name."""
 
 JOB_COLUMNS = ("job_id", "status", "path", "title", "title_manual", "year", "year_manual", "video_type",
                "imdb_id", "label", "disctype", "disc_barcode", "disc_barcode_title", "sleeve_id", "box",
@@ -256,22 +271,37 @@ def pending_folders(cfg, sub_folder, shippable):
 
 # --------------------------------------------------------------------------- rsync
 
-def destination(cfg, sub_folder, local_folder):
+def destination(cfg, sub_folder, local_folder, remote_name=None):
     """
     Build the rsync destination string for one job folder.
+
+    ``remote_name`` is the folder name on the media box; it defaults to the job
+    folder's own name and differs only when :func:`choose_remote_name` had to
+    step aside from a folder that already holds a file the transfer would replace.
 
     The remote path is deliberately not shell-quoted: rsync is run with ``-s``
     (``--protect-args``), so the path travels inside the rsync protocol and the
     remote shell never parses it.  Quoting it as well would make the quotes part
     of the path on rsync >= 3.2.4, which escapes remote args itself.
     """
-    remote_dir = os.path.join(remote_root_for(cfg, sub_folder), os.path.basename(local_folder))
+    remote_dir = os.path.join(remote_root_for(cfg, sub_folder), remote_name or os.path.basename(local_folder))
     if cfg["remote_host"]:
         return f"{cfg['remote_host']}:{remote_dir}/"
     return remote_dir + os.sep
 
 
-def build_rsync_command(cfg, sub_folder, local_folder, dry_run=False, verbose=False):
+def remote_shell_args(cfg):
+    """``-s -e ssh ...`` for a remote destination, nothing for a local one."""
+    if not cfg["remote_host"]:
+        return []
+    ssh = "ssh"
+    if cfg["ssh_options"]:
+        ssh += " " + cfg["ssh_options"]
+    # -s: send paths inside the protocol, safe from remote shell word splitting/quoting.
+    return ["-s", "-e", ssh]
+
+
+def build_rsync_command(cfg, sub_folder, local_folder, dry_run=False, verbose=False, remote_name=None):
     """Compose the full rsync argv for shipping one job folder."""
     # --partial-dir keeps an interrupted file out of the library folder (under its final
     # name Plex would index a truncated file); a dot-directory is ignored by Plex.
@@ -284,17 +314,115 @@ def build_rsync_command(cfg, sub_folder, local_folder, dry_run=False, verbose=Fa
     bwlimit = bwlimit_for(cfg, sub_folder)
     if bwlimit > 0:
         cmd.append(f"--bwlimit={bwlimit}")
-    if cfg["remote_host"]:
-        ssh = "ssh"
-        if cfg["ssh_options"]:
-            ssh += " " + cfg["ssh_options"]
-        # -s: send paths inside the protocol, safe from remote shell word splitting/quoting.
-        cmd.extend(["-s", "-e", ssh])
+    cmd.extend(remote_shell_args(cfg))
     if cfg["rsync_extra_args"]:
         cmd.extend(shlex.split(cfg["rsync_extra_args"]))
     cmd.append(local_folder.rstrip(os.sep) + os.sep)
-    cmd.append(destination(cfg, sub_folder, local_folder))
+    cmd.append(destination(cfg, sub_folder, local_folder, remote_name))
     return cmd
+
+
+def build_probe_rsync_command(cfg, sub_folder, local_folder, remote_name, ignore_existing=False):
+    """
+    rsync argv for one collision probe: a dry run that itemizes what the real transfer would send.
+
+    Same ssh, timeout and extra arguments as the transfer (an ``--exclude`` there
+    must hold here too), no bandwidth cap, nothing removed.  Only the short-flag
+    cluster differs on the remote command line, so a forced command written for
+    the transfer accepts the probe as well.
+    """
+    cmd = [cfg["rsync_path"], "-a", "--dry-run", "--itemize-changes", f"--timeout={int(cfg['rsync_timeout'])}"]
+    if ignore_existing:
+        cmd.append("--ignore-existing")
+    cmd.extend(remote_shell_args(cfg))
+    if cfg["rsync_extra_args"]:
+        cmd.extend(shlex.split(cfg["rsync_extra_args"]))
+    cmd.append(local_folder.rstrip(os.sep) + os.sep)
+    cmd.append(destination(cfg, sub_folder, local_folder, remote_name))
+    return cmd
+
+
+def transferred_files(itemized_output):
+    """
+    Names (relative to the transfer root) of the files an ``--itemize-changes`` run says it sends.
+
+    Only the first two characters of the flags are read: a dry run reports files
+    inside a folder that does not exist yet with dots instead of pluses (rsync
+    over ssh and openrsync both do), so the flags cannot tell a new file from a
+    replaced one.  :func:`colliding_files` gets that from a second probe instead.
+    """
+    names = []
+    for line in itemized_output.splitlines():
+        match = TRANSFER_ITEM.match(line)
+        if match:
+            names.append(match.group(1))
+    return names
+
+
+def colliding_files(cfg, sub_folder, local_folder, remote_name):
+    """
+    Files in the job folder that the real transfer into ``remote_name`` would replace on the media box.
+
+    Two dry runs: without ``--ignore-existing`` rsync lists every file it would
+    send (new ones and existing ones that differ); with it, only the files the
+    destination lacks.  The difference is exactly what would be overwritten.  A
+    file an earlier, interrupted run already delivered is identical to its
+    source (``-a`` keeps size and time) and appears in neither list, so a resume
+    is not a collision.  Returns the sorted names, or None when a probe failed.
+    """
+    listings = []
+    for ignore_existing in (False, True):
+        cmd = build_probe_rsync_command(cfg, sub_folder, local_folder, remote_name, ignore_existing)
+        log.debug("rsync argv: %s", " ".join(shlex.quote(part) for part in cmd))
+        result = subprocess.run(cmd, stdout=subprocess.PIPE, universal_newlines=True)
+        if result.returncode != 0:
+            log.error("rsync probe exited %d for %s -> %s; leaving local copy for the next run",
+                      result.returncode, local_folder, cmd[-1])
+            return None
+        listings.append(set(transferred_files(result.stdout)))
+    would_send, new_only = listings
+    return sorted(would_send - new_only)
+
+
+def remote_folder_names(local_folder, job):
+    """
+    Destination folder names to try for one job folder, in order.
+
+    ARM's own name first.  Then, for a folder that already holds a file the
+    transfer would replace, the same name with the disc label appended and
+    finally with the job id, so a second disc of a title the pool already has
+    (the Blu-ray after the UHD, a re-rip) lands beside the first copy, never over
+    it.  Plex groups both as versions of the one title.
+    """
+    folder = os.path.basename(local_folder.rstrip(os.sep))
+    names = [folder]
+    label = _clean(job.get("label")) if job else None
+    if label:
+        safe = " ".join(re.sub(r"[\\/\x00-\x1f\x7f]+", " ", label).split())[:SUFFIX_MAX_LENGTH].strip()
+        if safe:
+            names.append(f"{folder} - {safe}")
+    job_id = job.get("job_id") if job else None
+    if job_id:
+        names.append(f"{folder} - job{job_id}")
+    return names
+
+
+def choose_remote_name(cfg, sub_folder, local_folder, job):
+    """
+    The destination folder name for one job folder: the first of :func:`remote_folder_names`
+    that holds no file the transfer would replace.  None when all collide or a probe failed.
+    """
+    for name in remote_folder_names(local_folder, job):
+        collisions = colliding_files(cfg, sub_folder, local_folder, name)
+        if collisions is None:
+            return None
+        if not collisions:
+            return name
+        log.warning("%s already holds %s; not overwriting", destination(cfg, sub_folder, local_folder, name),
+                    ", ".join(collisions))
+    log.error("every destination name for %s already holds a file it would replace; leaving it for the next run",
+              local_folder)
+    return None
 
 
 def prune_empty_dirs(folder):
@@ -309,13 +437,15 @@ def prune_empty_dirs(folder):
             log.warning("could not remove %s: %s", root, err)
 
 
-def run_post_ship_command(cfg, sub_folder, local_folder):
+def run_post_ship_command(cfg, sub_folder, local_folder, remote_name=None):
     """Run the optional hook after a folder has shipped (e.g. to trigger a Plex scan)."""
     hook = cfg["post_ship_command"]
     if not hook:
         return
+    # SHIPPER_FOLDER is ARM's name for the job folder; SHIPPER_DESTINATION is where it landed,
+    # which carries a suffix when that name was already taken.
     env = dict(os.environ, SHIPPER_TYPE=sub_folder, SHIPPER_FOLDER=os.path.basename(local_folder),
-               SHIPPER_DESTINATION=destination(cfg, sub_folder, local_folder))
+               SHIPPER_DESTINATION=destination(cfg, sub_folder, local_folder, remote_name))
     result = subprocess.run(["/bin/sh", "-c", hook], env=env)
     if result.returncode != 0:
         log.warning("post_ship_command exited %d for %s", result.returncode, local_folder)
@@ -333,18 +463,31 @@ def ship_folder(cfg, sub_folder, local_folder, dry_run=False, verbose=False, job
     the media box, still counts as shipped, but the run exits 1
     (``stats["failed"]``) so the problem is noticed.  A record that cannot be
     built or spooled never stops the folder itself from shipping.
+
+    Nothing on the media box is overwritten: :func:`choose_remote_name` probes
+    the destination first and steps aside to ``<name> - <disc label>`` (then
+    ``<name> - job<id>``) when the folder already holds a file this transfer
+    would replace.  When every name collides, or a probe fails, the folder stays
+    and the run exits 1.  The record names the folder that actually received the
+    files.
     """
+    remote_name = choose_remote_name(cfg, sub_folder, local_folder, job)
+    if remote_name is None:
+        return False
+    renamed = remote_name != os.path.basename(local_folder.rstrip(os.sep))
+    if renamed:
+        log.warning("shipping %s as %s instead", local_folder, remote_name)
     pending = None
     if job is not None and cfg["remote_catalog_path"] and sub_folder != UNIDENTIFIED:
         try:
-            pending = prepare_record(cfg, sub_folder, local_folder, job, dry_run=dry_run)
+            pending = prepare_record(cfg, sub_folder, local_folder, job, remote_name, dry_run=dry_run)
         except Exception as err:  # optional metadata: never block the transfer
             if not isinstance(err, RecordError):
                 log.exception("could not prepare the catalog record for %s; shipping the folder without it",
                               local_folder)
             if stats is not None:
                 stats["failed"] += 1
-    cmd = build_rsync_command(cfg, sub_folder, local_folder, dry_run=dry_run, verbose=verbose)
+    cmd = build_rsync_command(cfg, sub_folder, local_folder, dry_run=dry_run, verbose=verbose, remote_name=remote_name)
     log.info("shipping [%s] %s -> %s", sub_folder, local_folder, cmd[-1])
     log.debug("rsync argv: %s", " ".join(shlex.quote(part) for part in cmd))
     result = subprocess.run(cmd)
@@ -359,6 +502,8 @@ def ship_folder(cfg, sub_folder, local_folder, dry_run=False, verbose=False, job
         log.error("rsync succeeded but %s still has content; not treating as shipped", local_folder)
         return False
     log.info("shipped and removed %s", local_folder)
+    if renamed and stats is not None:
+        stats["renamed"] += 1
     if pending:
         finished = finish_record(pending)
         if finished and ship_record(cfg, finished):
@@ -366,7 +511,7 @@ def ship_folder(cfg, sub_folder, local_folder, dry_run=False, verbose=False, job
                 stats["records"] += 1
         elif stats is not None:
             stats["failed"] += 1
-    run_post_ship_command(cfg, sub_folder, local_folder)
+    run_post_ship_command(cfg, sub_folder, local_folder, remote_name)
     return True
 
 
@@ -465,31 +610,35 @@ def record_name(cfg, job, suffix=RECORD_SUFFIX):
     return f"{when.strftime('%Y%m%d-%H%M%S')}-{cfg['ripper_name']}{_job_tag(job)}{suffix}"
 
 
-def library_path(sub_folder, local_folder):
-    """``<sub folder>/<job folder>``: the record's ``library`` key, and where the folder sits under completed_path."""
-    return f"{sub_folder}/{os.path.basename(local_folder.rstrip(os.sep))}"
+def library_path(sub_folder, folder):
+    """``<sub folder>/<folder name>``: the record's ``library`` key for a folder (a path's last component counts)."""
+    return f"{sub_folder}/{os.path.basename(folder.rstrip(os.sep))}"
 
 
-def catalog_record(cfg, sub_folder, local_folder, job):
+def catalog_record(cfg, sub_folder, local_folder, job, remote_name=None):
     """
     Build the catalog record for one job folder about to ship.
 
     Reads the Matroska header of every media file in the folder, so it must run
-    before rsync starts removing them.  Returns ``(file name, TOML text)`` (the
-    name ends in ``.toml``), or None when the folder holds no media file
-    (nothing for a catalog to register).
+    before rsync starts removing them.  ``remote_name`` is the folder on the
+    media box that receives the files (the job folder's own name unless that
+    was taken); ``library``, ``destination`` and the file paths name it.
+    Returns ``(file name, TOML text)`` (the name ends in ``.toml``), or None
+    when the folder holds no media file (nothing for a catalog to register).
     """
     files = folder_media_files(local_folder)
     if not files:
         log.warning("no media file in %s; no catalog record written", local_folder)
         return None
     folder = os.path.basename(local_folder.rstrip(os.sep))
-    library = library_path(sub_folder, local_folder)
+    remote_name = remote_name or folder
+    library = library_path(sub_folder, remote_name)
     rows = []
     for relative in files:
         row = mkvheader.probe_row(os.path.join(local_folder, relative))
         stem = relative.rsplit(".", 1)[0]
         row["path"] = f"{library}/{relative}"
+        # ARM names the main feature after its own folder, whatever the destination is called.
         row["main"] = "/" not in relative and stem == folder
         if not row["probed"]:
             log.debug("%s is not Matroska or unreadable; listed by size only", relative)
@@ -508,7 +657,7 @@ def catalog_record(cfg, sub_folder, local_folder, job):
         ("year", _job_year(job)),
         (id_key, id_value),
         ("library", library),
-        ("destination", os.path.join(remote_root_for(cfg, sub_folder), folder)),
+        ("destination", os.path.join(remote_root_for(cfg, sub_folder), remote_name)),
         ("label", _clean(job.get("label")) or ""),
         ("format", disc_format(job, rows)),
         ("role", "feature" if sub_folder == "tv" or any(row["main"] for row in rows) else "bonus"),
@@ -634,7 +783,7 @@ def pending_record_path(cfg, job, library=None):
     return matches[-1] if matches else None
 
 
-def prepare_record(cfg, sub_folder, local_folder, job, dry_run=False):
+def prepare_record(cfg, sub_folder, local_folder, job, remote_name=None, dry_run=False):
     """
     The ``.pending`` record for a folder about to ship: the one an earlier run spooled, or a new one.
 
@@ -645,11 +794,11 @@ def prepare_record(cfg, sub_folder, local_folder, job, dry_run=False):
 
     :raises RecordError: when the spool is not writable (the record's text has been logged)
     """
-    existing = pending_record_path(cfg, job, library_path(sub_folder, local_folder))
+    existing = pending_record_path(cfg, job, library_path(sub_folder, remote_name or local_folder))
     if existing:
         log.info("reusing catalog record %s from an earlier, unfinished transfer", existing)
         return existing
-    built = catalog_record(cfg, sub_folder, local_folder, job)
+    built = catalog_record(cfg, sub_folder, local_folder, job, remote_name)
     if built is None:
         return None
     name, text = built
@@ -743,11 +892,7 @@ def record_destination(cfg):
 def build_record_rsync_command(cfg, record_path):
     """rsync argv for one spooled record: the same ssh and timeout as the folders, no bwlimit, source kept."""
     cmd = [cfg["rsync_path"], "-t", f"--timeout={int(cfg['rsync_timeout'])}"]
-    if cfg["remote_host"]:
-        ssh = "ssh"
-        if cfg["ssh_options"]:
-            ssh += " " + cfg["ssh_options"]
-        cmd.extend(["-s", "-e", ssh])
+    cmd.extend(remote_shell_args(cfg))
     cmd.append(record_path)
     cmd.append(record_destination(cfg))
     return cmd
@@ -816,7 +961,7 @@ def ship_recognized(cfg, dry_run, verbose, stats):
 
 def run(cfg, dry_run=False, verbose=False):
     """One full pass.  Returns the exit code for the process."""
-    stats = {"shipped": 0, "failed": 0, "records": 0}
+    stats = {"shipped": 0, "failed": 0, "records": 0, "renamed": 0}
     attempted_unidentified = set()
     ship_pending_records(cfg, dry_run, stats)
     while True:
@@ -825,7 +970,7 @@ def run(cfg, dry_run=False, verbose=False):
             # Nothing moves in a dry run, so list the unidentified folders once and stop.
             shippable = shippable_folders(cfg)
             for folder in pending_folders(cfg, UNIDENTIFIED, shippable):
-                ship_folder(cfg, UNIDENTIFIED, folder, dry_run, verbose)
+                ship_folder(cfg, UNIDENTIFIED, folder, dry_run, verbose, job=shippable[folder])
             break
         if not recognized_clear:
             log.warning("recognized folders still pending; not starting unidentified transfers this run")
@@ -838,12 +983,12 @@ def run(cfg, dry_run=False, verbose=False):
         # One unidentified folder at a time, then loop back and re-check movies/ and tv/.
         folder = unidentified[0]
         attempted_unidentified.add(folder)
-        if ship_folder(cfg, UNIDENTIFIED, folder, dry_run, verbose, stats=stats):
+        if ship_folder(cfg, UNIDENTIFIED, folder, dry_run, verbose, job=shippable[folder], stats=stats):
             stats["shipped"] += 1
         else:
             stats["failed"] += 1
-    log.info("done: %d shipped, %d failed, %d catalog record(s) shipped", stats["shipped"], stats["failed"],
-             stats["records"])
+    log.info("done: %d shipped (%d beside a folder of the same name), %d failed, %d catalog record(s) shipped",
+             stats["shipped"], stats["renamed"], stats["failed"], stats["records"])
     return 1 if stats["failed"] else 0
 
 

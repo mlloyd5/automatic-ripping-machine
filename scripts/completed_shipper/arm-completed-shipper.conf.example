@@ -23,6 +23,9 @@ remote_host = arm@t620
 
 # Destination directories.  Each job folder lands as <path>/<Title (Year)>/.
 # The parent directories must already exist and be writable by remote_host.
+# A folder that already holds a file the rip would replace (a second disc of a
+# title the pool has, a re-rip) is never written into: the rip lands beside it
+# as <Title (Year)> - <disc label>/ (or - job<id>/) instead.  See the README.
 remote_movies_path = /srv/plex/Movies
 remote_tv_path = /srv/plex/TV
 remote_unidentified_path = /srv/arm-staging/unidentified
