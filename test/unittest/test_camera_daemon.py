@@ -27,6 +27,28 @@ TINY_JPEG = bytes.fromhex(
 )
 
 
+class ToggleSource:
+    """A camera that can be unplugged: ``present()`` is False until ``plugged`` is set."""
+
+    def __init__(self):
+        self.plugged = False
+        self.opens = 0
+        self.device = "/dev/video9"
+
+    def present(self):
+        return self.plugged
+
+    def open(self):
+        self.opens += 1
+        return True
+
+    def read(self):
+        return b"frame"
+
+    def release(self):
+        pass
+
+
 class FailingSource:
     """A camera whose ``open`` blows up, like cv2 missing or a V4L2 error."""
 
@@ -113,6 +135,23 @@ class TestFrameBuffer(unittest.TestCase):
         self.assertIsNot(buffer._thread, first, "start() must replace a dead thread")
         buffer._thread.join(5.0)
         self.assertEqual(source.opens, 2)
+        buffer.stop()
+
+    def test_unplugged_camera_is_waited_for_not_opened(self):
+        source = ToggleSource()
+        buffer = capture.FrameBuffer(source=source, fps=50, buffer_seconds=1.0)
+        buffer.absent_poll_seconds = 0.02
+        buffer.start()
+        time.sleep(0.2)
+        self.assertTrue(buffer.running, "waiting for a camera keeps the thread alive")
+        self.assertFalse(buffer.camera_present)
+        self.assertFalse(buffer.camera_open)
+        self.assertEqual(source.opens, 0, "an unplugged camera is not opened")
+        source.plugged = True
+        self.assertTrue(buffer.wait_for_frame(5.0))
+        self.assertTrue(buffer.camera_present)
+        self.assertTrue(buffer.camera_open)
+        self.assertEqual(source.opens, 1)
         buffer.stop()
 
     def test_crop_and_encode_pass_bytes_through(self):
@@ -220,6 +259,7 @@ class TestDaemonTick(unittest.TestCase):
         self.assertTrue(status["running"])
         self.assertTrue(status["enabled"])
         self.assertTrue(status["camera_open"])
+        self.assertTrue(status["camera_present"])
         self.assertEqual(status["device"], "/dev/video7")
         self.assertEqual(status["drives"], ["sr0", "sr1"])
         self.assertEqual(status["tray_state"], {"sr0": "TRAY_OPEN", "sr1": "DISC_OK"})
@@ -316,11 +356,14 @@ class TestDaemonTick(unittest.TestCase):
         self.assertIsNone(status["pending_scan"])
 
     def test_barcode_only_mode_watches_trays_without_camera(self):
-        self.write_cfg("CAMERA_ENABLED: false\nBARCODE_ENABLED: true\nBARCODE_DEVICE: /nonexistent/input/event9\n")
+        scanner = os.path.join(self.folder, "event9")
+        with open(scanner, "w") as handle:
+            handle.write("")
+        self.write_cfg(f"CAMERA_ENABLED: false\nBARCODE_ENABLED: true\nBARCODE_DEVICE: {scanner}\n")
         dmn = self.make_daemon(watch_config=True)
         self.assertTrue(dmn.barcode_enabled)
-        self.assertIsNotNone(dmn.reader, "a configured device is used as given")
-        self.assertEqual(dmn.reader.device, "/nonexistent/input/event9")
+        self.assertIsNotNone(dmn.reader, "a configured, present device is used as given")
+        self.assertEqual(dmn.reader.device, scanner)
         dmn.tick(10.0)
         self.assertFalse(dmn.buffer.running, "no camera in barcode-only mode")
         dmn.scans.hold("5050582868043", now=10.0)
@@ -332,13 +375,37 @@ class TestDaemonTick(unittest.TestCase):
         status = self.read_status()
         self.assertFalse(status["running"])
         self.assertTrue(status["barcode_enabled"])
-        self.assertEqual(status["barcode_device"], "/nonexistent/input/event9")
+        self.assertEqual(status["barcode_device"], scanner)
+        self.assertTrue(status["scanner_present"])
         # turning the scanner off at runtime releases it
         time.sleep(0.02)
         self.write_cfg("CAMERA_ENABLED: false\nBARCODE_ENABLED: false\n")
         dmn.tick(12.0)
         self.assertIsNone(dmn.reader)
         self.assertFalse(self.read_status()["barcode_enabled"])
+
+    def test_scanner_plugged_in_later_is_picked_up_and_released_when_pulled(self):
+        scanner = os.path.join(self.folder, "event9")
+        self.write_cfg(f"CAMERA_ENABLED: false\nBARCODE_ENABLED: true\nBARCODE_DEVICE: {scanner}\n")
+        dmn = self.make_daemon()
+        self.assertIsNone(dmn.reader, "an unplugged scanner is not read")
+        dmn.tick(10.0)
+        status = self.read_status()
+        self.assertTrue(status["barcode_enabled"])
+        self.assertFalse(status["scanner_present"])
+        self.assertIsNone(status["barcode_device"])
+        with open(scanner, "w") as handle:
+            handle.write("")
+        dmn.tick(11.0)
+        self.assertIsNone(dmn.reader, "not looked for again within peripheral_check_interval")
+        dmn.tick(16.0)
+        self.assertIsNotNone(dmn.reader, "a scanner plugged in later is picked up")
+        self.assertEqual(dmn.reader.device, scanner)
+        self.assertTrue(self.read_status()["scanner_present"])
+        os.remove(scanner)
+        dmn.tick(22.0)
+        self.assertIsNone(dmn.reader, "a pulled scanner is released")
+        self.assertFalse(self.read_status()["scanner_present"])
 
     def test_preview_written_while_requested_and_stops_when_stale(self):
         dmn = self.make_daemon()

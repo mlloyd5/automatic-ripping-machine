@@ -276,6 +276,9 @@ class Daemon:
         self.scans = barcode.ScanHolder()
         self.reader: Optional[barcode.BarcodeReader] = None
         self._scanner_warned = False
+        self.peripheral_check_interval = 5.0
+        """How often, while BARCODE_ENABLED, the scanner is looked for again, so one plugged in later is picked up."""
+        self._last_peripheral_check = -1.0
         self._config_stamps = self._config_mtimes()
         self.apply_config(config)
 
@@ -338,17 +341,20 @@ class Daemon:
         if self.barcode_enabled:
             device = barcode.find_scanner_device(self.barcode_device)
             if device is None and not self._scanner_warned:
-                logging.warning("BARCODE_ENABLED is set but no scanner was found; set BARCODE_DEVICE in arm.yaml")
+                logging.info("BARCODE_ENABLED is set but no scanner is plugged in"
+                             + (f" at {self.barcode_device}" if self.barcode_device else " (BARCODE_DEVICE is blank)")
+                             + "; waiting for it")
                 self._scanner_warned = True
         else:
             self._scanner_warned = False
         if self.reader is not None and self.reader.device != device:
             self.reader.stop()
             self.reader = None
-            logging.info("Barcode scanner released")
+            logging.info("Barcode scanner released" + ("" if device else " (unplugged)"))
         if device is not None and self.reader is None:
             self.reader = barcode.BarcodeReader(device, self.scans.hold)
             self.reader.start()
+            self._scanner_warned = False
 
     def _config_mtimes(self):
         stamps = []
@@ -479,8 +485,10 @@ class Daemon:
             "drives": [tray.TrayWatcher.devname(d) for d in self.drives],
             "tray_state": self.watcher.states(),
             "last_photo": dict(self.last_photo),
+            "camera_present": bool(self.buffer.camera_present),
             "barcode_enabled": self.barcode_enabled,
             "barcode_device": self.reader.device if self.reader else None,
+            "scanner_present": self.reader is not None,
             "pending_scan": self.scans.peek(now),
             "last_barcode": dict(self.last_barcode),
             "lead_seconds": self.lead_seconds,
@@ -530,6 +538,12 @@ class Daemon:
         """One round: reload config if needed, poll trays, honour marker files, refresh status."""
         now = time.monotonic() if now is None else now
         status_due = bool(self.check_config())
+        if self.barcode_enabled and now - self._last_peripheral_check >= self.peripheral_check_interval:
+            # A scanner plugged in (or pulled) after start: start or stop the reader to match
+            self._last_peripheral_check = now
+            before = self.reader.device if self.reader else None
+            self._apply_reader()
+            status_due = status_due or (self.reader.device if self.reader else None) != before
         active = self.enabled or self.barcode_enabled
         if self.enabled:
             if not self.buffer.running:

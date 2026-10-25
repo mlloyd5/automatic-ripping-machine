@@ -53,6 +53,7 @@
             <span id="daemonState" class="badge badge-pill badge-secondary" style="font-size: 0.9rem;">
                 {%- if not status.found or status.stale %}Daemon not running
                 {%- elif not status.enabled %}Daemon idle: camera not enabled
+                {%- elif not status.camera_open and status.camera_present is sameas false %}Running, camera not plugged in
                 {%- elif not status.camera_open %}Running, camera not open
                 {%- else %}Running{% endif -%}
             </span>
@@ -99,6 +100,10 @@
                                 {%- else %}no status file in {{ photo_dir or 'DISC_PHOTO_PATH' }}{% endif %}</td></tr>
                             <tr><th>Camera</th><td id="stCamera">{{ 'open' if status.camera_open else 'closed' }}</td></tr>
                             <tr><th>Device</th><td id="stDevice">{{ status.device or values['CAMERA_DEVICE'] }}</td></tr>
+                            <tr><th>Scanner</th><td id="stScanner">
+                                {%- if not status.barcode_enabled %}not enabled
+                                {%- elif status.scanner_present %}reading {{ status.barcode_device }}
+                                {%- else %}not plugged in{% endif %}</td></tr>
                             <tr><th>Frame</th><td id="stFrame">
                                 {%- if status.frame_width %}{{ status.frame_width }}&times;{{ status.frame_height }} @ {{ status.fps }} fps
                                 {%- else %}&ndash;{% endif %}</td></tr>
@@ -456,6 +461,9 @@
                 } else if (!s.enabled) {
                     setBadge('Daemon idle: camera not enabled', 'warning');
                     text('stDaemon').textContent = `idle, waiting for CAMERA_ENABLED (status written ${s.age_seconds}s ago)`;
+                } else if (!s.camera_open && s.camera_present === false) {
+                    setBadge('Running, camera not plugged in', 'warning');
+                    text('stDaemon').textContent = `running, ${s.device} is not plugged in; it is picked up when it appears (status written ${s.age_seconds}s ago)`;
                 } else if (!s.camera_open) {
                     setBadge('Running, camera not open', 'warning');
                     text('stDaemon').textContent = `running, cannot open ${s.device} (status written ${s.age_seconds}s ago)`;
@@ -465,6 +473,8 @@
                 }
                 text('stCamera').textContent = s.camera_open ? 'open' : 'closed';
                 text('stDevice').textContent = s.device || init.device;
+                text('stScanner').textContent = !s.barcode_enabled ? 'not enabled'
+                    : (s.scanner_present ? `reading ${s.barcode_device}` : 'not plugged in');
                 text('stFrame').textContent = s.frame_width ? `${s.frame_width}×${s.frame_height} @ ${s.fps} fps` : '–';
                 text('stFrames').textContent = s.frames_read || 0;
                 text('stLastFrame').textContent = (s.last_frame_age_seconds === null || s.last_frame_age_seconds === undefined)

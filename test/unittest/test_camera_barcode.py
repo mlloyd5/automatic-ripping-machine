@@ -158,7 +158,11 @@ class TestFindScannerDevice(unittest.TestCase):
         return path
 
     def test_configured_device_wins(self):
-        self.assertEqual(barcode.find_scanner_device("/dev/input/event7", by_id_dir=self.folder), "/dev/input/event7")
+        path = self._touch("event7")
+        self.assertEqual(barcode.find_scanner_device(path, by_id_dir=self.folder), path)
+
+    def test_configured_device_unplugged_is_none(self):
+        self.assertIsNone(barcode.find_scanner_device(os.path.join(self.folder, "event7"), by_id_dir=self.folder))
 
     def test_autodetect_by_id_name(self):
         self._touch("usb-Logitech_USB_Keyboard-event-kbd")

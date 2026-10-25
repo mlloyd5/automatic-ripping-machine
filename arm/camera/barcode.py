@@ -174,7 +174,10 @@ def find_scanner_device(configured: str = "", by_id_dir: str = "/dev/input/by-id
     """
     configured = str(configured or "").strip()
     if configured:
-        return configured
+        if os.path.exists(configured):
+            return configured
+        logger.debug(f"Barcode scanner {configured} is not plugged in")
+        return None
     # Prefer the stable by-id names, which carry the USB product string
     candidates = sorted(glob.glob(os.path.join(by_id_dir, "*-event-kbd")))
     for path in candidates:
