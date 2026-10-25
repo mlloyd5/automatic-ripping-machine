@@ -54,9 +54,10 @@ class _Tracks:
                 if all(getattr(track, key) == value for key, value in criteria.items())]
 
 
-def _track(number, filename, chapters=0, filesize=0, ripped=True, source="MakeMKV"):
+def _track(number, filename, chapters=0, filesize=0, ripped=True, source="MakeMKV", length=5400):
+    """A ripped MakeMKV title; feature-length by default so the gate lets it through."""
     return SimpleNamespace(track_number=str(number), filename=filename, chapters=chapters,
-                           filesize=filesize, ripped=ripped, source=source, main_feature=False)
+                           filesize=filesize, ripped=ripped, source=source, main_feature=False, length=length)
 
 
 def _job(tracks, mainfeature=False, extras_sub="extras"):
@@ -116,6 +117,43 @@ class TestPickMainFeature(unittest.TestCase):
             self.assertEqual(arm_ripper.pick_main_feature(files, job, self.raw_path), "title_t01.mkv")
         self.assertTrue(any("No chapter info" in line and "largest file" in line for line in logs.output),
                         logs.output)
+
+    def test_many_chapter_bonus_reel_loses_to_feature_length_film(self):
+        # deleted-scenes reel: one chapter per clip, 20 minutes; film: 8 chapters, 90 minutes;
+        # plus a chapterless copy of the film. The film must win, not the reel and not the copy.
+        files = self._write({"title_t00.mkv": 4000, "title_t01.mkv": 900, "title_t02.mkv": 4000})
+        job = _job([_track(0, "title_t00.mkv", chapters=8, length=5400),
+                    _track(1, "title_t01.mkv", chapters=15, length=1200),
+                    _track(2, "title_t02.mkv", chapters=0, length=5400)])
+        with self.assertLogs(level="INFO") as logs:
+            self.assertEqual(arm_ripper.pick_main_feature(files, job, self.raw_path), "title_t00.mkv")
+        self.assertTrue(any("title 1" in line.lower() and "too short" in line and "runtime 1200s" in line
+                            for line in logs.output), logs.output)
+        self.assertTrue(any("title 0" in line and "most chapters" in line for line in logs.output), logs.output)
+
+    def test_gate_uses_size_when_a_runtime_is_missing(self):
+        files = self._write({"title_t00.mkv": 4000, "title_t01.mkv": 900})
+        job = _job([_track(0, "title_t00.mkv", chapters=8, length=0),
+                    _track(1, "title_t01.mkv", chapters=15, length=1200)])
+        with self.assertLogs(level="INFO") as logs:
+            self.assertEqual(arm_ripper.pick_main_feature(files, job, self.raw_path), "title_t00.mkv")
+        self.assertTrue(any("too short" in line and "size 900 bytes" in line for line in logs.output), logs.output)
+
+    def test_gate_threshold_is_a_fraction_of_the_longest(self):
+        # 70% of 5400s is 3780s: a 3800s title is still a candidate, a 3700s title is not
+        files = self._write({"title_t00.mkv": 100, "title_t01.mkv": 100, "title_t02.mkv": 100})
+        job = _job([_track(0, "title_t00.mkv", chapters=5, length=5400),
+                    _track(1, "title_t01.mkv", chapters=9, length=3800),
+                    _track(2, "title_t02.mkv", chapters=20, length=3700)])
+        self.assertEqual(arm_ripper.pick_main_feature(files, job, self.raw_path), "title_t01.mkv")
+
+    def test_chapterless_film_with_chaptered_short_extras_falls_back_to_largest(self):
+        files = self._write({"title_t00.mkv": 4000, "title_t01.mkv": 300})
+        job = _job([_track(0, "title_t00.mkv", chapters=0, length=5400),
+                    _track(1, "title_t01.mkv", chapters=6, length=600)])
+        with self.assertLogs(level="INFO") as logs:
+            self.assertEqual(arm_ripper.pick_main_feature(files, job, self.raw_path), "title_t00.mkv")
+        self.assertTrue(any("No chapter info on the feature-length" in line for line in logs.output), logs.output)
 
     def test_no_tracks_at_all_falls_back_to_largest_file(self):
         files = self._write({"a.mkv": 10, "b.mkv": 20})

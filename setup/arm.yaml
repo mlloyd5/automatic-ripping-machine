@@ -45,8 +45,9 @@ DISABLE_LOGIN: false
 # This will produce the highest quality videos (and use the most storage)
 # Set to false to re-encode every title with HandBrake or FFmpeg instead
 # Note: RIPMETHOD must be set to "mkv" for this feature to work
-# Note: For movies the ripped title with the most chapters (then the largest file, then the lowest title
-# number) is treated as the "main feature"; when no title has chapter info the largest file is used.
+# Note: For movies the "main feature" is picked from the ripped titles that are feature-length (at least 70%
+# of the longest title's runtime): the one with the most chapters, then the largest file, then the lowest
+# title number. When no such title has chapter info the largest file is used.
 # There are cases when this is not the title you want, so to avoid losing a desired track use this feature
 # with an EXTRAS_SUB value that is not "None"
 SKIP_TRANSCODE: true
