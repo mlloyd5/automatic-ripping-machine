@@ -8,6 +8,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -153,6 +154,42 @@ class TestFrameBuffer(unittest.TestCase):
         self.assertTrue(buffer.camera_open)
         self.assertEqual(source.opens, 1)
         buffer.stop()
+
+    def test_read_failure_releases_the_dead_handle(self):
+        source = ToggleSource()
+        source.plugged = True
+        source.releases = 0
+        source.reads = 0
+
+        def read():
+            source.reads += 1
+            return None if source.reads == 1 else b"frame"
+
+        def release():
+            source.releases += 1
+
+        source.read = read
+        source.release = release
+        buffer = capture.FrameBuffer(source=source, fps=50, buffer_seconds=1.0)
+        buffer.absent_poll_seconds = 0.02
+        buffer.start()
+        self.assertTrue(buffer.wait_for_frame(5.0))
+        self.assertEqual(source.releases, 1, "the dead handle is released as soon as the read fails")
+        self.assertEqual(source.opens, 2, "a failed read reopens the camera")
+        buffer.stop()
+
+    def test_camera_present_needs_a_character_device(self):
+        folder = tempfile.mkdtemp()
+        try:
+            placeholder = os.path.join(folder, "video0")
+            with open(placeholder, "w") as handle:
+                handle.write("")
+            self.assertFalse(capture.CameraSource(placeholder).present(), "a leftover regular file is unplugged")
+            self.assertFalse(capture.CameraSource(os.path.join(folder, "video1")).present())
+            self.assertTrue(capture.CameraSource("/dev/null").present())
+            self.assertTrue(capture.CameraSource("0").present(), "an index is always present")
+        finally:
+            shutil.rmtree(folder)
 
     def test_crop_and_encode_pass_bytes_through(self):
         self.assertEqual(capture.crop(TINY_JPEG, (0, 0, 1, 1)), TINY_JPEG)
@@ -356,6 +393,7 @@ class TestDaemonTick(unittest.TestCase):
         self.assertIsNone(status["pending_scan"])
 
     def test_barcode_only_mode_watches_trays_without_camera(self):
+        self.fake_device_nodes()
         scanner = os.path.join(self.folder, "event9")
         with open(scanner, "w") as handle:
             handle.write("")
@@ -385,6 +423,7 @@ class TestDaemonTick(unittest.TestCase):
         self.assertFalse(self.read_status()["barcode_enabled"])
 
     def test_scanner_plugged_in_later_is_picked_up_and_released_when_pulled(self):
+        self.fake_device_nodes()
         scanner = os.path.join(self.folder, "event9")
         self.write_cfg(f"CAMERA_ENABLED: false\nBARCODE_ENABLED: true\nBARCODE_DEVICE: {scanner}\n")
         dmn = self.make_daemon()
@@ -406,6 +445,28 @@ class TestDaemonTick(unittest.TestCase):
         dmn.tick(22.0)
         self.assertIsNone(dmn.reader, "a pulled scanner is released")
         self.assertFalse(self.read_status()["scanner_present"])
+
+    def test_missing_scanner_is_reported_once_not_on_every_recheck(self):
+        self.write_cfg("CAMERA_ENABLED: false\nBARCODE_ENABLED: true\nBARCODE_DEVICE: \"\"\n")
+        keyboard = "/dev/input/by-id/usb-Foo_Keyboard-event-kbd"
+        with mock.patch.object(daemon.barcode, "find_scanner_device", return_value=None) as find, \
+                mock.patch.object(daemon.barcode, "keyboard_candidates", return_value=[keyboard]):
+            with self.assertLogs(level="DEBUG") as logs:
+                dmn = self.make_daemon()
+                for now in (0.0, 5.0, 10.0, 15.0):
+                    dmn.tick(now)
+        self.assertGreaterEqual(find.call_count, 4, "looked for again at every peripheral_check_interval")
+        self.assertTrue(all(call.kwargs.get("warn") is False for call in find.call_args_list))
+        scanner_lines = [r for r in logs.records if r.levelno >= 20 and "scanner" in r.getMessage()]
+        self.assertEqual(len(scanner_lines), 1, [r.getMessage() for r in scanner_lines])
+        self.assertIn(keyboard, scanner_lines[0].getMessage(), "the one message names the candidates")
+        self.assertIsNone(dmn.reader)
+
+    def fake_device_nodes(self):
+        """Let regular files stand in for device nodes (no root to mknod a real one)."""
+        patcher = mock.patch.object(daemon.barcode, "is_device_node", os.path.exists)
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def test_preview_written_while_requested_and_stops_when_stale(self):
         dmn = self.make_daemon()

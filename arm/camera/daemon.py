@@ -339,11 +339,16 @@ class Daemon:
         """Start, stop or swap the scanner thread to match BARCODE_ENABLED and BARCODE_DEVICE."""
         device = None
         if self.barcode_enabled:
-            device = barcode.find_scanner_device(self.barcode_device)
+            # Called every peripheral_check_interval: say "not found" once here, not on every re-check
+            device = barcode.find_scanner_device(self.barcode_device, warn=False)
             if device is None and not self._scanner_warned:
+                hint = ""
+                if not self.barcode_device:
+                    candidates = barcode.keyboard_candidates()
+                    hint = f"; if it is one of {', '.join(candidates)}, set BARCODE_DEVICE to it" if candidates else ""
                 logging.info("BARCODE_ENABLED is set but no scanner is plugged in"
                              + (f" at {self.barcode_device}" if self.barcode_device else " (BARCODE_DEVICE is blank)")
-                             + "; waiting for it")
+                             + "; waiting for it" + hint)
                 self._scanner_warned = True
         else:
             self._scanner_warned = False

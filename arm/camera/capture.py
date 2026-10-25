@@ -10,6 +10,7 @@ import collections
 import glob
 import logging
 import os
+import stat
 import threading
 import time
 from typing import Any, Deque, Dict, List, Optional, Tuple
@@ -21,6 +22,14 @@ Region = Tuple[int, int, int, int]
 def _cv2():
     import cv2  # pylint: disable=import-outside-toplevel
     return cv2
+
+
+def is_device_node(path) -> bool:
+    """True when ``path`` is a character device; a missing path or a leftover regular file counts as unplugged."""
+    try:
+        return stat.S_ISCHR(os.stat(path).st_mode)
+    except (OSError, ValueError):
+        return False
 
 
 class CameraSource:
@@ -41,9 +50,9 @@ class CameraSource:
         return self.device
 
     def present(self) -> bool:
-        """True when the device node exists (the camera is plugged in); paths only, an index is always "present"."""
+        """True when the device node is a character device (plugged in); paths only, an index is always "present"."""
         device = str(self.device)
-        return os.path.exists(device) if device.startswith("/") else True
+        return is_device_node(device) if device.startswith("/") else True
 
     def open(self) -> bool:
         cv2 = _cv2()
@@ -221,6 +230,11 @@ class FrameBuffer:
                 self._logger.warning("Camera read failed, reopening")
                 opened = False
                 self.camera_open = False
+                # Let go of the dead handle now, so an unplugged node is not held open while we wait for it
+                try:
+                    self.source.release()
+                except Exception:  # pylint: disable=broad-except
+                    pass
                 continue
             backoff = 1.0
             self._append(time.monotonic(), frame)

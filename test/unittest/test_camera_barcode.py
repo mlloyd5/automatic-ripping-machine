@@ -6,6 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -147,6 +148,10 @@ class TestScanHolder(unittest.TestCase):
 class TestFindScannerDevice(unittest.TestCase):
     def setUp(self):
         self.folder = tempfile.mkdtemp()
+        # Regular files stand in for device nodes here (no root to mknod); TestDeviceNodes checks the real helper
+        patcher = mock.patch.object(barcode, "is_device_node", os.path.exists)
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def tearDown(self):
         shutil.rmtree(self.folder)
@@ -176,8 +181,36 @@ class TestFindScannerDevice(unittest.TestCase):
         self.assertIsNone(barcode.find_scanner_device("", by_id_dir=self.folder, logger=log))
         self.assertTrue(any(lvl == "warning" and "BARCODE_DEVICE" in msg for lvl, msg in log.lines))
 
+    def test_no_match_without_warn_only_logs_debug(self):
+        log = _Log()
+        self._touch("usb-Logitech_USB_Keyboard-event-kbd")
+        self.assertIsNone(barcode.find_scanner_device("", by_id_dir=self.folder, logger=log, warn=False))
+        self.assertFalse(any(lvl in ("warning", "info") for lvl, _ in log.lines), log.lines)
+
     def test_missing_by_id_folder(self):
         self.assertIsNone(barcode.find_scanner_device("", by_id_dir=os.path.join(self.folder, "nope"), logger=_Log()))
+
+
+class TestDeviceNodes(unittest.TestCase):
+    """The real ``is_device_node``: a leftover regular file (a Proxmox hotplug placeholder) is not a scanner."""
+
+    def setUp(self):
+        self.folder = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.folder)
+
+    def test_regular_file_at_configured_path_is_unplugged(self):
+        path = os.path.join(self.folder, "event7")
+        with open(path, "w") as handle:
+            handle.write("")
+        self.assertIsNone(barcode.find_scanner_device(path, by_id_dir=self.folder, logger=_Log()))
+        self.assertFalse(barcode.is_device_node(path))
+        self.assertFalse(barcode.is_device_node(os.path.join(self.folder, "missing")))
+
+    def test_character_device_is_a_node(self):
+        self.assertTrue(barcode.is_device_node("/dev/null"))
+        self.assertEqual(barcode.find_scanner_device("/dev/null", by_id_dir=self.folder), "/dev/null")
 
 
 class TestBarcodeReaderDeviceLifecycle(unittest.TestCase):

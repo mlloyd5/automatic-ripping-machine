@@ -20,6 +20,7 @@ import logging
 import os
 import re
 import select
+import stat
 import threading
 import time
 from typing import Callable, List, Optional, Tuple
@@ -165,21 +166,37 @@ class ScanHolder:
         return code
 
 
-def find_scanner_device(configured: str = "", by_id_dir: str = "/dev/input/by-id", logger=logging) -> Optional[str]:
+def is_device_node(path) -> bool:
+    """True when ``path`` is a character device; a missing path or a leftover regular file counts as unplugged."""
+    # Same as capture.is_device_node; a copy so this module stays importable on its own
+    try:
+        return stat.S_ISCHR(os.stat(path).st_mode)
+    except (OSError, ValueError):
+        return False
+
+
+def keyboard_candidates(by_id_dir: str = "/dev/input/by-id") -> List[str]:
+    """The plugged-in keyboard-like input nodes under ``by_id_dir``, any of which could be the scanner."""
+    return [path for path in sorted(glob.glob(os.path.join(by_id_dir, "*-event-kbd"))) if is_device_node(path)]
+
+
+def find_scanner_device(configured: str = "", by_id_dir: str = "/dev/input/by-id", logger=logging,
+                        warn: bool = True) -> Optional[str]:
     """
     Work out which input node to read.
 
     :param configured: ``BARCODE_DEVICE`` from arm.yaml: a path, or blank to autodetect
+    :param warn: warn when nothing looked like a scanner; the daemon's periodic re-check passes False
     :return: a device path, or ``None`` when nothing matched
     """
     configured = str(configured or "").strip()
     if configured:
-        if os.path.exists(configured):
+        if is_device_node(configured):
             return configured
         logger.debug(f"Barcode scanner {configured} is not plugged in")
         return None
     # Prefer the stable by-id names, which carry the USB product string
-    candidates = sorted(glob.glob(os.path.join(by_id_dir, "*-event-kbd")))
+    candidates = keyboard_candidates(by_id_dir)
     for path in candidates:
         if DEVICE_NAME_HINT.search(os.path.basename(path)):
             return path
@@ -196,8 +213,8 @@ def find_scanner_device(configured: str = "", by_id_dir: str = "/dev/input/by-id
     except ImportError:
         logger.debug("evdev is not installed; cannot autodetect the barcode scanner by name")
     if candidates:
-        logger.warning(f"No input device looked like a barcode scanner; set BARCODE_DEVICE to one of: "
-                       f"{', '.join(candidates)}")
+        log = logger.warning if warn else logger.debug
+        log(f"No input device looked like a barcode scanner; set BARCODE_DEVICE to one of: {', '.join(candidates)}")
     return None
 
 
