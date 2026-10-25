@@ -41,12 +41,15 @@ ARM_API_KEY: ""
 # ARMui will need to be restared for this to update
 DISABLE_LOGIN: false
 
-# Skip transcoding if you want the original MakeMKV files as your final output
+# Skip transcoding to keep the original MakeMKV files as your final output (the default)
 # This will produce the highest quality videos (and use the most storage)
+# Set to false to re-encode every title with HandBrake or FFmpeg instead
 # Note: RIPMETHOD must be set to "mkv" for this feature to work
-# Note: The largest file will be considered to be the "main feature" but there are cases when this is not true
-# to avoid losing a desired track, use this feature with an EXTRAS_SUB value that is not "None"
-SKIP_TRANSCODE: false
+# Note: For movies the ripped title with the most chapters (then the largest file, then the lowest title
+# number) is treated as the "main feature"; when no title has chapter info the largest file is used.
+# There are cases when this is not the title you want, so to avoid losing a desired track use this feature
+# with an EXTRAS_SUB value that is not "None"
+SKIP_TRANSCODE: true
 
 # Video type identification.  Options are "auto", "series", "movie".
 # If "auto" then ARM will get the video type when querying the movie webservice.  This is default.

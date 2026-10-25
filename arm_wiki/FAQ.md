@@ -33,9 +33,9 @@ When a disc is inserted, udev rules should launch a script (scripts/arm_wrapper.
 
 You can either edit the arm.yaml manually with: `sudo nano /opt/arm/arm.yaml` or you can use the A.R.M settings page to update
 
-`SKIP_TRANSCODE: false`
+`SKIP_TRANSCODE: true`
 
-Change false to true
+This is the default; set it to false if you want every title re-encoded
 
 `Save the changes to arm.yaml (Ctr + S  then Ctr + x) or pressing submit on the A.R.M settings page
 
