@@ -53,8 +53,8 @@ def entry():
     return parser.parse_args()
 
 
-DISC_LOADING_STATES = (CDS.DRIVE_NOT_READY, CDS.NO_INFO)
-"""Tray states that mean a disc is in the drive but could not (yet) be read."""
+DISC_LOADING_STATES = (CDS.DRIVE_NOT_READY, CDS.NO_INFO, CDS.DISC_OK)
+"""Tray states that mean a disc is in the drive, whether or not it could be read."""
 
 
 def log_udev_params(dev_path):
@@ -214,12 +214,12 @@ def setup():
     # udev starts ARM when the tray closes, which is well before some drives can read the disc
     # (an LG SP80NB80 needs a moment, an HL-DT-ST DT80N ~16 s with a dual-layer DVD): wait for it.
     timeout = utils.drive_ready_timeout()
-    seen = drive.wait_until_ready(timeout, logger=arm_log)
-    if not drive.ready:
+    ready, seen = drive.wait_until_ready(timeout, logger=arm_log)
+    if not ready:
         states = ", ".join(state.name for state in seen)
         if any(state in DISC_LOADING_STATES for state in seen):
             raise utils.RipperException(
-                f"Timed out after {timeout}s waiting for drive {devpath} to be ready (tray status: {states})."
+                f"Timed out after {timeout}s waiting for a readable disc in {devpath} (tray status: {states})."
             )
         # Nothing was ever loaded: a tray left open, or a queued udev event replayed after the eject
         raise utils.EmptyDriveException(f"No disc in drive {devpath} (tray status: {states}).")
