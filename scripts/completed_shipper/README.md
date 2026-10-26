@@ -65,8 +65,11 @@ box:
   only copy of the new rip.  A file an interrupted run already delivered has
   its source's contents, appears in neither list, and resumes in place as
   before.  (The checksums cost a read of both copies of every file that
-  already exists at the destination, which is only the case on a resume or a
-  collision; the transfer itself keeps the quick check.)  Different file names
+  already exists at the destination with the same size, which is only the
+  case on a resume or a collision; the transfer itself keeps the quick check.
+  rsync sends nothing while it checksums and its I/O timeout fires during
+  that silence, so the probes get `rsync_timeout` plus one second per 50 MiB
+  in the folder: about 24 extra minutes for a 70 GB rip.)  Different file names
   are no collision either: a second disc of a TV season joins the season
   folder.
 * On a collision the folder ships as `<Title (Year)> - <disc label>` (the
@@ -233,7 +236,7 @@ All settings live in one `[shipper]` section.  Defaults match a stock
 | `bwlimit_unidentified` | rsync `--bwlimit` for unidentified rips.  `0` = unlimited. |
 | `ssh_options` | Extra arguments for the ssh command rsync runs (`-i keyfile`, `-p port`, ...). |
 | `rsync_path` / `rsync_extra_args` | rsync binary and extra flags, e.g. `--chown=plex:plex` or `--chmod=D775,F664` so Plex can read the files. |
-| `rsync_timeout` | Seconds of I/O silence before rsync gives up; the folder is retried next run. |
+| `rsync_timeout` | Seconds of I/O silence before rsync gives up; the folder is retried next run.  The collision probes get this plus one second per 50 MiB in the folder, for their checksums. |
 | `lock_file` | Prevents overlapping runs. |
 | `post_ship_command` | Optional shell command run after each folder ships, with `SHIPPER_TYPE`, `SHIPPER_FOLDER` (ARM's folder name) and `SHIPPER_DESTINATION` (where it landed, suffix included) in the environment. |
 
@@ -484,7 +487,8 @@ PATH=/opt/homebrew/bin:$PATH python3 -m unittest scripts/completed_shipper/test_
   transfer into `Title (Year) - LABEL` was interrupted, and before the next
   run a different file of the same name appeared in that folder.  The rip
   stays on the ripper (exit 1).  Move the stranger away on the media box, or
-  remove `job<id>.destination` from `catalog_spool_path` to let the shipper
-  choose a new name, which leaves the part already delivered where it is.
+  remove `job<id>.destination` and the job's `.pending` catalog record (which
+  also remembers the name) from `catalog_spool_path` to let the shipper choose
+  a new name, which leaves the part already delivered where it is.
 * **Permissions on the media box.**  Use `rsync_extra_args = --chmod=D775,F664`
   (and `--chown=` if the ssh user may chown) so the Plex user can read the files.

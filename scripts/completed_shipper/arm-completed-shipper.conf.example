@@ -69,6 +69,8 @@ rsync_path = rsync
 rsync_extra_args =
 
 # Seconds of I/O silence before rsync gives up (the folder is retried next run).
+# The collision probes get this plus one second per 50 MiB in the folder, since
+# rsync is silent while it checksums a file that already exists at the destination.
 rsync_timeout = 300
 
 # Lock file so timer runs never overlap.

@@ -105,6 +105,9 @@ TRANSFER_ITEM = re.compile(r"^[<>]f\S* (.+)$")
 """An ``rsync --itemize-changes`` line for a file the transfer sends (``<`` to a remote, ``>`` locally)."""
 STATE_SUFFIX = ".destination"
 """A job folder's chosen destination name, kept in the spool from before its transfer until it has shipped."""
+PROBE_CHECKSUM_RATE = 50 * 1024 * 1024
+"""Bytes per second either end is assumed to checksum at least; sizes a collision probe's ``--timeout`` (see
+:func:`probe_timeout`)."""
 
 JOB_COLUMNS = ("job_id", "status", "path", "title", "title_manual", "year", "year_manual", "video_type",
                "imdb_id", "label", "disctype", "disc_barcode", "disc_barcode_title", "sleeve_id", "box",
@@ -330,19 +333,48 @@ def build_rsync_command(cfg, sub_folder, local_folder, dry_run=False, verbose=Fa
     return cmd
 
 
+def folder_bytes(local_folder):
+    """Total size of the files under a folder; a folder that cannot be walked counts as empty."""
+    total = 0
+    for root, _, files in os.walk(local_folder):
+        for name in files:
+            try:
+                total += os.lstat(os.path.join(root, name)).st_size
+            except OSError:
+                pass
+    return total
+
+
+def probe_timeout(cfg, local_folder):
+    """
+    ``--timeout`` for a collision probe: ``rsync_timeout`` plus the time the checksums may take.
+
+    rsync sends nothing while it checksums a file that exists on both ends with
+    the same size (the feature an interrupted run already delivered, 70 GB for
+    a UHD rip), and its I/O timeout fires during that silence, so the probe
+    gets ``rsync_timeout`` plus one second per :data:`PROBE_CHECKSUM_RATE`
+    bytes in the folder.  A ``rsync_timeout`` of 0 (no timeout) stays 0.
+    """
+    base = int(cfg["rsync_timeout"])
+    if base <= 0:
+        return 0
+    return base + -(-folder_bytes(local_folder) // PROBE_CHECKSUM_RATE)
+
+
 def build_probe_rsync_command(cfg, sub_folder, local_folder, remote_name, ignore_existing=False):
     """
     rsync argv for one collision probe: a dry run that itemizes what the real transfer would send.
 
-    Same ssh, timeout and extra arguments as the transfer (an ``--exclude`` there
-    must hold here too), no bandwidth cap, nothing removed.  ``--checksum``
-    compares contents instead of size and time (see :func:`colliding_files`).
-    Only the short-flag cluster differs on the remote command line (``n`` and
-    ``c`` join it: ``rsync --server -snlogDtprce.iLsfxCIvu`` with rsync 3.x and
-    ``-s``), so a forced command written for the transfer accepts the probe too.
+    Same ssh and extra arguments as the transfer (an ``--exclude`` there must
+    hold here too), no bandwidth cap, nothing removed, and a ``--timeout`` that
+    allows for the checksums (:func:`probe_timeout`).  ``--checksum`` compares
+    contents instead of size and time (see :func:`colliding_files`).  Only the
+    short-flag cluster differs on the remote command line (``n`` and ``c`` join
+    it: ``rsync --server -snlogDtprce.iLsfxCIvu`` with rsync 3.x and ``-s``), so
+    a forced command written for the transfer accepts the probe too.
     """
     cmd = [cfg["rsync_path"], "-a", "--dry-run", "--itemize-changes", "--checksum",
-           f"--timeout={int(cfg['rsync_timeout'])}"]
+           f"--timeout={probe_timeout(cfg, local_folder)}"]
     if ignore_existing:
         cmd.append("--ignore-existing")
     cmd.extend(remote_shell_args(cfg))
@@ -499,11 +531,21 @@ def settle_destination_states(cfg, dry_run=False):
 
     That happens when a run was killed after the folder shipped but before the
     name was forgotten, and when a folder was removed by hand.  A name whose
-    folder is still there is left for :func:`ship_folder` to resume with.
+    folder is still there is left for :func:`ship_folder` to resume with, and
+    so is every name while the folder's category directory is missing
+    (completed_path not mounted) or the state file cannot be read.
     """
     for path in _spooled(cfg, STATE_SUFFIX):
         source = read_record_key(path, "source")
-        if source and os.path.isdir(os.path.join(cfg["completed_path"], source)):
+        if not source:
+            log.warning("%s names no source folder; leaving it in the spool", path)
+            continue
+        present = source_folder_present(cfg, source)
+        if present:
+            continue
+        if present is None:
+            log.warning("%s has no %s folder (not mounted?); leaving destination name %s in the spool",
+                        cfg["completed_path"], source.split("/", 1)[0], os.path.basename(path))
             continue
         if dry_run:
             log.info("dry run: would drop %s (%s is gone)", path, source)
@@ -564,8 +606,9 @@ def resolve_remote_name(cfg, sub_folder, local_folder, job, dry_run=False, stats
             return None
         if collisions:
             log.error("%s, the destination an earlier run chose for %s, now holds %s, which this transfer would "
-                      "replace; leaving it for the next run (removing %s lets the shipper choose again, which "
-                      "splits the rip)", destination(cfg, sub_folder, local_folder, persisted), local_folder,
+                      "replace; leaving it for the next run (removing %s and the job's .pending catalog record "
+                      "from the spool lets the shipper choose again, which splits the rip)",
+                      destination(cfg, sub_folder, local_folder, persisted), local_folder,
                       ", ".join(collisions), destination_state_path(cfg, job))
             return None
         log.info("resuming %s into %s, the destination an earlier run chose", local_folder, persisted)

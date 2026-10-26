@@ -727,6 +727,32 @@ class NoOverwrite(ShipperFixture):
         # Movie B is still ripping, so its kept name stays; Gone's folder is gone, so its name goes.
         self.assertEqual(os.listdir(self.spool), ["job78.destination"])
 
+    def test_destination_names_are_kept_while_completed_path_is_not_mounted(self):
+        # A missing movies/ directory means the completed volume is absent, not that the folders shipped.
+        os.makedirs(self.spool)
+        cfg = shipper.load_config(self.conf)
+        shipper.save_destination_state(cfg, {"job_id": 77}, "movies/Gone (1999)", "Gone (1999) - GONE")
+        with open(os.path.join(self.spool, "job78.destination"), "w") as handle:
+            handle.write("# no source key at all\n")
+        shutil.rmtree(os.path.join(self.completed, "movies"))
+        with self.assertLogs("arm-completed-shipper", "WARNING") as logs:
+            shipper.settle_destination_states(cfg)
+        self.assertIn("not mounted", "\n".join(logs.output))
+        self.assertIn("names no source folder", "\n".join(logs.output))
+        self.assertEqual(sorted(os.listdir(self.spool)), ["job77.destination", "job78.destination"])
+
+    def test_probe_timeout_allows_for_the_checksums(self):
+        # rsync is silent while it checksums, so the probes get rsync_timeout (30 here) plus 1 s per 50 MiB.
+        cfg = shipper.load_config(self.conf)
+        folder = self._local("movies", "Movie A (2001)")
+        with open(os.path.join(folder, "Movie A (2001).mkv"), "r+b") as handle:
+            handle.truncate(120 * 1024 * 1024)  # sparse: 120 MiB counts as 3 s
+        self.assertEqual(shipper.probe_timeout(cfg, folder), 33)
+        self.assertIn("--timeout=33", shipper.build_probe_rsync_command(cfg, "movies", folder, "Movie A (2001)"))
+        self.assertIn("--timeout=30", shipper.build_rsync_command(cfg, "movies", folder))
+        self.assertEqual(shipper.probe_timeout(cfg, os.path.join(self.tmp, "no-such-folder")), 30)
+        self.assertEqual(shipper.probe_timeout(dict(cfg, rsync_timeout="0"), folder), 0)
+
 
 class KeptNameWithoutRecords(ShipperFixture):
     """Records off: the destination name is still kept in the spool across an interrupted transfer."""
