@@ -229,6 +229,50 @@ def tmdb_get_imdb(tmdb_id):
     return search_results['external_ids']['imdb_id']
 
 
+def tmdb_runtime(tmdb_id):
+    """
+    Queries api.themoviedb.org for a film's runtime by TMDB id\n
+    :param tmdb_id: tmdb id of the film
+    :return: runtime in seconds, or None when TMDB has none
+    """
+    tmdb_api_key = cfg.arm_config['TMDB_API_KEY']
+    url = f"https://api.themoviedb.org/3/movie/{tmdb_id}?api_key={tmdb_api_key}"
+    try:
+        response = requests.get(url, timeout=30)
+        details = json.loads(response.text)
+    except (requests.RequestException, ValueError) as error:
+        app.logger.debug(f"tmdb_runtime failed for {tmdb_id}: {error}")
+        return None
+    if 'status_code' in details or not details.get('runtime'):
+        return None
+    return int(details['runtime']) * 60
+
+
+def omdb_runtime(imdb_id):
+    """
+    Queries OMDbapi.org for a film's runtime by IMDb id\n
+    :param imdb_id: IMDb id of the film
+    :return: runtime in seconds, or None when OMDb has none
+    """
+    details = call_omdb_api(imdb_id=imdb_id)
+    return parse_runtime(details.get('Runtime') if details else None)
+
+
+def parse_runtime(text):
+    """
+    Seconds in an OMDb style runtime such as ``"84 min"`` or ``"1h 24min"``; None when there is none
+    """
+    if not text:
+        return None
+    hours = re.search(r"(\d+)\s*h", str(text))
+    minutes = re.search(r"(\d+)\s*min", str(text))
+    if not hours and not minutes:
+        minutes = re.search(r"^\s*(\d+)\s*$", str(text))
+    total = int(hours.group(1)) * 60 if hours else 0
+    total += int(minutes.group(1)) if minutes else 0
+    return total * 60 if total else None
+
+
 def tmdb_find(imdb_id):
     """
     basic function to return an object from TMDB from only the IMDB id

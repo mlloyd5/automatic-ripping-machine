@@ -331,6 +331,60 @@ def clean_upc_title(title: Optional[str]) -> Tuple[Optional[str], Optional[str]]
     return text, year
 
 
+# Packaging words that say a product holds several films, and carry no title of their own
+_COLLECTION_BOILERPLATE = re.compile(
+    r"\b("
+    r"(double|triple|dual)\s+feature|"
+    r"(two|three|four|2|3|4)\s*-?\s*(movie|film|pack|in\s+1|in\s+one)\s*(collection|set|pack)?|"
+    r"(movie|film)\s+collection|collection|"
+    r"(two|three|four|2|3|4)\s*-?\s*pack"
+    r")\b",
+    re.IGNORECASE,
+)
+# "Stuart Little 1 & 2", "Shrek 1 and 2", "Toy Story 1/2/3": one name and a run of sequel numbers
+_NUMBERED_RUN_RE = re.compile(r"^(?P<base>.*?\D)\s*(?P<numbers>\d(?:\s*(?:&|and|/|,|\+)\s*\d)+)\s*$", re.IGNORECASE)
+_SEPARATOR_RE = re.compile(r"\s+(?:/|\+|\|)\s+|\s*//\s*")
+
+
+def split_collection_title(title: Optional[str]) -> List[str]:
+    """
+    The films a product title names when it names more than one.
+
+    ``"Stuart Little / Stuart Little 2 (DVD)"`` and ``"Stuart Little 1 & 2 Double Feature"`` both
+    give ``["Stuart Little", "Stuart Little 2"]``; a disc label like ``STUART_LITTLE_1_AND_2`` works
+    too. A number run keeps the base name for 1 (``"Shrek 1 and 2"`` is Shrek and Shrek 2). The
+    slash is the signal: a title with ``&`` or ``and`` alone ("Fast & Furious") is not split, since
+    those are at least as often part of one title.
+
+    :return: the cleaned titles in disc order, or ``[]`` when the text names a single film
+    """
+    if not title:
+        return []
+    text = unicodedata.normalize("NFKD", str(title))
+    text = "".join(ch for ch in text if not unicodedata.combining(ch))
+    text = _BRACKETS_RE.sub(" ", text).replace("_", " ")
+    text = _COLLECTION_BOILERPLATE.sub(" ", text)
+    text = _SPACES_RE.sub(" ", text).strip(" -:.,!?'\u2019&/+|")
+    parts = []
+    run = _NUMBERED_RUN_RE.match(text)
+    if run and not _SEPARATOR_RE.search(run.group("base")):
+        base = run.group("base").strip(" -:.,")
+        # "Shrek 1 and 2" is Shrek and Shrek 2, but "Kill Bill Vol. 1 & 2" keeps its 1
+        numbered_first = re.search(r"\b(vol|volume|part|chapter|episode|book)$", base, re.IGNORECASE)
+        for number in re.findall(r"\d", run.group("numbers")):
+            parts.append(base if number == "1" and not numbered_first else f"{base} {number}")
+    else:
+        parts = [part for part in _SEPARATOR_RE.split(text) if part and part.strip()]
+    if len(parts) < 2:
+        return []
+    titles = []
+    for part in parts:
+        cleaned, _ = clean_upc_title(part)
+        if cleaned and cleaned.lower() not in (t.lower() for t in titles):
+            titles.append(cleaned)
+    return titles if len(titles) >= 2 else []
+
+
 def _plausible_year(year: str) -> bool:
     """A release year: not in the future."""
     try:

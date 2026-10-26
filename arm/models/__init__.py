@@ -3,6 +3,7 @@
 
 from .alembic_version import AlembicVersion  # noqa F401
 from .config import Config  # noqa F401
+from .film import Film  # noqa F401
 from .job import Job, JobState  # noqa F401
 from .notifications import Notifications  # noqa F401
 from .system_drives import SystemDrives  # noqa F401
