@@ -75,6 +75,15 @@ WALL_E_HYPHEN = [_result("East of Wall", "2025", 30), _result("End of the Wall",
 WALL_E_YEAR = [_result("WALL\u00b7E's Treasures & Trinkets", "2008", 7), _result("Wall Street", "1987", 2358),
                _result("WALL\u00b7E", "2008", 21096), _result("BURN\u00b7E", "2008", 837)]
 
+# Job 37 on the ts140: barcode 013131210392 is "Thomas the Tank Engine and Friends - Best of James [DVD]",
+# TMDB words the brand "Thomas & Friends", and the query "Best of James" is led by a wrestling compilation.
+BEST_OF_JAMES = [_result("The Best of Mickie James", "2020", 1),
+                 _result("Thomas & Friends: The Best of James", "2012", 0),
+                 _result("Thomas & Friends: Best of James", "2002", 3),
+                 _result("James Last: Best of the 70's", "1998", 2)]
+THOMAS_PRODUCT = {"title": "Thomas the Tank Engine and Friends - Best of James", "year": None,
+                  "raw": "Thomas the Tank Engine and Friends - Best of James [DVD]"}
+
 
 @unittest.skipIf(IMPORT_ERROR is not None, f"ARM could not be imported here: {IMPORT_ERROR}")
 class TestBestSearchResult(unittest.TestCase):
@@ -235,6 +244,61 @@ class TestIdentifyFromBarcode(unittest.TestCase):
         search.assert_called_once_with("WALL-E", None)
         self.assertEqual((job.title, job.year, job.hasnicetitle), ("not identified", "", False))
         self.assertEqual(job.disc_barcode_title, "WALL-E (DVD) Disney Adventure  Animated")
+
+    def test_video_brand_worded_differently_online_is_found_by_subtitle(self):
+        """No title is exactly the product title: the subtitle's result that names the brand is taken."""
+        asked = []
+
+        def fake_search(title, year=None):
+            asked.append((title, year))
+            return {"Search": BEST_OF_JAMES} if title == "Best of James" else {"Search": []}
+
+        job = _job(disc_barcode="013131210392", label="The_Best_of_James")
+        with mock.patch.object(identify.disc_photo, "lookup_upc", return_value=[THOMAS_PRODUCT]), \
+                mock.patch.object(identify, "_provider_search", side_effect=fake_search), \
+                self.assertLogs(level="INFO") as logs:
+            self.assertTrue(identify.identify_from_barcode(job))
+        self.assertEqual(asked, [("Thomas the Tank Engine and Friends - Best of James", None), ("Best of James", None)])
+        self.assertEqual((job.title, job.year, job.imdb_id, job.hasnicetitle),
+                         ("Thomas-and-Friends--Best-of-James", "2002", BEST_OF_JAMES[2]["imdbID"], True))
+        self.assertEqual(job.disc_barcode_title, THOMAS_PRODUCT["raw"])
+        self.assertEqual([line for line in logs.output if "subtitle 'Best of James'" in line and "'Thomas'" in line
+                          and "(2002)" in line], logs.output[-1:])
+
+    def test_video_subtitle_result_without_the_brand_is_not_taken(self):
+        """"Best of James" alone is not the disc: without the brand word the barcode must not guess."""
+        no_brand = [r for r in BEST_OF_JAMES if "Thomas" not in r["Title"]] + [_result("The Best of James", "2012", 5)]
+        job = _job(disc_barcode="013131210392", label="The_Best_of_James")
+        with mock.patch.object(identify.disc_photo, "lookup_upc", return_value=[THOMAS_PRODUCT]), \
+                mock.patch.object(identify, "_provider_search", return_value={"Search": no_brand}) as search:
+            self.assertFalse(identify.identify_from_barcode(job))
+        self.assertEqual([c.args[0] for c in search.call_args_list],
+                         ["Thomas the Tank Engine and Friends - Best of James", "Best of James"])
+        self.assertEqual((job.title, job.year, job.hasnicetitle), ("not identified", "", False))
+
+    def test_video_product_title_without_a_separator_is_searched_once(self):
+        candidates = [{"title": "Obscure Film", "year": None, "raw": "Obscure Film (DVD)"}]
+        job = _job()
+        with mock.patch.object(identify.disc_photo, "lookup_upc", return_value=candidates), \
+                mock.patch.object(identify, "_provider_search", return_value={"Search": WALL_E_HYPHEN}) as search:
+            self.assertFalse(identify.identify_from_barcode(job))
+        search.assert_called_once_with("Obscure Film", None)
+        self.assertEqual(job.title, "not identified")
+
+    def test_search_film_by_subtitle(self):
+        with mock.patch.object(identify, "_provider_search", return_value={"Search": BEST_OF_JAMES}):
+            best = identify.search_film_by_subtitle("Thomas the Tank Engine and Friends - Best of James")
+            self.assertEqual((best["Title"], best["Year"]), ("Thomas & Friends: Best of James", "2002"))
+            # a known year narrows the qualifying results before the vote count decides
+            best = identify.search_film_by_subtitle("Thomas & Friends: Best of James", "2012")
+            self.assertEqual(best["Year"], "2012")
+            self.assertIsNone(identify.search_film_by_subtitle("Best of James"))
+            self.assertIsNone(identify.search_film_by_subtitle("The - Best of James"))
+        self.assertEqual(identify.split_brand_subtitle("The Simpsons: Season 1"), ("Simpsons", "Season 1"))
+        self.assertEqual(identify.split_brand_subtitle("Thomas & Friends - Best of James"), ("Thomas", "Best of James"))
+        self.assertIsNone(identify.split_brand_subtitle("Blade Runner 2049"))
+        self.assertIsNone(identify.split_brand_subtitle("Mission:Impossible"))  # no space after the colon
+        self.assertIsNone(identify.split_brand_subtitle(None))
 
     def test_video_no_online_match_keeps_product_title(self):
         candidates = [{"title": "Obscure Film", "year": None, "raw": "Obscure Film (DVD)"}]
