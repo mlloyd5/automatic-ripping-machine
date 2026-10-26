@@ -735,6 +735,21 @@ def database_adder(obj_class):
     return False
 
 
+def job_process_alive(job) -> bool:
+    """
+    True when the process that owns ``job`` is still running.
+
+    The pid alone is not enough: after a container restart pids start over and another
+    process may sit on the number, which is what ``pid_hash`` (pid plus start time) catches.
+    """
+    if job.pid is None or not psutil.pid_exists(job.pid):
+        return False
+    try:
+        return job.pid_hash == hash(psutil.Process(job.pid))
+    except psutil.Error:
+        return False
+
+
 def clean_old_jobs():
     """
     Check for running jobs - Update failed jobs that are no longer running\n
@@ -743,10 +758,8 @@ def clean_old_jobs():
     active_jobs = db.session.query(Job).filter(Job.status.notin_(['fail', 'success'])).all()
     # Clean up abandoned jobs
     for job in active_jobs:
-        if psutil.pid_exists(job.pid):
-            job_process = psutil.Process(job.pid)
-            if job.pid_hash == hash(job_process):
-                logging.info(f"Job #{job.job_id} with PID {job.pid} is currently running.")
+        if job_process_alive(job):
+            logging.info(f"Job #{job.job_id} with PID {job.pid} is currently running.")
         else:
             logging.info(f"Job #{job.job_id} with PID {job.pid} has been abandoned."
                          f"Updating job status to fail.")
@@ -814,6 +827,14 @@ def duplicate_run_check(dev_path):
     if drive is None or not drive.processing:
         return  # unknown or idle drive is safe to start another run.
     job = drive.job_current
+    if not job_process_alive(job):
+        # The job died with its process (a container restart, a kill): it must not hold the drive
+        logging.warning(f"Drive {dev_path}'s job ({job.job_id}, {job.status}) has no live process (pid {job.pid}); "
+                        "marking it failed and taking the drive")
+        job.status = JobState.FAILURE.value
+        drive.release_current_job()
+        db.session.commit()
+        return
     logging.critical(f'Drive {dev_path} has an active Job ({job.job_id}): {job.status}.')
     # log time
     job_time = ceil(job.run_time // 60)

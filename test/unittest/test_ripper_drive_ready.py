@@ -382,6 +382,18 @@ class TestUnmountDisc(unittest.TestCase):
 
 
 @unittest.skipIf(IMPORT_ERROR is not None, f"ARM could not be imported here: {IMPORT_ERROR}")
+class TestJobProcessAlive(unittest.TestCase):
+    def test_states(self):
+        me = os.getpid()
+        live = SimpleNamespace(pid=me, pid_hash=hash(utils.psutil.Process(me)))
+        self.assertTrue(utils.job_process_alive(live))
+        self.assertFalse(utils.job_process_alive(SimpleNamespace(pid=me, pid_hash=12345)))  # pid reused
+        self.assertFalse(utils.job_process_alive(SimpleNamespace(pid=None, pid_hash=None)))
+        with mock.patch.object(utils.psutil, "pid_exists", return_value=False):
+            self.assertFalse(utils.job_process_alive(live))
+
+
+@unittest.skipIf(IMPORT_ERROR is not None, f"ARM could not be imported here: {IMPORT_ERROR}")
 class TestQuietExceptions(unittest.TestCase):
     def test_hierarchy(self):
         for cls in (utils.EmptyDriveException, utils.UnlistedDriveException, utils.DuplicateRunException):
