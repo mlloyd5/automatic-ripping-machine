@@ -26,7 +26,10 @@ for you to rename by hand, at lower priority and with a bandwidth cap.
    to step 1.  A movie that finishes while a long unidentified transfer is
    running therefore waits for at most that one folder.  If a recognized rsync
    failed, no unidentified transfer is started at all in that run.
-4. Exits 0 when everything shipped, 1 when a transfer failed (systemd marks the
+4. With `remote_catalog_path` set, leaves a **catalog record** for every
+   movie or tv folder it shipped: a small TOML file with what ARM knew about
+   the disc and what the shipped files' Matroska headers say (see below).
+5. Exits 0 when everything shipped, 1 when a transfer failed (systemd marks the
    unit failed so you notice), 2 on configuration problems or when another run
    still holds the lock.
 
@@ -100,6 +103,7 @@ remote_host = root@t620
 remote_movies_path = /tank/media/movies
 remote_tv_path = /tank/media/tv
 remote_unidentified_path = /tank/rips/unidentified
+remote_catalog_path = /tank/rips/catalog
 lock_file = /run/lock/arm-completed-shipper.lock
 ```
 
@@ -143,6 +147,9 @@ All settings live in one `[shipper]` section.  Defaults match a stock
 | `remote_host` | `user@host` of the media box.  Leave empty if the destination paths are local mounts (NFS/SMB) on the ripping box. |
 | `remote_movies_path` / `remote_tv_path` | Plex library folders on the media box.  Each rip lands as `<path>/<Title (Year)>/`. |
 | `remote_unidentified_path` | Staging folder on the media box for manual review.  Keep it **outside** any Plex library. |
+| `remote_catalog_path` | Optional.  Directory on the media box that receives one catalog record per shipped movie or tv folder.  Must exist.  Empty turns records off. |
+| `catalog_spool_path` | Where records wait between being written and shipped.  Default `<completed_path>/catalog`. |
+| `ripper_name` | The ripper's name written into each record.  Default: this box's hostname. |
 | `bwlimit_recognized` | rsync `--bwlimit` in KiB/s for movies/tv.  `0` = unlimited. |
 | `bwlimit_unidentified` | rsync `--bwlimit` for unidentified rips.  `0` = unlimited. |
 | `ssh_options` | Extra arguments for the ssh command rsync runs (`-i keyfile`, `-p port`, ...). |
@@ -157,6 +164,98 @@ rsync and deletes nothing), `-v/--verbose`, plus `--db-path`,
 
 Destination parent folders must already exist.  rsync creates the per-title
 folder itself.
+
+## Catalog records
+
+A media library kept as records (which discs are owned, what was ripped from
+each, which case they live in, what is on the pool) needs to hear about every
+rip, and ARM is the one place that knows the disc label, the metadata match,
+the sleeve id and the case barcode together.  With `remote_catalog_path` set,
+each shipped `movies/` or `tv/` folder leaves one TOML record there, named
+`<rip finished>-<ripper>-job<id>.toml`:
+
+```toml
+ripper = "ts140"
+job = 12
+shipped = "2026-10-25T14:03:11"       # when the folder's transfer finished
+type = "movie"                       # movie | series, from the folder shipped
+title = "Back to the Future"
+year = 1985
+imdb = "tt0088763"                   # or tmdb = 105; absent when ARM had no match
+library = "movies/Back to the Future (1985)"
+destination = "/tank/media/movies/Back to the Future (1985)"
+label = "BACK_TO_THE_FUTURE"         # the disc's volume label
+format = "uhd"                       # uhd | bd | dvd
+role = "feature"                     # bonus when a movie disc has no main feature
+sleeve = "TS-0007"                   # Sleeve Labels id, when the feature is on
+box = "Box 02"
+barcode = "025192412363"             # case barcode from the Barcode Scanner feature
+barcode_title = "Back to the Future: The Ultimate Trilogy (4K UHD)"
+
+[[files]]
+path = "movies/Back to the Future (1985)/Back to the Future (1985).mkv"
+main = true
+size = 74012345678
+seconds = 6960
+resolution = "3840x2160"
+video = "MPEGH/ISO/HEVC"
+audio = "eng/TRUEHD,eng/AC3"
+subs = 3
+chapters = 20
+
+[[files]]
+path = "movies/Back to the Future (1985)/extras/Back to the Future (1985)_t03.mkv"
+main = false
+size = 1234567890
+...
+```
+
+`format` comes from ARM's disc type and the widest picture in the files
+(3840 wide is UHD).  The file rows come from `mkvheader.py`, a standard-library
+Matroska header reader shipped next to the script (`python3 mkvheader.py
+<path>` prints the same columns as TSV), so a file that is not Matroska is
+listed by size alone.  Keys ARM did not fill (no barcode scanned, no sleeve
+label, a stock ARM database without those columns) are left out rather than
+written empty.
+
+The record is built before the folder's rsync starts, while every file is
+still local, and written atomically (via a `.tmp` file and a rename) to
+`catalog_spool_path` as `<name>.pending`.  If that transfer is interrupted,
+the next run finds the pending record by its `-job<id>.pending` ending and
+reuses it, so the record still lists the files the first run already
+delivered and removed.  Once rsync has exited 0 and the folder is empty, the
+record is renamed to `<name>.toml` (with `shipped` set to that moment), copied
+with its own rsync to `remote_catalog_path` (which must exist; the same ssh
+key and options, no bandwidth cap) and removed from the spool.  A record whose
+copy failed stays in the spool as `.toml`, the run exits 1, and the next run
+ships it before anything else.  Only `.toml` files are ever shipped from the
+spool; `.pending` and `.tmp` ones never are.
+
+A `.pending` record whose job folder is no longer in `completed_path` (the run
+was killed between the folder shipping and the rename, or the folder was
+removed by hand) is finished and shipped at the start of the next run, with a
+warning naming it: the shipper cannot list the media box to tell the two cases
+apart, so it assumes the folder shipped.  It only draws that conclusion while
+the folder's category directory (`movies/`, `tv/`) exists: when that is missing
+too, `completed_path` is most likely not mounted, and every pending record is
+left alone with a warning.  A pending record is matched to its folder by job id
+and its `library` key, so a job id reused after an ARM database reset never
+picks up another rip's record.
+
+The record is optional metadata and never stops a folder from shipping: a file
+whose Matroska header is corrupt is listed by size alone (with a warning), a
+record that cannot be built is logged and the folder ships without it, and a
+spool that cannot be written logs the record's full text at error level, so it
+can be recovered from the journal.  Those last two make the run exit 1.
+
+Unidentified rips get no record: the catalog cannot register a disc without a
+title, and those folders are renamed by hand anyway.  A folder with no media
+file (only sidecars) gets none either.  A dry run logs what it would write
+(`-v` prints the record) and touches nothing.
+
+Nothing here reads the records.  On the setup this was written for, the
+catalog lives in git on another machine and imports them from the media box
+(`catalog import` in the home-ansible-projects repo).
 
 ## Pairing with Plex on the media box
 
@@ -231,8 +330,16 @@ destination folders, and runs the shipper end to end through a wrapper around
 the real `rsync` that records every call.  It covers priority order, the
 bandwidth cap, skipped unfinished/failed/unknown folders, the failure
 behaviour, resume after an interrupted copy, dry run, the lock, container to
-host path mapping (`arm_completed_path`) and the rsync command shape (`-s`,
-`--partial-dir`, unquoted remote path).
+host path mapping (`arm_completed_path`), the rsync command shape (`-s`,
+`--partial-dir`, unquoted remote path), and the catalog records: their
+content from a database with and without the fork's columns, the Matroska
+header reader on hand-built files (SeekHead following, truncation at every
+byte offset, random byte flips, corrupt element sizes and positions), a record
+whose transfer fails and ships on the next run, an interrupted folder transfer
+whose record still lists every file, pending records (atomic writes, never
+shipped early, finished when their folder is gone), an unwritable spool, a
+corrupt header or failing record build that still ships the folder, and that
+dry runs, unidentified rips and media-less folders leave none.
 
 ```bash
 python3 -m unittest scripts/completed_shipper/test_arm_completed_shipper.py

@@ -27,6 +27,25 @@ remote_movies_path = /srv/plex/Movies
 remote_tv_path = /srv/plex/TV
 remote_unidentified_path = /srv/arm-staging/unidentified
 
+# Optional: a directory on the media box (or local, like the paths above) that
+# receives one small TOML catalog record per shipped movie or tv folder: what
+# ARM knew about the disc (title, year, metadata id, disc label and type, sleeve
+# id, case barcode) and every media file delivered with what its Matroska
+# header says.  A media catalog imports these.  Must exist on the media box.
+# Empty (the default) turns records off.  Unidentified rips never get one.
+remote_catalog_path = /tank/rips/catalog
+
+# Where records wait between being written and shipped.  A record is written
+# here as <name>.pending before its folder's transfer starts (an interrupted
+# transfer reuses it on the next run), renamed to <name>.toml once the folder
+# has shipped, then copied to remote_catalog_path; a record whose copy failed
+# goes on the next run.  Only .toml files are shipped from here.
+# Default: <completed_path>/catalog.
+catalog_spool_path =
+
+# The ripper's name in each record.  Default: this box's hostname.
+ripper_name =
+
 # rsync --bwlimit in KiB/s.  0 means unlimited.  Recognized rips (movies/tv)
 # normally go full speed; unidentified rips are throttled so they never crowd
 # out the next recognized rip or Plex playback.
