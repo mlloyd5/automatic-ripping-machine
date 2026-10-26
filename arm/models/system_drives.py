@@ -56,6 +56,26 @@ def _tray_ioctl(devpath, request):
         os.close(handle)
 
 
+def _medium_readable(devpath, logger=logging):
+    """
+    True when a plain (blocking) ``open()`` of the device succeeds, i.e. the drive will serve reads.
+
+    The CDROM_DRIVE_STATUS ioctl says DISC_OK a few seconds before that, and an HL-DT-ST DT80N
+    keeps saying DISC_OK after an eject with the tray open; ``mount``, ``blkid`` and ``cdrom_id``
+    all need the open to work, so this is what "ready" has to mean.
+    """
+    try:
+        handle = os.open(devpath, os.O_RDONLY)
+    except OSError as err:
+        logger.debug(f"'{devpath}' cannot be opened for reading yet: {err}")
+        return False
+    except TypeError as err:
+        logger.critical(f"Possible Database Inconsistency for {devpath}: '{err}'")
+        return False
+    os.close(handle)
+    return True
+
+
 def _tray_status(devpath, logger=logging):
     """
     Get the Status of the CDROM Drive.
@@ -222,22 +242,30 @@ class SystemDrives(db.Model):  # pylint: disable=too-many-instance-attributes
         :param logger: where progress goes (the job log does not exist yet at this point)
         :param sleep: injectable for tests
         :param clock: injectable for tests
-        :return: the distinct tray states seen, in order; ``self.ready`` says whether the drive got there
+        :return: ``(ready, seen)``: whether the disc can be read, and the distinct tray states seen in order
         """
         deadline = clock() + max(float(timeout), 0.0)
         seen = []
+        last = None
         while True:
             status = self.tray_status()
+            readable = status == CDS.DISC_OK and _medium_readable(self.mount, logger)
             if not seen or seen[-1] != status:
                 seen.append(status)
-                if status != CDS.DISC_OK:
+            if (status, readable) != last:
+                last = (status, readable)
+                if readable:
+                    logger.info(f"Drive [{self.mount}] has a readable disc")
+                elif status == CDS.DISC_OK:
+                    logger.info(f"Drive [{self.mount}] reports a disc but cannot read it yet; waiting up to {timeout}s")
+                else:
                     logger.info(f"Drive [{self.mount}] is not ready (tray status: {status.name}); "
                                 f"waiting up to {timeout}s")
-            if self.ready:
-                return seen
+            if readable:
+                return True, seen
             remaining = deadline - clock()
             if remaining <= 0:
-                return seen
+                return False, seen
             sleep(min(interval, remaining))
 
     @property

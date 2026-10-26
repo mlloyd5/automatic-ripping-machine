@@ -79,33 +79,70 @@ class TestWaitUntilReady(unittest.TestCase):
         self.drive.mount = "/dev/sr0"
         self.clock = FakeClock()
 
-    def _wait(self, statuses, timeout):
-        with mock.patch.object(system_drives, "_tray_status", side_effect=statuses):
-            return self.drive.wait_until_ready(timeout, logger=logging, sleep=self.clock.sleep, clock=self.clock)
+    def _wait(self, statuses, timeout, readable=None):
+        readable = itertools.repeat(True) if readable is None else iter(readable)
+        with mock.patch.object(system_drives, "_tray_status", side_effect=statuses), \
+                mock.patch.object(system_drives, "_medium_readable", side_effect=lambda *_a: next(readable)) as opened:
+            result = self.drive.wait_until_ready(timeout, logger=logging, sleep=self.clock.sleep, clock=self.clock)
+        self.opens = opened.call_count
+        return result
 
     def test_waits_through_loading_states_until_disc_ok(self):
         CDS = system_drives.CDS
-        seen = self._wait([3, 2, 3, 3, 4, 4], timeout=60)
+        ready, seen = self._wait([3, 2, 3, 3, 4, 4], timeout=60)
+        self.assertTrue(ready)
         self.assertEqual(seen, [CDS.DRIVE_NOT_READY, CDS.TRAY_OPEN, CDS.DRIVE_NOT_READY, CDS.DISC_OK])
         self.assertTrue(self.drive.ready)
         self.assertEqual(self.clock.sleeps, [1.0, 1.0, 1.0, 1.0])
+        self.assertEqual(self.opens, 1)  # only tried once the status allowed it
 
     def test_returns_at_once_when_already_ready(self):
-        seen = self._wait([4], timeout=60)
+        ready, seen = self._wait([4], timeout=60)
+        self.assertTrue(ready)
         self.assertEqual(seen, [system_drives.CDS.DISC_OK])
         self.assertEqual(self.clock.sleeps, [])
 
+    def test_disc_ok_is_not_enough_until_the_device_opens(self):
+        # the HL-DT-ST DT80N says DISC_OK seconds before mount/blkid/cdrom_id can open the device
+        ready, seen = self._wait([4, 4, 4, 4], timeout=60, readable=[False, False, True])
+        self.assertTrue(ready)
+        self.assertEqual(seen, [system_drives.CDS.DISC_OK])
+        self.assertEqual(self.clock.sleeps, [1.0, 1.0])
+        self.assertEqual(self.opens, 3)
+
+    def test_disc_ok_but_never_readable_times_out(self):
+        ready, seen = self._wait(itertools.repeat(4), timeout=5, readable=itertools.repeat(False))
+        self.assertFalse(ready)
+        self.assertEqual(seen, [system_drives.CDS.DISC_OK])
+        self.assertTrue(self.drive.ready)  # the ioctl's opinion, which is why main() uses the result instead
+        self.assertEqual(self.clock.sleeps, [1.0] * 5)
+
     def test_gives_up_at_timeout(self):
-        seen = self._wait(itertools.repeat(2), timeout=5)
+        ready, seen = self._wait(itertools.repeat(2), timeout=5)
+        self.assertFalse(ready)
         self.assertEqual(seen, [system_drives.CDS.TRAY_OPEN])
         self.assertFalse(self.drive.ready)
         self.assertEqual(sum(self.clock.sleeps), 5.0)
         self.assertEqual(self.clock.sleeps, [1.0] * 5)
+        self.assertEqual(self.opens, 0)
 
     def test_unreadable_status_is_recorded_as_error(self):
-        seen = self._wait([None, 4], timeout=10)
+        ready, seen = self._wait([None, 4], timeout=10)
+        self.assertTrue(ready)
         self.assertEqual(seen, [system_drives.CDS.ERROR, system_drives.CDS.DISC_OK])
-        self.assertTrue(self.drive.ready)
+
+
+@unittest.skipIf(IMPORT_ERROR is not None, f"ARM could not be imported here: {IMPORT_ERROR}")
+class TestMediumReadable(unittest.TestCase):
+    def test_open_success_and_failure(self):
+        with mock.patch.object(system_drives.os, "open", return_value=7) as opener, \
+                mock.patch.object(system_drives.os, "close") as closer:
+            self.assertTrue(system_drives._medium_readable("/dev/sr0"))
+        opener.assert_called_once_with("/dev/sr0", os.O_RDONLY)
+        closer.assert_called_once_with(7)
+        with mock.patch.object(system_drives.os, "open", side_effect=OSError(123, "No medium found")):
+            self.assertFalse(system_drives._medium_readable("/dev/sr0"))
+        self.assertFalse(system_drives._medium_readable(None))
 
 
 @unittest.skipIf(IMPORT_ERROR is not None, f"ARM could not be imported here: {IMPORT_ERROR}")
