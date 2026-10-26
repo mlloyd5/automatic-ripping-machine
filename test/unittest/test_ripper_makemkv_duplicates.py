@@ -273,5 +273,39 @@ class TestMakemkvMkvRouting(unittest.TestCase):
         self.assertEqual([call[0] for call in order.mock_calls], ["commit", "run", "run"])
 
 
+@unittest.skipIf(IMPORT_ERROR is not None, f"ARM could not be imported here: {IMPORT_ERROR}")
+class TestGetTrackInfoRetry(unittest.TestCase):
+    """A disc MakeMKV fails to open is scanned again (RED 2 on the t620 opened on a later try)."""
+
+    OPEN_FAILED = ['MSG:5010,0,0,"Failed to open disc","Failed to open disc"', "TCOUNT:0"]
+    OPENED = ["TCOUNT:1", 'TINFO:0,9,0,"1:55:49"']
+
+    def _scan(self, *outputs):
+        scans = iter(outputs)
+
+        def info(job, select, index, options):
+            for line in next(scans):
+                msg_type, data = makemkv.parse_line(line)
+                if msg_type in select:
+                    yield data
+
+        with mock.patch.object(makemkv, "makemkv_info", side_effect=info) as scan, \
+                mock.patch.object(makemkv, "sleep") as pause, \
+                mock.patch.object(makemkv.utils, "database_updater"), \
+                mock.patch.object(makemkv.utils, "put_track") as put_track:
+            makemkv.get_track_info(0, _job([]))
+        return scan.call_count, pause.call_count, put_track.call_count
+
+    def test_opens_on_the_second_try(self):
+        self.assertEqual(self._scan(self.OPEN_FAILED, self.OPENED), (2, 1, 1))
+
+    def test_gives_up_after_the_last_attempt(self):
+        self.assertEqual(self._scan(*[self.OPEN_FAILED] * makemkv.DISC_OPEN_ATTEMPTS),
+                         (makemkv.DISC_OPEN_ATTEMPTS, makemkv.DISC_OPEN_ATTEMPTS - 1, 0))
+
+    def test_disc_without_long_titles_is_not_retried(self):
+        self.assertEqual(self._scan(["TCOUNT:0"]), (1, 0, 0))
+
+
 if __name__ == '__main__':
     unittest.main()
