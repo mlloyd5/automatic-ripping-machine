@@ -67,13 +67,15 @@ def get_omdb_poster(title=None, year=None, imdb_id=None, plot="short"):
         str_url = f"https://www.omdbapi.com/?i={imdb_id}&plot={plot}&r=json&apikey={omdb_api_key}"
         str_url_2 = ""
     elif title:
-        str_url = f"https://www.omdbapi.com/?s={title}&y={year}&plot={plot}&r=json&apikey={omdb_api_key}"
-        str_url_2 = f"https://www.omdbapi.com/?t={title}&y={year}&plot={plot}&r=json&apikey={omdb_api_key}"
+        # urlencode so a title with "&", "#", "+" or "?" is one parameter rather than a cut-off query
+        params = {"y": year, "plot": plot, "r": "json", "apikey": omdb_api_key}
+        str_url = "https://www.omdbapi.com/?" + urllib.parse.urlencode({"s": title, **params})
+        str_url_2 = "https://www.omdbapi.com/?" + urllib.parse.urlencode({"t": title, **params})
     else:
         app.logger.debug("no params")
         return None, None
     try:
-        title_info_json = urllib.request.urlopen(requests.utils.requote_uri(str_url)).read()
+        title_info_json = urllib.request.urlopen(str_url).read()
     except Exception as error:
         app.logger.debug(f"Failed to reach OMdb - {error}")
     else:
@@ -83,7 +85,7 @@ def get_omdb_poster(title=None, year=None, imdb_id=None, plot="short"):
             return title_info['Search'][0]['Poster'], title_info['Search'][0]['imdbID']
 
         try:
-            title_info_json2 = urllib.request.urlopen(requests.utils.requote_uri(str_url_2)).read()
+            title_info_json2 = urllib.request.urlopen(str_url_2).read()
             title_info2 = json.loads(title_info_json2.decode())
             # app.logger.debug("omdb - " + str(title_info2))
             if 'Error' not in title_info2:
@@ -115,8 +117,8 @@ def get_tmdb_poster(search_query=None, year=None):
         return tmdb_process_poster(search_results, poster_base)
 
     # Search tmdb for tv series
-    url = f"https://api.themoviedb.org/3/search/tv?api_key={tmdb_api_key}&query={search_query}"
-    response = requests.get(url)
+    response = requests.get("https://api.themoviedb.org/3/search/tv",
+                            params={"api_key": tmdb_api_key, "query": search_query})
     search_results = json.loads(response.text)
     # app.logger.debug(json.dumps(response.json(), indent=4, sort_keys=True))
     if search_results['total_results'] > 0:
@@ -165,8 +167,8 @@ def tmdb_search(search_query=None, year=None):
         return tmdb_process_results(poster_base, return_results, search_results, "movie")
     # Search for tv series
     app.logger.debug("tmdb_search - movie not found, trying tv series ")
-    url = f"https://api.themoviedb.org/3/search/tv?api_key={tmdb_api_key}&query={search_query}"
-    response = requests.get(url)
+    response = requests.get("https://api.themoviedb.org/3/search/tv",
+                            params={"api_key": tmdb_api_key, "query": search_query})
     search_results = json.loads(response.text)
     if search_results['total_results'] > 0:
         app.logger.debug(search_results['total_results'])
@@ -335,14 +337,15 @@ def tmdb_fetch_results(search_query, year, tmdb_api_key):
     # https://api.themoviedb.org/3/movie/78?api_key= # base url
     # Additional
     # &append_to_response=alternative_titles,changes,credits,images,keywords,lists,releases,reviews,similar,videos
+    # requests percent-encodes the params, so a title such as "Thomas & Friends - Best of Gordon" reaches
+    # TMDB whole instead of being cut at the "&" (job 36 on the ts140 was filed as Gordon (2003) that way)
+    params = {"api_key": tmdb_api_key, "query": search_query}
     if year:
-        url = f"https://api.themoviedb.org/3/search/movie?api_key={tmdb_api_key}&query={search_query}&year={year}"
-    else:
-        url = f"https://api.themoviedb.org/3/search/movie?api_key={tmdb_api_key}&query={search_query}"
+        params["year"] = year
     # Valid poster sizes
     # "w92", "w154", "w185", "w342", "w500", "w780", "original"
     poster_size = "original"
     poster_base = f"https://image.tmdb.org/t/p/{poster_size}"
-    response = requests.get(url)
+    response = requests.get("https://api.themoviedb.org/3/search/movie", params=params)
     return_json = json.loads(response.text)
     return return_json, poster_base, response
