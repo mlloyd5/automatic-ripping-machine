@@ -16,6 +16,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -294,6 +295,30 @@ class TestFindMount(unittest.TestCase):
     def test_findmnt_missing(self):
         with mock.patch.object(identify.subprocess, "run", side_effect=OSError("no findmnt")):
             self.assertIsNone(identify.find_mount("/dev/sr0"))
+
+
+@unittest.skipIf(IMPORT_ERROR is not None, f"ARM could not be imported here: {IMPORT_ERROR}")
+class TestUnmountDisc(unittest.TestCase):
+    def test_unmounts_by_mountpoint_when_there_is_one(self):
+        job = SimpleNamespace(devpath="/dev/sr1", mountpoint=_TMP)
+        with mock.patch.object(identify, "arm_subprocess") as run:
+            identify.unmount_disc(job)
+        run.assert_called_once_with(["umount", _TMP])
+
+    def test_falls_back_to_the_device(self):
+        for mountpoint in ("", None, "/dev/sr1", "/nonexistent/mnt"):
+            job = SimpleNamespace(devpath="/dev/sr1", mountpoint=mountpoint)
+            with mock.patch.object(identify, "arm_subprocess") as run:
+                identify.unmount_disc(job)
+            run.assert_called_once_with(["umount", "/dev/sr1"])
+
+
+@unittest.skipIf(IMPORT_ERROR is not None, f"ARM could not be imported here: {IMPORT_ERROR}")
+class TestQuietExceptions(unittest.TestCase):
+    def test_hierarchy(self):
+        for cls in (utils.EmptyDriveException, utils.UnlistedDriveException, utils.DuplicateRunException):
+            self.assertTrue(issubclass(cls, utils.NothingToDoException))
+            self.assertTrue(issubclass(cls, utils.RipperException))
 
 
 @unittest.skipIf(IMPORT_ERROR is not None, f"ARM could not be imported here: {IMPORT_ERROR}")
