@@ -24,8 +24,10 @@ remote_host = arm@t620
 # Destination directories.  Each job folder lands as <path>/<Title (Year)>/.
 # The parent directories must already exist and be writable by remote_host.
 # A folder that already holds a file the rip would replace (a second disc of a
-# title the pool has, a re-rip) is never written into: the rip lands beside it
-# as <Title (Year)> - <disc label>/ (or - job<id>/) instead.  See the README.
+# title the pool has, a re-rip; contents are compared by checksum) is never
+# written into: the rip lands beside it as <Title (Year)> - <disc label>/ (or
+# - job<id>/) instead.  Unidentified rips, which ARM names after the disc
+# label, go straight to <label> - job<id>/.  See the README.
 remote_movies_path = /srv/plex/Movies
 remote_tv_path = /srv/plex/TV
 remote_unidentified_path = /srv/arm-staging/unidentified
@@ -42,7 +44,10 @@ remote_catalog_path = /tank/rips/catalog
 # here as <name>.pending before its folder's transfer starts (an interrupted
 # transfer reuses it on the next run), renamed to <name>.toml once the folder
 # has shipped, then copied to remote_catalog_path; a record whose copy failed
-# goes on the next run.  Only .toml files are shipped from here.
+# goes on the next run.  Only .toml files are shipped from here.  Records on or
+# off, each folder's chosen destination name is also kept here as
+# job<id>.destination from before its transfer starts until it has shipped, so
+# an interrupted transfer finishes in the same folder.
 # Default: <completed_path>/catalog.
 catalog_spool_path =
 

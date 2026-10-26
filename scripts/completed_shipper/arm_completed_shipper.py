@@ -36,6 +36,12 @@ Safety rules:
   ``<Title (Year)> - <disc label>`` (or ``- job<id>``) beside the original,
   and if that collides too it stays on the ripper and the run exits 1.  The
   dry runs need no listing rights: a write-only destination key allows them.
+  They compare checksums, so a different file that merely has the same size
+  and time is a collision too, never mistaken for a resumed one.
+* The destination name is decided once, before the transfer starts, and kept
+  in ``catalog_spool_path`` as ``job<id>.destination`` until the folder has
+  shipped, so a run that is interrupted part-way finishes in the same folder
+  instead of probing again with only the files still left.
 * A lock file stops two runs overlapping.
 * Only the standard library plus ``rsync`` are needed.
 
@@ -96,7 +102,9 @@ HD_MIN_WIDTH = 1280
 SUFFIX_MAX_LENGTH = 64
 """Longest disc label appended to a destination folder name that already holds a file the transfer would replace."""
 TRANSFER_ITEM = re.compile(r"^[<>]f\S* (.+)$")
-"""An ``rsync --itemize-changes`` line for a file the transfer sends (``<`` to a remote, ``>`` locally): flags, space, name."""
+"""An ``rsync --itemize-changes`` line for a file the transfer sends (``<`` to a remote, ``>`` locally)."""
+STATE_SUFFIX = ".destination"
+"""A job folder's chosen destination name, kept in the spool from before its transfer until it has shipped."""
 
 JOB_COLUMNS = ("job_id", "status", "path", "title", "title_manual", "year", "year_manual", "video_type",
                "imdb_id", "label", "disctype", "disc_barcode", "disc_barcode_title", "sleeve_id", "box",
@@ -327,11 +335,14 @@ def build_probe_rsync_command(cfg, sub_folder, local_folder, remote_name, ignore
     rsync argv for one collision probe: a dry run that itemizes what the real transfer would send.
 
     Same ssh, timeout and extra arguments as the transfer (an ``--exclude`` there
-    must hold here too), no bandwidth cap, nothing removed.  Only the short-flag
-    cluster differs on the remote command line, so a forced command written for
-    the transfer accepts the probe as well.
+    must hold here too), no bandwidth cap, nothing removed.  ``--checksum``
+    compares contents instead of size and time (see :func:`colliding_files`).
+    Only the short-flag cluster differs on the remote command line (``n`` and
+    ``c`` join it: ``rsync --server -snlogDtprce.iLsfxCIvu`` with rsync 3.x and
+    ``-s``), so a forced command written for the transfer accepts the probe too.
     """
-    cmd = [cfg["rsync_path"], "-a", "--dry-run", "--itemize-changes", f"--timeout={int(cfg['rsync_timeout'])}"]
+    cmd = [cfg["rsync_path"], "-a", "--dry-run", "--itemize-changes", "--checksum",
+           f"--timeout={int(cfg['rsync_timeout'])}"]
     if ignore_existing:
         cmd.append("--ignore-existing")
     cmd.extend(remote_shell_args(cfg))
@@ -365,10 +376,14 @@ def colliding_files(cfg, sub_folder, local_folder, remote_name):
 
     Two dry runs: without ``--ignore-existing`` rsync lists every file it would
     send (new ones and existing ones that differ); with it, only the files the
-    destination lacks.  The difference is exactly what would be overwritten.  A
-    file an earlier, interrupted run already delivered is identical to its
-    source (``-a`` keeps size and time) and appears in neither list, so a resume
-    is not a collision.  Returns the sorted names, or None when a probe failed.
+    destination lacks.  The difference is exactly what would be overwritten.
+    Both probes run with ``--checksum``: rsync's usual quick check (size and
+    time) would pass over a different file that happens to have the source's
+    size and time, the transfer would skip it, and ``--remove-source-files``
+    would then delete the only copy of the new rip.  A file an earlier,
+    interrupted run already delivered has the source's contents and appears in
+    neither list, so a resume is not a collision.  The transfer itself keeps
+    the quick check.  Returns the sorted names, or None when a probe failed.
     """
     listings = []
     for ignore_existing in (False, True):
@@ -384,7 +399,7 @@ def colliding_files(cfg, sub_folder, local_folder, remote_name):
     return sorted(would_send - new_only)
 
 
-def remote_folder_names(local_folder, job):
+def remote_folder_names(local_folder, job, sub_folder=None):
     """
     Destination folder names to try for one job folder, in order.
 
@@ -393,13 +408,17 @@ def remote_folder_names(local_folder, job):
     finally with the job id, so a second disc of a title the pool already has
     (the Blu-ray after the UHD, a re-rip) lands beside the first copy, never over
     it.  Plex groups both as versions of the one title.
+
+    The label is skipped for an unidentified folder, which ARM names after the
+    label itself (``DVD_VIDEO - DVD_VIDEO`` says nothing), and whenever it
+    matches the folder name; those go straight to the job id.
     """
     folder = os.path.basename(local_folder.rstrip(os.sep))
     names = [folder]
-    label = _clean(job.get("label")) if job else None
+    label = _clean(job.get("label")) if job and sub_folder != UNIDENTIFIED else None
     if label:
         safe = " ".join(re.sub(r"[\\/\x00-\x1f\x7f]+", " ", label).split())[:SUFFIX_MAX_LENGTH].strip()
-        if safe:
+        if safe and safe != folder:
             names.append(f"{folder} - {safe}")
     job_id = job.get("job_id") if job else None
     if job_id:
@@ -412,7 +431,7 @@ def choose_remote_name(cfg, sub_folder, local_folder, job):
     The destination folder name for one job folder: the first of :func:`remote_folder_names`
     that holds no file the transfer would replace.  None when all collide or a probe failed.
     """
-    for name in remote_folder_names(local_folder, job):
+    for name in remote_folder_names(local_folder, job, sub_folder):
         collisions = colliding_files(cfg, sub_folder, local_folder, name)
         if collisions is None:
             return None
@@ -423,6 +442,145 @@ def choose_remote_name(cfg, sub_folder, local_folder, job):
     log.error("every destination name for %s already holds a file it would replace; leaving it for the next run",
               local_folder)
     return None
+
+
+def destination_state_path(cfg, job):
+    """``<catalog_spool_path>/job<id>.destination``: where a job folder's chosen destination name is kept."""
+    return os.path.join(cfg["catalog_spool_path"], f"job{job.get('job_id') or 0}{STATE_SUFFIX}")
+
+
+def read_destination_state(cfg, job, source):
+    """
+    The destination name an earlier run chose for the job folder ``source`` (see :func:`library_path`), or None.
+
+    A state file left by another folder with the same job id (an id reused
+    after an ARM database reset) is ignored, with a warning.
+    """
+    path = destination_state_path(cfg, job)
+    if not os.path.exists(path):
+        return None
+    recorded = read_record_key(path, "source")
+    name = read_record_key(path, "remote_name")
+    if recorded != source or not name or "/" in name or name in (".", ".."):
+        log.warning("ignoring %s: it names %s -> %s, not a destination for %s", path, recorded, name, source)
+        return None
+    return name
+
+
+def save_destination_state(cfg, job, source, remote_name):
+    """Keep the destination name chosen for a job folder, atomically.  Returns False when the spool is not writable."""
+    path = destination_state_path(cfg, job)
+    text = "\n".join(["# Destination folder the ARM completed-rip shipper chose for one job folder; removed once",
+                      "# the folder has shipped.  An interrupted transfer resumes into the same folder."]
+                     + _toml_lines([("source", source), ("remote_name", remote_name)])) + "\n"
+    try:
+        os.makedirs(cfg["catalog_spool_path"], exist_ok=True)
+        _write_atomically(path, text)
+    except OSError as err:
+        log.error("could not keep the destination name of %s in %s: %s", source, path, err)
+        return False
+    return True
+
+
+def clear_destination_state(cfg, job):
+    """Forget a job folder's destination name once it has shipped."""
+    path = destination_state_path(cfg, job)
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        pass
+    except OSError as err:
+        log.warning("could not remove %s: %s", path, err)
+
+
+def settle_destination_states(cfg, dry_run=False):
+    """
+    Drop destination names whose job folder is no longer in completed_path.
+
+    That happens when a run was killed after the folder shipped but before the
+    name was forgotten, and when a folder was removed by hand.  A name whose
+    folder is still there is left for :func:`ship_folder` to resume with.
+    """
+    for path in _spooled(cfg, STATE_SUFFIX):
+        source = read_record_key(path, "source")
+        if source and os.path.isdir(os.path.join(cfg["completed_path"], source)):
+            continue
+        if dry_run:
+            log.info("dry run: would drop %s (%s is gone)", path, source)
+            continue
+        log.info("%s is no longer in %s; dropping its destination name %s", source, cfg["completed_path"],
+                 os.path.basename(path))
+        try:
+            os.remove(path)
+        except OSError as err:
+            log.warning("could not remove %s: %s", path, err)
+
+
+def persisted_remote_name(cfg, sub_folder, source, job):
+    """
+    The destination name an earlier, unfinished run chose for a job folder, or None when there was none.
+
+    Read from the job's ``.destination`` state file or, failing that, from the
+    ``library`` key of its pending catalog record.  When the two disagree the
+    state file wins, with a warning.
+    """
+    if job is None:
+        return None
+    state = read_destination_state(cfg, job, source)
+    pending = pending_record_path(cfg, job, source)
+    recorded = None
+    if pending:
+        library = read_record_key(pending, "library") or ""
+        if library.startswith(sub_folder + "/") and "/" not in library[len(sub_folder) + 1:]:
+            recorded = library[len(sub_folder) + 1:] or None
+    if state and recorded and state != recorded:
+        log.warning("%s ships as %s according to %s, but catalog record %s says %s; following the former",
+                    source, state, os.path.basename(destination_state_path(cfg, job)), os.path.basename(pending),
+                    recorded)
+    return state or recorded
+
+
+def resolve_remote_name(cfg, sub_folder, local_folder, job, dry_run=False, stats=None):
+    """
+    The destination folder name for one job folder, decided once and kept until the folder has shipped.
+
+    A name an earlier, interrupted run chose (see :func:`persisted_remote_name`)
+    is reused without probing ARM's own name again: with part of the folder
+    already delivered and removed, that probe would see only the files still
+    left and could send them somewhere else.  The kept name is still probed, so
+    a file someone else put there meanwhile is caught (one this folder already
+    delivered is identical and counts as a resume); then the folder stays and
+    the run exits 1.  Otherwise :func:`choose_remote_name` picks a name, which
+    is written to the spool before the transfer starts.  When it cannot be
+    written, a folder shipping under ARM's own name goes anyway (a later probe
+    picks the same name for a resumed transfer) but a renamed one stays.
+    Returns None when the folder must not ship this run.
+    """
+    source = library_path(sub_folder, local_folder)
+    persisted = persisted_remote_name(cfg, sub_folder, source, job)
+    if persisted is not None:
+        collisions = colliding_files(cfg, sub_folder, local_folder, persisted)
+        if collisions is None:
+            return None
+        if collisions:
+            log.error("%s, the destination an earlier run chose for %s, now holds %s, which this transfer would "
+                      "replace; leaving it for the next run (removing %s lets the shipper choose again, which "
+                      "splits the rip)", destination(cfg, sub_folder, local_folder, persisted), local_folder,
+                      ", ".join(collisions), destination_state_path(cfg, job))
+            return None
+        log.info("resuming %s into %s, the destination an earlier run chose", local_folder, persisted)
+        return persisted
+    remote_name = choose_remote_name(cfg, sub_folder, local_folder, job)
+    if remote_name is None or dry_run or job is None:
+        return remote_name
+    if not save_destination_state(cfg, job, source, remote_name):
+        if remote_name != os.path.basename(local_folder.rstrip(os.sep)):
+            log.error("not shipping %s as %s without a record of that name; leaving it for the next run",
+                      local_folder, remote_name)
+            return None
+        if stats is not None:
+            stats["failed"] += 1
+    return remote_name
 
 
 def prune_empty_dirs(folder):
@@ -469,9 +627,11 @@ def ship_folder(cfg, sub_folder, local_folder, dry_run=False, verbose=False, job
     ``<name> - job<id>``) when the folder already holds a file this transfer
     would replace.  When every name collides, or a probe fails, the folder stays
     and the run exits 1.  The record names the folder that actually received the
-    files.
+    files.  The name is decided once (:func:`resolve_remote_name`) and kept
+    until the folder has shipped, so an interrupted transfer resumes into the
+    same folder.
     """
-    remote_name = choose_remote_name(cfg, sub_folder, local_folder, job)
+    remote_name = resolve_remote_name(cfg, sub_folder, local_folder, job, dry_run, stats)
     if remote_name is None:
         return False
     renamed = remote_name != os.path.basename(local_folder.rstrip(os.sep))
@@ -479,14 +639,7 @@ def ship_folder(cfg, sub_folder, local_folder, dry_run=False, verbose=False, job
         log.warning("shipping %s as %s instead", local_folder, remote_name)
     pending = None
     if job is not None and cfg["remote_catalog_path"] and sub_folder != UNIDENTIFIED:
-        try:
-            pending = prepare_record(cfg, sub_folder, local_folder, job, remote_name, dry_run=dry_run)
-        except Exception as err:  # optional metadata: never block the transfer
-            if not isinstance(err, RecordError):
-                log.exception("could not prepare the catalog record for %s; shipping the folder without it",
-                              local_folder)
-            if stats is not None:
-                stats["failed"] += 1
+        pending = prepare_record_safely(cfg, sub_folder, local_folder, job, remote_name, dry_run, stats)
     cmd = build_rsync_command(cfg, sub_folder, local_folder, dry_run=dry_run, verbose=verbose, remote_name=remote_name)
     log.info("shipping [%s] %s -> %s", sub_folder, local_folder, cmd[-1])
     log.debug("rsync argv: %s", " ".join(shlex.quote(part) for part in cmd))
@@ -502,6 +655,8 @@ def ship_folder(cfg, sub_folder, local_folder, dry_run=False, verbose=False, job
         log.error("rsync succeeded but %s still has content; not treating as shipped", local_folder)
         return False
     log.info("shipped and removed %s", local_folder)
+    if job is not None:
+        clear_destination_state(cfg, job)
     if renamed and stats is not None:
         stats["renamed"] += 1
     if pending:
@@ -513,6 +668,19 @@ def ship_folder(cfg, sub_folder, local_folder, dry_run=False, verbose=False, job
             stats["failed"] += 1
     run_post_ship_command(cfg, sub_folder, local_folder, remote_name)
     return True
+
+
+def prepare_record_safely(cfg, sub_folder, local_folder, job, remote_name, dry_run=False, stats=None):
+    """:func:`prepare_record`, but a record that cannot be built or spooled is logged and counted, never raised."""
+    try:
+        return prepare_record(cfg, sub_folder, local_folder, job, remote_name, dry_run=dry_run)
+    except Exception as err:  # optional metadata: never block the transfer
+        if not isinstance(err, RecordError):
+            log.exception("could not prepare the catalog record for %s; shipping the folder without it",
+                          local_folder)
+        if stats is not None:
+            stats["failed"] += 1
+    return None
 
 
 # --------------------------------------------------------------------------- catalog records
@@ -611,7 +779,13 @@ def record_name(cfg, job, suffix=RECORD_SUFFIX):
 
 
 def library_path(sub_folder, folder):
-    """``<sub folder>/<folder name>``: the record's ``library`` key for a folder (a path's last component counts)."""
+    """
+    ``<sub folder>/<folder name>`` (a path's last component counts).
+
+    For the destination name it is a record's ``library``; for the local job
+    folder it is the record's ``source`` and the state file's, which is also
+    where the folder sits under completed_path.
+    """
     return f"{sub_folder}/{os.path.basename(folder.rstrip(os.sep))}"
 
 
@@ -658,6 +832,7 @@ def catalog_record(cfg, sub_folder, local_folder, job, remote_name=None):
         (id_key, id_value),
         ("library", library),
         ("destination", os.path.join(remote_root_for(cfg, sub_folder), remote_name)),
+        ("source", library_path(sub_folder, folder)),
         ("label", _clean(job.get("label")) or ""),
         ("format", disc_format(job, rows)),
         ("role", "feature" if sub_folder == "tv" or any(row["main"] for row in rows) else "bonus"),
@@ -767,20 +942,61 @@ def _spooled(cfg, suffix):
     return [os.path.join(spool, name) for name in sorted(os.listdir(spool)) if name.endswith(suffix)]
 
 
-def pending_record_path(cfg, job, library=None):
+def record_source(path):
+    """
+    The local job folder a record was built from, as ``<sub folder>/<job folder>``.
+
+    Its ``source`` key; a record written before that key existed falls back to
+    ``library``, which then named the same folder.
+    """
+    return read_record_key(path, "source") or read_record_key(path, "library")
+
+
+def pending_record_path(cfg, job, source=None):
     """
     The ``.pending`` record an earlier run spooled for ``job``, or None.
 
     Matched on the ``-job<id>.pending`` end of the name only, so a changed
-    ripper name or rip-time format cannot orphan it.  With ``library`` (see
-    :func:`library_path`) a pending record whose ``library`` key names another
-    folder (a job id reused after an ARM database reset) is not returned.
-    When several match, the newest name wins.
+    ripper name or rip-time format cannot orphan it.  With ``source`` (see
+    :func:`library_path`) a pending record built from another folder (a job id
+    reused after an ARM database reset) is not returned.  The record's
+    ``library`` is not compared: it names the destination folder, which carries
+    a suffix when ARM's name was taken.  When several match, the newest name
+    wins.
     """
     tail = _job_tag(job) + PENDING_SUFFIX
-    matches = [path for path in _spooled(cfg, tail)
-               if library is None or read_record_key(path, "library") == library]
+    matches = [path for path in _spooled(cfg, tail) if source is None or record_source(path) == source]
     return matches[-1] if matches else None
+
+
+def retarget_record(path, cfg, sub_folder, remote_name):
+    """
+    Point a pending record's ``library``, ``destination`` and file paths at ``remote_name``.
+
+    Only needed when a pending record and the state file disagree about the
+    destination (the state file wins).
+
+    :raises RecordError: when the record cannot be rewritten (logged)
+    """
+    old = read_record_key(path, "library") or ""
+    library = library_path(sub_folder, remote_name)
+    replacements = {"library": library, "destination": os.path.join(remote_root_for(cfg, sub_folder), remote_name)}
+    try:
+        with open(path, encoding="utf-8") as handle:
+            lines = handle.read().split("\n")
+        for index, line in enumerate(lines):
+            key, sep, value = line.partition(" = ")
+            if sep and key in replacements:
+                lines[index] = _toml_lines([(key, replacements[key])])[0]
+            elif sep and key == "path" and len(value) >= 2 and value[0] == value[-1] == '"':
+                current = _toml_unescape(value[1:-1])
+                if old and current.startswith(old + "/"):
+                    lines[index] = _toml_lines([("path", library + current[len(old):])])[0]
+        _write_atomically(path, "\n".join(lines))
+    except OSError as err:
+        log.error("could not point catalog record %s at %s: %s", path, library, err)
+        raise RecordError(path) from err
+    log.warning("catalog record %s now names %s, not %s", os.path.basename(path), library, old)
 
 
 def prepare_record(cfg, sub_folder, local_folder, job, remote_name=None, dry_run=False):
@@ -794,9 +1010,15 @@ def prepare_record(cfg, sub_folder, local_folder, job, remote_name=None, dry_run
 
     :raises RecordError: when the spool is not writable (the record's text has been logged)
     """
-    existing = pending_record_path(cfg, job, library_path(sub_folder, remote_name or local_folder))
+    existing = pending_record_path(cfg, job, library_path(sub_folder, local_folder))
     if existing:
         log.info("reusing catalog record %s from an earlier, unfinished transfer", existing)
+        remote_name = remote_name or os.path.basename(local_folder.rstrip(os.sep))
+        if read_record_key(existing, "library") != library_path(sub_folder, remote_name):
+            if dry_run:
+                log.info("dry run: would point catalog record %s at %s", existing, remote_name)
+            else:
+                retarget_record(existing, cfg, sub_folder, remote_name)
         return existing
     built = catalog_record(cfg, sub_folder, local_folder, job, remote_name)
     if built is None:
@@ -865,22 +1087,24 @@ def settle_pending_records(cfg, dry_run=False):
     then nothing can be said about the folder.
     """
     for pending in _spooled(cfg, PENDING_SUFFIX):
-        library = read_record_key(pending, "library")
-        if not library:
-            log.warning("catalog record %s names no library folder; leaving it in the spool", pending)
+        # The record's source names the local job folder; its library names the destination,
+        # which differs when ARM's name was taken on the media box.
+        source = record_source(pending)
+        if not source:
+            log.warning("catalog record %s names no source folder; leaving it in the spool", pending)
             continue
-        present = source_folder_present(cfg, library)
+        present = source_folder_present(cfg, source)
         if present:
             continue
         if present is None:
             log.warning("%s has no %s folder (not mounted?); leaving catalog record %s in the spool",
-                        cfg["completed_path"], library.split("/", 1)[0], os.path.basename(pending))
+                        cfg["completed_path"], source.split("/", 1)[0], os.path.basename(pending))
             continue
         if dry_run:
-            log.info("dry run: would finish catalog record %s (%s is gone)", pending, library)
+            log.info("dry run: would finish catalog record %s (%s is gone)", pending, source)
             continue
         log.warning("%s is no longer in %s; assuming it shipped and finishing its catalog record %s",
-                    library, cfg["completed_path"], os.path.basename(pending))
+                    source, cfg["completed_path"], os.path.basename(pending))
         finish_record(pending)
 
 
@@ -963,6 +1187,7 @@ def run(cfg, dry_run=False, verbose=False):
     """One full pass.  Returns the exit code for the process."""
     stats = {"shipped": 0, "failed": 0, "records": 0, "renamed": 0}
     attempted_unidentified = set()
+    settle_destination_states(cfg, dry_run)
     ship_pending_records(cfg, dry_run, stats)
     while True:
         recognized_clear = ship_recognized(cfg, dry_run, verbose, stats)
