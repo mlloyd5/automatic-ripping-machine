@@ -175,7 +175,16 @@ def process_makemkv_logfile(job, job_results):
 
     if job_stage_index is not None:
         try:
-            if job_batch_info.group(4) != job_stage_index.group(1):
+            if job_batch_info is None:
+                # First poll of this rip: start the batch-info file, which is the ETA's clock. Without
+                # this the line below raised on a missing file, the error was swallowed into the stage
+                # text and the file never came to exist, so every rip showed "Unknown" to the end.
+                entry = f"BINF:{int(time())},1,{job.no_of_titles or 1},{job_stage_index.group(1)}"
+                app.logger.debug(f"Starting batch position info for job {job.job_id}: {entry}")
+                with open(batch_log_path, 'a') as f:
+                    f.write(f"\n{entry}")
+                job_batch_info = re.search(r"BINF:(\d{10}),(\d+),(\d+),(\d+)", entry)
+            elif job_batch_info.group(4) != job_stage_index.group(1):
                 app.logger.debug(f"Appending new batch position info for job {job.job_id}: "
                                  f"BINF:{int(time())},"
                                  f"{job_batch_info.group(2)},"
