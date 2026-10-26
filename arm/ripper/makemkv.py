@@ -842,6 +842,10 @@ def process_single_tracks(job, rawpath, mode: str):
             else:
                 # track is just right
                 track.process = True
+        # Commit before ripping: job.tracks is a dynamic query, so reading it below autoflushes
+        # these flags inside a transaction that would then hold SQLite's write lock for the whole
+        # rip and make every other drive's job fail with "database is locked".
+        db.session.commit()
 
     # Rip the track if the user has set it to rip, or in auto mode and the time is good
 
