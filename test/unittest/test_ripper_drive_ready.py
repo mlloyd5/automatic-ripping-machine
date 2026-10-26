@@ -6,12 +6,14 @@ Importing these modules pulls in the whole of ARM (config, Flask app, database),
 arm.yaml is written first and pointed at with ARM_CONFIG_FILE. Needs the Linux dependencies ARM
 itself needs (libdiscid, pyudev); skipped when they are missing.
 """
+import ctypes
 import importlib
 import itertools
 import json
 import logging
 import os
 import shutil
+import struct
 import subprocess
 import tempfile
 import unittest
@@ -154,26 +156,49 @@ class TestEject(unittest.TestCase):
         self.drive.stale = False
         self.drive.mount = "/dev/sr0"
         self.drive.job_id_current = 5
+        self.no_wait = mock.patch.object(system_drives, "TRAY_MOVE_TIMEOUT", 0.0)
+        self.no_wait.start()
 
-    def test_ioctl_is_enough(self):
+    def tearDown(self):
+        self.no_wait.stop()
+
+    def test_ioctl_is_enough_when_the_tray_opens(self):
         with mock.patch.object(system_drives, "_tray_ioctl") as ioctl, \
+                mock.patch.object(system_drives, "_tray_status", return_value=2), \
+                mock.patch.object(system_drives, "_scsi_tray") as scsi, \
                 mock.patch.object(system_drives, "arm_subprocess") as run:
             self.assertIsNone(self.drive.eject())
         ioctl.assert_called_once_with("/dev/sr0", system_drives.CDROMEJECT)
+        scsi.assert_not_called()
         run.assert_not_called()
         self.assertIsNone(self.drive.job_id_current)
         self.assertEqual(self.drive.job_id_previous, 5)
 
     def test_close_and_toggle_pick_the_request(self):
         with mock.patch.object(system_drives, "_tray_ioctl") as ioctl, \
-                mock.patch.object(system_drives, "_tray_status", return_value=2):
-            self.drive.eject("close")
-            self.drive.eject("toggle")
+                mock.patch.object(system_drives, "_scsi_tray") as scsi, \
+                mock.patch.object(system_drives, "_tray_status", side_effect=[4, 2, 4]):
+            self.assertIsNone(self.drive.eject("close"))   # closed: status reads 4
+            self.assertIsNone(self.drive.eject("toggle"))  # toggle reads 2 (open) so it closes, then reads 4
+        scsi.assert_not_called()
         self.assertEqual([call.args[1] for call in ioctl.call_args_list],
                          [system_drives.CDROMCLOSETRAY, system_drives.CDROMCLOSETRAY])
 
-    def test_falls_back_to_eject_command(self):
+    def test_scsi_when_the_ioctl_says_ok_but_nothing_moves(self):
+        # the drive's medium is locked in: the ioctl returns 0 and the tray stays put
+        with mock.patch.object(system_drives, "_tray_ioctl") as ioctl, \
+                mock.patch.object(system_drives, "_tray_status", side_effect=[4, 2]), \
+                mock.patch.object(system_drives, "_scsi_tray") as scsi, \
+                mock.patch.object(system_drives, "arm_subprocess") as run:
+            self.assertIsNone(self.drive.eject())
+        ioctl.assert_called_once()
+        scsi.assert_called_once_with("/dev/sr0", False)
+        run.assert_not_called()
+
+    def test_eject_command_is_the_last_resort(self):
         with mock.patch.object(system_drives, "_tray_ioctl", side_effect=OSError(5, "Input/output error")), \
+                mock.patch.object(system_drives, "_scsi_tray", side_effect=OSError("check condition")), \
+                mock.patch.object(system_drives, "_tray_status", return_value=4), \
                 mock.patch.object(system_drives, "arm_subprocess") as run:
             self.assertIsNone(self.drive.eject())
         run.assert_called_once_with(["eject", "--verbose", "--cdrom", "--scsi", "/dev/sr0"], check=True)
@@ -181,9 +206,52 @@ class TestEject(unittest.TestCase):
     def test_reports_the_command_error(self):
         error = subprocess.CalledProcessError(1, ["eject"], output="eject: none: not found")
         with mock.patch.object(system_drives, "_tray_ioctl", side_effect=OSError(5, "boom")), \
+                mock.patch.object(system_drives, "_scsi_tray", side_effect=OSError("no")), \
+                mock.patch.object(system_drives, "_tray_status", return_value=4), \
                 mock.patch.object(system_drives, "arm_subprocess", side_effect=error):
             self.assertEqual(self.drive.eject(), "eject: none: not found")
         self.assertIsNone(self.drive.job_id_current)
+
+
+@unittest.skipIf(IMPORT_ERROR is not None, f"ARM could not be imported here: {IMPORT_ERROR}")
+class TestScsiCommand(unittest.TestCase):
+    def _run(self, status=0, host=0, driver=0):
+        captured = {}
+
+        def fake_ioctl(fd, request, buf):
+            captured["request"] = request
+            header = list(struct.unpack(system_drives._SG_IO_HDR, buf.raw))
+            captured["cdb_len"], captured["timeout"] = header[2], header[9]
+            captured["cdb"] = ctypes.string_at(header[7], header[2])
+            struct.pack_into("BBBBHH", buf, system_drives._SG_STATUS_OFFSET, status, 0, 0, 0, host, driver)
+            return 0
+        with mock.patch.object(system_drives.os, "open", return_value=9) as opener, \
+                mock.patch.object(system_drives.os, "close"), \
+                mock.patch.object(system_drives.fcntl, "ioctl", side_effect=fake_ioctl):
+            system_drives._scsi_tray("/dev/sr1")
+        opener.assert_called_with("/dev/sr1", os.O_RDWR | os.O_NONBLOCK)
+        return captured
+
+    def test_sends_allow_then_eject(self):
+        sent = []
+        with mock.patch.object(system_drives, "_scsi_command", side_effect=lambda d, cdb: sent.append(cdb)):
+            system_drives._scsi_tray("/dev/sr1")
+            system_drives._scsi_tray("/dev/sr1", close=True)
+        self.assertEqual(sent, [system_drives.SCSI_ALLOW_MEDIUM_REMOVAL, system_drives.SCSI_EJECT,
+                                system_drives.SCSI_ALLOW_MEDIUM_REMOVAL, system_drives.SCSI_LOAD])
+
+    def test_header_and_success(self):
+        captured = self._run()
+        self.assertEqual(captured["request"], system_drives.SG_IO)
+        self.assertEqual(captured["cdb_len"], 6)
+        self.assertEqual(captured["cdb"], system_drives.SCSI_EJECT)
+        self.assertEqual(captured["timeout"], 15000)
+
+    def test_check_condition_raises(self):
+        with self.assertRaises(OSError):
+            self._run(status=2)
+        with self.assertRaises(OSError):
+            self._run(host=1)
 
 
 @unittest.skipIf(IMPORT_ERROR is not None, f"ARM could not be imported here: {IMPORT_ERROR}")
@@ -311,6 +379,18 @@ class TestUnmountDisc(unittest.TestCase):
             with mock.patch.object(identify, "arm_subprocess") as run:
                 identify.unmount_disc(job)
             run.assert_called_once_with(["umount", "/dev/sr1"])
+
+
+@unittest.skipIf(IMPORT_ERROR is not None, f"ARM could not be imported here: {IMPORT_ERROR}")
+class TestJobProcessAlive(unittest.TestCase):
+    def test_states(self):
+        me = os.getpid()
+        live = SimpleNamespace(pid=me, pid_hash=hash(utils.psutil.Process(me)))
+        self.assertTrue(utils.job_process_alive(live))
+        self.assertFalse(utils.job_process_alive(SimpleNamespace(pid=me, pid_hash=12345)))  # pid reused
+        self.assertFalse(utils.job_process_alive(SimpleNamespace(pid=None, pid_hash=None)))
+        with mock.patch.object(utils.psutil, "pid_exists", return_value=False):
+            self.assertFalse(utils.job_process_alive(live))
 
 
 @unittest.skipIf(IMPORT_ERROR is not None, f"ARM could not be imported here: {IMPORT_ERROR}")

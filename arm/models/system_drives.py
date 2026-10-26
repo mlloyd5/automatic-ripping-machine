@@ -1,11 +1,13 @@
 """Database Model for Drive Information on the System
 """
 
+import ctypes
 import enum
 import fcntl
 import logging
 import os
 import re
+import struct
 import time
 from subprocess import CalledProcessError
 
@@ -36,6 +38,60 @@ CDROMEJECT = 0x5309
 """ioctl request: eject the disc / open the tray (linux/cdrom.h)"""
 CDROMCLOSETRAY = 0x5319
 """ioctl request: close the tray (linux/cdrom.h)"""
+
+
+SG_IO = 0x2285
+"""ioctl request: pass a SCSI command through (scsi/sg.h)"""
+_SG_IO_HDR = "iiBBHIPPPIIiPBBBBHHiII"
+"""struct sg_io_hdr, interface 'S' (scsi/sg.h)"""
+_SG_STATUS_OFFSET = struct.calcsize("iiBBHIPPPIIiP")
+"""where sg_io_hdr.status sits, for reading the result back"""
+SCSI_ALLOW_MEDIUM_REMOVAL = bytes.fromhex("1e 00 00 00 00 00")
+SCSI_EJECT = bytes.fromhex("1b 00 00 00 02 00")
+"""START STOP UNIT with LoEj set and Start clear: open the tray"""
+SCSI_LOAD = bytes.fromhex("1b 00 00 00 03 00")
+"""START STOP UNIT with LoEj and Start set: close the tray"""
+TRAY_MOVE_TIMEOUT = 5.0
+"""seconds to give a drive after a tray request before concluding it ignored it"""
+
+
+def _scsi_command(devpath, cdb, timeout_ms=15000):
+    """
+    Send one SCSI command with no data phase to the drive through SG_IO.
+
+    START STOP UNIT and PREVENT/ALLOW MEDIUM REMOVAL are on the kernel's list of commands a
+    user with write access to the device may send, so the arm user needs no capability.
+
+    :raise OSError: when the device cannot be opened or the drive reports a check condition
+    """
+    command = ctypes.create_string_buffer(bytes(cdb), len(cdb))
+    sense = ctypes.create_string_buffer(32)
+    header = struct.pack(_SG_IO_HDR, ord("S"), -1, len(cdb), 32, 0, 0, 0,
+                         ctypes.addressof(command), ctypes.addressof(sense), timeout_ms,
+                         0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+    request = ctypes.create_string_buffer(header, len(header))
+    handle = os.open(devpath, os.O_RDWR | os.O_NONBLOCK)
+    try:
+        fcntl.ioctl(handle, SG_IO, request)
+    finally:
+        os.close(handle)
+    result = struct.unpack_from("BBBBHH", request.raw, _SG_STATUS_OFFSET)
+    status, host_status, driver_status = result[0], result[4], result[5]
+    if status or host_status or driver_status:
+        raise OSError(f"SCSI command {cdb.hex()} on {devpath} failed: status 0x{status:02x}, "
+                      f"host 0x{host_status:04x}, driver 0x{driver_status:04x}")
+
+
+def _scsi_tray(devpath, close=False):
+    """
+    Open or close the tray by SCSI command, after lifting a PREVENT MEDIUM REMOVAL.
+
+    udev's cdrom_id locks the medium in on every media change, and some drives then ignore
+    the CDROMEJECT ioctl although the kernel reports it as done; the explicit ALLOW plus
+    START STOP UNIT is what eject --scsi sends and what got the trays open on such a drive.
+    """
+    _scsi_command(devpath, SCSI_ALLOW_MEDIUM_REMOVAL)
+    _scsi_command(devpath, SCSI_LOAD if close else SCSI_EJECT)
 
 
 def _tray_ioctl(devpath, request):
@@ -306,23 +362,50 @@ class SystemDrives(db.Model):  # pylint: disable=too-many-instance-attributes
             message otherwise.
         """
         try:
-            error = self._eject_ioctl(method)
+            close = method == "close" or (method == "toggle" and self.tray_status() == CDS.TRAY_OPEN)
+            error = self._eject_ioctl(close)
             if error is None:
                 return None
-            logging.warning(f"Tray ioctl failed for '{self.mount}' ({error}); trying eject(1)")
+            logging.warning(f"Tray ioctl did not move '{self.mount}' ({error}); trying a SCSI eject")
+            error = self._eject_scsi(close)
+            if error is None:
+                return None
+            logging.warning(f"SCSI eject failed for '{self.mount}' ({error}); trying eject(1)")
             return self._eject_command(method)
         finally:
             self.release_current_job()
 
-    def _eject_ioctl(self, method):
-        """Send the tray request for ``method`` straight to the drive; error text or None."""
-        request = CDROMCLOSETRAY if method == "close" else CDROMEJECT
-        if method == "toggle":
-            request = CDROMCLOSETRAY if self.tray_status() == CDS.TRAY_OPEN else CDROMEJECT
+    def _tray_moved(self, close, sleep=time.sleep, clock=time.monotonic):
+        """Poll the tray status until it shows the request took effect, or TRAY_MOVE_TIMEOUT passes."""
+        deadline = clock() + TRAY_MOVE_TIMEOUT
+        while True:
+            status = self.tray_status()
+            if close and status != CDS.TRAY_OPEN:
+                return True
+            if not close and status not in (CDS.DISC_OK, CDS.ERROR):
+                return True
+            if clock() >= deadline:
+                return False
+            sleep(0.5)
+
+    def _eject_ioctl(self, close):
+        """Send the tray request straight to the drive and check the tray moved; error text or None."""
         try:
-            _tray_ioctl(self.mount, request)
+            _tray_ioctl(self.mount, CDROMCLOSETRAY if close else CDROMEJECT)
         except (OSError, TypeError) as err:
             return str(err)
+        if not self._tray_moved(close):
+            return f"tray status still {self.tray.name} after {TRAY_MOVE_TIMEOUT:.0f}s"
+        return None
+
+    def _eject_scsi(self, close):
+        """Unlock the medium and move the tray by SCSI command; error text or None."""
+        try:
+            _scsi_tray(self.mount, close)
+        except (OSError, TypeError) as err:
+            return str(err)
+        if not self._tray_moved(close):
+            return f"tray status still {self.tray.name} after {TRAY_MOVE_TIMEOUT:.0f}s"
         return None
 
     def _eject_command(self, method):
