@@ -68,6 +68,13 @@ HOME_ALONE = [_result("Home Alone 3", "1997", 1500), _result("Home Sweet Home Al
               _result("Home Alone", "2023", 1), _result("Home Alone", "1990", 11000),
               _result("Home Alone", "1969", 3)]
 
+# What TMDB really returns for the WALL-E case barcode's product title: the hyphen hides the film
+# (job 29 on the ts140 was filed as East of Wall); with the year it turns up.
+WALL_E_HYPHEN = [_result("East of Wall", "2025", 30), _result("End of the Wall", "2026", 0),
+                 _result("Wall Engravings", "1968", 36), _result("Eyes Behind the Wall", "1977", 22)]
+WALL_E_YEAR = [_result("WALL\u00b7E's Treasures & Trinkets", "2008", 7), _result("Wall Street", "1987", 2358),
+               _result("WALL\u00b7E", "2008", 21096), _result("BURN\u00b7E", "2008", 837)]
+
 
 @unittest.skipIf(IMPORT_ERROR is not None, f"ARM could not be imported here: {IMPORT_ERROR}")
 class TestBestSearchResult(unittest.TestCase):
@@ -93,6 +100,13 @@ class TestBestSearchResult(unittest.TestCase):
         self.assertEqual(best["Title"], "Home Alone 3")
         self.assertEqual(identify.best_search_result(HOME_ALONE, None)["Title"], "Home Alone 3")
         self.assertIsNone(identify.best_search_result([], "Home Alone"))
+
+    def test_exact_only_refuses_a_page_of_near_misses(self):
+        self.assertIsNone(identify.best_search_result(WALL_E_HYPHEN, "WALL-E", exact_only=True))
+        self.assertIsNone(identify.best_search_result(HOME_ALONE, None, exact_only=True))
+        self.assertEqual(identify.best_search_result(WALL_E_YEAR, "WALL-E", "2008", exact_only=True)["Title"],
+                         "WALL\u00b7E")
+        self.assertEqual(identify.best_search_result(HOME_ALONE, "Home Alone", exact_only=True)["Year"], "1990")
 
     def test_update_job_uses_the_best_match(self):
         job = _job()
@@ -194,36 +208,55 @@ class TestIdentifyFromBarcode(unittest.TestCase):
 
     def test_video_title_found_from_upc(self):
         candidates = [{"title": "Inception", "year": "2010", "raw": "Inception (Blu-ray + DVD, 2010)"}]
+        inception = [_result("Inception: The Cobol Job", "2010", 300), _result("Inception", "2010", 36000)]
+        asked = []
 
-        def fake_search(job, response, title, year=None):
-            if response is None and title == "Inception":
-                job.title, job.year, job.hasnicetitle = "Inception", "2010", True
-                return {"Search": [{"Title": "Inception"}]}
-            return response
+        def fake_search(title, year=None):
+            asked.append((title, year))
+            return {"Search": inception} if title == "Inception" else None
 
         job = _job()
         with mock.patch.object(identify.disc_photo, "lookup_upc", return_value=candidates) as lookup, \
-                mock.patch.object(identify, "try_with_year", side_effect=fake_search), \
-                mock.patch.object(identify, "try_without_year", side_effect=lambda j, r, t: r):
+                mock.patch.object(identify, "_provider_search", side_effect=fake_search):
             self.assertTrue(identify.identify_from_barcode(job))
         lookup.assert_called_once_with("085391163926", user_agent="arm/test")
-        self.assertEqual(job.title, "Inception")
+        self.assertEqual(asked, [("Inception", "2010")])
+        self.assertEqual((job.title, job.year, job.imdb_id, job.hasnicetitle),
+                         ("Inception", "2010", inception[1]["imdbID"], True))
         self.assertEqual(job.disc_barcode_title, "Inception (Blu-ray + DVD, 2010)")
+
+    def test_video_near_miss_is_not_taken_for_the_film(self):
+        """TMDB has nothing titled WALL-E for "WALL-E": the barcode must not file the disc as East of Wall."""
+        candidates = [{"title": "WALL-E", "year": None, "raw": "WALL-E (DVD) Disney Adventure  Animated"}]
+        job = _job(disc_barcode="786936734911", label="WALL_E")
+        with mock.patch.object(identify.disc_photo, "lookup_upc", return_value=candidates), \
+                mock.patch.object(identify, "_provider_search", return_value={"Search": WALL_E_HYPHEN}) as search:
+            self.assertFalse(identify.identify_from_barcode(job))
+        search.assert_called_once_with("WALL-E", None)
+        self.assertEqual((job.title, job.year, job.hasnicetitle), ("not identified", "", False))
+        self.assertEqual(job.disc_barcode_title, "WALL-E (DVD) Disney Adventure  Animated")
 
     def test_video_no_online_match_keeps_product_title(self):
         candidates = [{"title": "Obscure Film", "year": None, "raw": "Obscure Film (DVD)"}]
         job = _job()
         with mock.patch.object(identify.disc_photo, "lookup_upc", return_value=candidates), \
-                mock.patch.object(identify, "try_with_year", return_value=None), \
-                mock.patch.object(identify, "try_without_year", return_value=None):
+                mock.patch.object(identify, "_provider_search", return_value=None):
             self.assertFalse(identify.identify_from_barcode(job))
         self.assertEqual(job.disc_barcode_title, "Obscure Film (DVD)")
+        self.assertEqual(job.title, "not identified")
+
+    def test_video_lookup_failure_is_a_miss(self):
+        candidates = [{"title": "Inception", "year": "2010", "raw": "Inception (DVD)"}]
+        job = _job()
+        with mock.patch.object(identify.disc_photo, "lookup_upc", return_value=candidates), \
+                mock.patch.object(identify, "_provider_search", side_effect=RuntimeError("tmdb down")):
+            self.assertFalse(identify.identify_from_barcode(job))
         self.assertEqual(job.title, "not identified")
 
     def test_video_lookup_empty(self):
         job = _job()
         with mock.patch.object(identify.disc_photo, "lookup_upc", return_value=[]), \
-                mock.patch.object(identify, "try_with_year") as search:
+                mock.patch.object(identify, "_provider_search") as search:
             self.assertFalse(identify.identify_from_barcode(job))
         search.assert_not_called()
 
@@ -333,10 +366,13 @@ class TestIdentifyCollection(unittest.TestCase):
         candidates = [{"title": "Stuart Little Stuart Little 2", "year": None,
                        "raw": "Stuart Little / Stuart Little 2 (DVD)"}]
         job = _job(disc_barcode="043396430099")
+        asked = []
         with mock.patch.object(identify.disc_photo, "lookup_upc", return_value=candidates), \
-                mock.patch.object(identify, "try_with_year") as single:
+                mock.patch.object(identify, "_provider_search",
+                                  side_effect=lambda title, year=None: asked.append(title)
+                                  or {"Search": STUART_LITTLE.get(title, [])}):
             self.assertTrue(identify.identify_from_barcode(job))
-        single.assert_not_called()
+        self.assertEqual(asked, ["Stuart Little", "Stuart Little 2"])
         self.assertEqual((job.title, job.year), ("Stuart-Little", "1999"))
         self.assertEqual(job.disc_barcode_title, "Stuart Little / Stuart Little 2 (DVD)")
 
@@ -344,11 +380,12 @@ class TestIdentifyCollection(unittest.TestCase):
         candidates = [{"title": "Obscure Film Obscure Film 2", "year": None,
                        "raw": "Obscure Film / Obscure Film 2 (DVD)"}]
         job = _job()
+        asked = []
         with mock.patch.object(identify.disc_photo, "lookup_upc", return_value=candidates), \
-                mock.patch.object(identify, "try_with_year", return_value=None) as single, \
-                mock.patch.object(identify, "try_without_year", return_value=None):
+                mock.patch.object(identify, "_provider_search",
+                                  side_effect=lambda title, year=None: asked.append(title) or None):
             self.assertFalse(identify.identify_from_barcode(job))
-        single.assert_called_once()
+        self.assertEqual(asked, ["Obscure", "Obscure 2", "Obscure Film Obscure Film 2"])
         self.assertEqual(self.stored, [])
 
     def test_label_naming_two_films(self):

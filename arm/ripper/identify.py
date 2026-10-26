@@ -356,7 +356,7 @@ def _normalise_title(text) -> str:
     return re.sub(r"[^a-z0-9]", "", str(text or "").lower())
 
 
-def best_search_result(results, title=None, year=None):
+def best_search_result(results, title=None, year=None, exact_only=False):
     """
     Pick the result a title search most likely meant.
 
@@ -365,23 +365,27 @@ def best_search_result(results, title=None, year=None):
     query is a real title (a case barcode's product title, a disc label), a result whose title
     is exactly the query beats everything else; among several exact matches (remakes, shorts
     with the same name) the one with the most votes wins, after the year when one was asked
-    for. With no exact match the provider's first result stands, as before.
+    for. With no exact match the provider's first result stands, as before, unless
+    ``exact_only`` is set: a provider can return a page of results none of which is the film
+    (TMDB has nothing titled WALL·E for the query "WALL-E", only "East of Wall"), and a caller
+    that knows the query is the real title would rather have no answer than that one.
 
     :param results: the ``Search`` list in OMDB style (``Title``, ``Year``), TMDB results keep
                     their ``vote_count``
+    :param exact_only: return None instead of the provider's first result when no title matches
     :return: one entry of ``results``
     """
     if not results:
         return None
     wanted = _normalise_title(title)
     if not wanted:
-        return results[0]
+        return None if exact_only else results[0]
     exact = [r for r in results if _normalise_title(r.get("Title") or r.get("title")) == wanted]
     if year:
         same_year = [r for r in exact if str(r.get("Year") or "")[:4] == str(year)[:4]]
         exact = same_year or exact
     if not exact:
-        return results[0]
+        return None if exact_only else results[0]
 
     def rank(result):
         try:
@@ -408,6 +412,16 @@ def update_job(job, search_results, title=None, year=None):
     if best is not search_results['Search'][0]:
         logging.info(f"Search for '{title}' returned '{search_results['Search'][0]['Title']}' first; "
                      f"taking the exact match '{best['Title']}' ({best['Year']})")
+    return apply_search_result(job, best)
+
+
+def apply_search_result(job, best):
+    """
+    Make one search result the job's title, year, type, IMDb id and poster.
+
+    :param best: a search result in OMDB style (``Title``, ``Year``, ``Type``, ``imdbID``, ``Poster``)
+    :return: what ``utils.database_updater`` returns
+    """
     new_year = best['Year']
     title = utils.clean_for_filename(best['Title'])
     logging.debug(f"Webservice successful.  New title is {title}.  New Year is: {new_year}")
@@ -674,8 +688,10 @@ def _provider_search(title, year=None):
 
 def search_film(title, year=None):
     """
-    The provider's best match for one film title (see best_search_result): with the year, with
-    the year before it (a disc often comes out the year after the film), then without a year.
+    The provider's result whose title is this film title (see best_search_result): with the
+    year, with the year before it (a disc often comes out the year after the film), then without
+    a year. ``title`` is taken to be the film's real title (a case barcode's product title, one
+    film of a double feature), so a page of results that merely resemble it is no match.
 
     :return: one search result in OMDB style (``Title``, ``Year``, ``imdbID``, ...) or None
     """
@@ -688,7 +704,7 @@ def search_film(title, year=None):
             logging.debug(f"Metadata lookup for '{title}' ({attempt}) failed: {error}")
             response = None
         if response and response.get('Search'):
-            best = best_search_result(response['Search'], title, attempt)
+            best = best_search_result(response['Search'], title, attempt, exact_only=True)
             if best:
                 return best
     return None
@@ -803,8 +819,10 @@ def identify_from_barcode(job):
     Runs when BARCODE_LOOKUP is enabled, the job has a barcode and the disc is not yet
     identified (``hasnicetitle`` is False): first thing for video discs, since the barcode
     names the exact release, and as the fallback for music discs. Video discs go through
-    upcitemdb and then the normal metadata search; music discs ask MusicBrainz for a release
-    with that barcode.
+    upcitemdb and then the metadata search, which must find the product title itself (see
+    search_film): the barcode outranks the disc's own CRC64 record and label, so a guess here
+    would override a right answer there. Music discs ask MusicBrainz for a release with that
+    barcode.
     The looked-up product title is kept on the job so the title fix pages can offer it even
     when no online match is found.
 
@@ -836,16 +854,13 @@ def _identify_video_from_barcode(job):
             return True
         logging.info("Could not identify every film the product title names; searching it as one title")
     for candidate in candidates[:3]:
-        try:
-            response = try_with_year(job, None, candidate['title'], candidate['year'])
-            response = try_without_year(job, response, candidate['title'])
-        except Exception as error:
-            logging.debug(f"Metadata lookup for barcode candidate '{candidate['title']}' failed: {error}")
-            response = None
-        if response and 'Search' in response:
+        best = search_film(candidate['title'], candidate['year'])
+        if best:
+            apply_search_result(job, best)
             logging.info(f"Identified disc from barcode as '{job.title}' ({job.year}) via '{candidate['title']}'")
             return True
-    logging.info("Barcode product title did not match any title online")
+    logging.info("No title online is exactly the barcode's product title; "
+                 "leaving the disc to its CRC64 record and label")
     return False
 
 
