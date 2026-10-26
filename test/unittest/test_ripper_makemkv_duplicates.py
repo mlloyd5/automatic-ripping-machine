@@ -261,6 +261,17 @@ class TestMakemkvMkvRouting(unittest.TestCase):
         commands = [call.args[0] for call in self.run_mock.call_args_list]
         self.assertEqual([cmd[cmd.index("dev:/dev/sr0") + 1] for cmd in commands], ["0", "2"])
 
+    def test_track_flags_are_committed_before_ripping(self):
+        # Left uncommitted, the flags were autoflushed and held SQLite's write lock for the whole
+        # rip (RED 2 on the t620), so the other drives' jobs failed with "database is locked".
+        job = _job([self.main, self.extra])
+        order = mock.Mock()
+        order.attach_mock(self.mocks[4], "commit")
+        order.attach_mock(self.run_mock, "run")
+        with mock.patch("builtins.open", mock.mock_open()):
+            makemkv.process_single_tracks(job, "/raw", "auto")
+        self.assertEqual([call[0] for call in order.mock_calls], ["commit", "run", "run"])
+
 
 if __name__ == '__main__':
     unittest.main()
