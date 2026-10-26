@@ -35,7 +35,7 @@ os.environ["ARM_CONFIG_FILE"] = _CONFIG_PATH
 
 try:
     import arm.config.config as cfg
-    from arm.ui import app, db
+    from arm.ui import app
     import arm.ui.routes  # noqa: F401  (creates the database like runui.py does)
     from arm.ui import json_api
     from arm.models.job import Job
@@ -69,21 +69,25 @@ class TestMakeMkvProgress(unittest.TestCase):
             importlib.reload(cfg)
         self.ctx = app.app_context()
         self.ctx.push()
+        # A detached Job row (never added to the session): the progress code only reads it and
+        # commits nothing of its own, and the SQLAlchemy engine is bound to whichever test module
+        # imported ARM first, whose database may be gone by now
         job = Job.__mapper__.class_manager.new_instance()
-        for key, value in dict(devpath="/dev/sr1", status="ripping", disctype="dvd", title="Jaws", year="1975",
-                               label="JAWS", start_time=datetime(2026, 10, 25, 23, 0), no_of_titles=2,
+        for key, value in dict(job_id=9901, devpath="/dev/sr1", status="ripping", disctype="dvd", title="Jaws",
+                               year="1975", label="JAWS", start_time=datetime(2026, 10, 25, 23, 0), no_of_titles=2,
                                hasnicetitle=True, ejected=False, updated=False, video_type="movie").items():
             setattr(job, key, value)
-        db.session.add(job)
-        db.session.commit()
         self.job = job
         self.progress_dir = os.path.join(cfg.arm_config["LOGPATH"], "progress")
         with open(os.path.join(self.progress_dir, f"{job.job_id}.log"), "w") as handle:
             handle.write(PROGRESS)
 
     def tearDown(self):
-        db.session.delete(self.job)
-        db.session.commit()
+        for suffix in (".log", ".log.batchinfo"):
+            try:
+                os.remove(os.path.join(self.progress_dir, f"{self.job.job_id}{suffix}"))
+            except FileNotFoundError:
+                pass
         self.ctx.pop()
 
     def test_batch_info_is_created_on_the_first_poll_and_the_eta_follows(self):

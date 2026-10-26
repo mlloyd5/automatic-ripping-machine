@@ -57,6 +57,69 @@ def _fake_updater(args, job):
 
 
 @unittest.skipIf(IMPORT_ERROR is not None, f"ARM could not be imported here: {IMPORT_ERROR}")
+class TestBarcodeComesFirst(unittest.TestCase):
+    """identify() asks the case barcode before the CRC database and the label search."""
+
+    def setUp(self):
+        os.environ["ARM_CONFIG_FILE"] = _CONFIG
+        if cfg.arm_config_path != _CONFIG:
+            importlib.reload(cfg)
+        cfg.arm_config["GET_VIDEO_TITLE"] = True
+        self.calls = []
+        self.patches = [
+            mock.patch.object(identify, "check_mount", return_value=True),
+            mock.patch.object(identify, "unmount_disc"),
+            mock.patch.object(identify, "get_video_details"),
+            mock.patch.object(identify.utils, "find_file", return_value=False),
+            mock.patch.object(identify.db.session, "commit"),
+            mock.patch.object(identify, "identify_bluray",
+                              side_effect=lambda job: self.calls.append("bluray") or True),
+            mock.patch.object(identify, "identify_dvd", side_effect=self._dvd),
+        ]
+        for patch in self.patches:
+            patch.start()
+
+    def tearDown(self):
+        for patch in self.patches:
+            patch.stop()
+
+    def _dvd(self, job, title_known=False):
+        self.calls.append(("dvd", title_known))
+        return True
+
+    def _video_job(self, disctype):
+        job = _job(disctype=disctype, devpath="/dev/sr1", mountpoint="/mnt/dev/sr1", video_type="movie")
+        job.get_disc_type = lambda found: None
+        job.pretty_table = lambda: ""
+        return job
+
+    def test_dvd_barcode_hit_skips_the_label_search(self):
+        with mock.patch.object(identify, "identify_from_barcode",
+                               side_effect=lambda job: self.calls.append("barcode") or True):
+            identify.identify(self._video_job("dvd"))
+        self.assertEqual(self.calls, ["barcode", ("dvd", True)])
+
+    def test_dvd_barcode_miss_falls_back_to_the_disc(self):
+        with mock.patch.object(identify, "identify_from_barcode",
+                               side_effect=lambda job: self.calls.append("barcode") or False):
+            identify.identify(self._video_job("dvd"))
+        self.assertEqual(self.calls, ["barcode", ("dvd", False)])
+
+    def test_bluray_is_only_read_when_the_barcode_missed(self):
+        with mock.patch.object(identify, "identify_from_barcode", return_value=True):
+            identify.identify(self._video_job("bluray"))
+        self.assertEqual(self.calls, [])
+        with mock.patch.object(identify, "identify_from_barcode", return_value=False):
+            identify.identify(self._video_job("bluray"))
+        self.assertEqual(self.calls, ["bluray"])
+
+    def test_barcode_failure_never_stops_identification(self):
+        with mock.patch.object(identify, "identify_from_barcode", side_effect=RuntimeError("upcitemdb down")):
+            identify.identify(self._video_job("dvd"))
+        self.assertEqual(self.calls, [("dvd", False)])
+
+
+@unittest.skipIf(IMPORT_ERROR is not None, f"ARM could not be imported here: {IMPORT_ERROR}")
 class TestIdentifyFromBarcode(unittest.TestCase):
     def setUp(self):
         # another test module may have imported ARM with its own throwaway config: switch to ours

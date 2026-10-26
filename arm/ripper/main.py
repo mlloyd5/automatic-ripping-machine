@@ -125,19 +125,13 @@ def print_sleeve_label(job):
 def main():
     """main disc processing function"""
     logging.info("Starting Disc identification")
-    identify.identify(job)
-    # Fall back to the barcode scanned from the case (video discs only here: music discs get the
-    # precise MusicBrainz disc-id lookup first, below, and its barcode search is rate limited),
-    # then to reading the disc label from the camera photo; never let either stop the rip
+    identify.identify(job)  # video discs: the case barcode first, then the disc itself
+    # Fall back to reading the disc label from the camera photo; never let it stop the rip
     if job.disctype in ("dvd", "bluray"):
         try:
-            identify.identify_from_barcode(job)
+            identify.identify_from_photo(job)
         except Exception as error:
-            logging.error(f"Barcode lookup failed: {error}", exc_info=True)
-    try:
-        identify.identify_from_photo(job)
-    except Exception as error:
-        logging.error(f"Disc photo OCR failed: {error}", exc_info=True)
+            logging.error(f"Disc photo OCR failed: {error}", exc_info=True)
 
     # Check db for entries matching the crc and successful
     have_dupes = utils.job_dupe_check(job)
