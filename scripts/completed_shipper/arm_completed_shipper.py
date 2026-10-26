@@ -687,6 +687,21 @@ def finish_record(pending_path):
     return final
 
 
+def source_folder_present(cfg, source):
+    """
+    Whether the job folder ``source`` (``<sub folder>/<folder>``, see :func:`library_path`) is still in completed_path.
+
+    True when it is, False when it has gone, and None when its category folder
+    (``movies``, ``tv``, ``unidentified``) is itself missing: then completed_path
+    is probably not mounted, which says nothing about the job folder, and
+    nothing that treats "gone" as "shipped" may act on it.
+    """
+    category = source.split("/", 1)[0]
+    if not os.path.isdir(os.path.join(cfg["completed_path"], category)):
+        return None
+    return os.path.isdir(os.path.join(cfg["completed_path"], source))
+
+
 def settle_pending_records(cfg, dry_run=False):
     """
     Finish ``.pending`` records whose job folder is no longer in completed_path.
@@ -696,14 +711,21 @@ def settle_pending_records(cfg, dry_run=False):
     cannot list the media box to tell the two apart, so it assumes the folder
     shipped: the record becomes ``.toml`` (and ships with the others), with a
     warning naming it.  A pending record whose folder is still there is left
-    for :func:`ship_folder` to reuse.
+    for :func:`ship_folder` to reuse, and so is every pending record while the
+    folder's category directory is missing (completed_path not mounted), since
+    then nothing can be said about the folder.
     """
     for pending in _spooled(cfg, PENDING_SUFFIX):
         library = read_record_key(pending, "library")
         if not library:
             log.warning("catalog record %s names no library folder; leaving it in the spool", pending)
             continue
-        if os.path.isdir(os.path.join(cfg["completed_path"], library)):
+        present = source_folder_present(cfg, library)
+        if present:
+            continue
+        if present is None:
+            log.warning("%s has no %s folder (not mounted?); leaving catalog record %s in the spool",
+                        cfg["completed_path"], library.split("/", 1)[0], os.path.basename(pending))
             continue
         if dry_run:
             log.info("dry run: would finish catalog record %s (%s is gone)", pending, library)

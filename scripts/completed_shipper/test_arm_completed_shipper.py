@@ -801,6 +801,21 @@ class CatalogRecords(ShipperFixture):
         top, _ = self._record_files("20200101-000000-ts140-job77.toml")
         self.assertNotEqual(top["shipped"], "2020-01-01T00:00:00")
 
+    def test_pending_record_is_kept_while_completed_path_is_not_mounted(self):
+        # A missing movies/ directory means the completed volume is absent, not that the folder shipped.
+        os.makedirs(self.spool)
+        with open(os.path.join(self.spool, "20200101-000000-ts140-job77.pending"), "w") as handle:
+            handle.write('ripper = "ts140"\njob = 77\nshipped = "2020-01-01T00:00:00"\n'
+                         'library = "movies/Gone (1999)"\n\n[[files]]\npath = "movies/Gone (1999)/Gone (1999).mkv"\n')
+        shutil.rmtree(os.path.join(self.completed, "movies"))
+        cfg = self._cfg()
+        stats = {"shipped": 0, "failed": 0, "records": 0}
+        with self.assertLogs("arm-completed-shipper", "WARNING") as logs:
+            self.assertTrue(shipper.ship_pending_records(cfg, False, stats))
+        self.assertIn("not mounted", "\n".join(logs.output))
+        self.assertEqual(self._spooled(), ["20200101-000000-ts140-job77.pending"])
+        self.assertEqual(self._records(), [])
+
     def test_pending_record_lookup_and_key_reader(self):
         cfg = self._cfg()
         job = {"job_id": 1, "stop_time": "2026-10-25 14:03:11"}

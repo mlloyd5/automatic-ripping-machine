@@ -235,9 +235,12 @@ A `.pending` record whose job folder is no longer in `completed_path` (the run
 was killed between the folder shipping and the rename, or the folder was
 removed by hand) is finished and shipped at the start of the next run, with a
 warning naming it: the shipper cannot list the media box to tell the two cases
-apart, so it assumes the folder shipped.  A pending record is matched to its
-folder by job id and its `library` key, so a job id reused after an ARM
-database reset never picks up another rip's record.
+apart, so it assumes the folder shipped.  It only draws that conclusion while
+the folder's category directory (`movies/`, `tv/`) exists: when that is missing
+too, `completed_path` is most likely not mounted, and every pending record is
+left alone with a warning.  A pending record is matched to its folder by job id
+and its `library` key, so a job id reused after an ARM database reset never
+picks up another rip's record.
 
 The record is optional metadata and never stops a folder from shipping: a file
 whose Matroska header is corrupt is listed by size alone (with a warning), a
