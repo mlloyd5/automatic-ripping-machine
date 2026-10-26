@@ -96,6 +96,8 @@
                                             Search</a>
                                         <a href="customTitle?job_id={{ jobs.job_id }}" class="btn btn-primary">Custom
                                             Title</a>
+                                        <a href="bonusdisc?job_id={{ jobs.job_id }}" class="btn btn-primary">Bonus
+                                            Disc</a>
                                         <a id="plot" class="btn btn-primary">Plot</a>
                                     </div>
                                 {% endif %}
@@ -115,6 +117,8 @@
                                             Search</a>
                                         <a href="customTitle?job_id={{ jobs.job_id }}" class="btn btn-primary">Custom
                                             Title</a>
+                                        <a href="bonusdisc?job_id={{ jobs.job_id }}" class="btn btn-primary">Bonus
+                                            Disc</a>
                                         <a id="plot" class="btn btn-primary">Plot</a>
                                     </div>
                                 {% endif %}
@@ -378,6 +382,18 @@
                                     <td style="text-align:left"><strong>path</strong></td>
                                     <td style="text-align:left">{{ jobs.path }}</td>
                                 </tr>
+                                {% if jobs.bonus_of_job_id %}
+                                <tr>
+                                    <td style="text-align:left"><strong>bonus_of</strong></td>
+                                    <td style="text-align:left">
+                                        Bonus disc of
+                                        {% if jobs.bonus_of_film %}{{ jobs.bonus_of_film.title }}{{ ' (' ~ jobs.bonus_of_film.year ~ ')' if jobs.bonus_of_film.year else '' }},{% endif %}
+                                        <a href="jobdetail?job_id={{ jobs.bonus_of_job_id }}">job {{ jobs.bonus_of_job_id }}</a>
+                                        {% if jobs.bonus_of %}({{ jobs.bonus_of.title }}, disc {{ jobs.bonus_of.label }}){% endif %}:
+                                        its titles are filed as extras
+                                    </td>
+                                </tr>
+                                {% endif %}
                                 <tr>
                                     <td style="text-align:left"><strong>Config ID</strong></td>
                                     <td style="text-align:left"> {{ jobs.config.CONFIG_ID }}</td>

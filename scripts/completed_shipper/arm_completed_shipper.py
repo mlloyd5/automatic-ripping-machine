@@ -43,6 +43,13 @@ Safety rules:
   shipped, so a run that is interrupted part-way finishes in the same folder
   instead of probing again with only the files still left.
 * A lock file stops two runs overlapping.
+* A bonus disc's extras (the fork marks a disc as the bonus disc of an earlier
+  job) go into the film's folder on the media box, never beside it.  ARM files
+  them into the film's local folder while that is still here, and the folder
+  ships as the film's.  Once the film's folder has shipped, ARM files them in
+  ``<film folder> - bonus job<id>`` instead, and that folder ships into
+  ``<film folder>`` on the media box under the same overwrite rule: files are
+  only added, and if one would replace a file there the folder stays.
 * Only the standard library plus ``rsync`` are needed.
 
 The shipper may run outside ARM's container (e.g. on the Docker or Proxmox
@@ -109,6 +116,10 @@ PROBE_CHECKSUM_RATE = 50 * 1024 * 1024
 """Bytes per second either end is assumed to checksum at least; sizes a collision probe's ``--timeout`` (see
 :func:`probe_timeout`)."""
 
+BONUS_COLUMNS = ("bonus_of_job_id",)
+"""The fork's bonus disc column, read when present: the job whose film a disc's titles are extras of."""
+BONUS_FOLDER = re.compile(r"^(?P<target>.+) - bonus job(?P<job_id>\d+)$")
+"""ARM's folder for a bonus disc whose film folder had already shipped: ``<film folder> - bonus job<id>``."""
 JOB_COLUMNS = ("job_id", "status", "path", "title", "title_manual", "year", "year_manual", "video_type",
                "imdb_id", "label", "disctype", "disc_barcode", "disc_barcode_title", "sleeve_id", "box",
                "stop_time")
@@ -206,7 +217,7 @@ def read_jobs(db_path):
     conn = sqlite3.connect(uri, uri=True, timeout=30)
     try:
         present = {row[1] for row in conn.execute("PRAGMA table_info(job)")}
-        columns = [column for column in JOB_COLUMNS if column in present]
+        columns = [column for column in JOB_COLUMNS + BONUS_COLUMNS if column in present]
         if "path" not in columns or "status" not in columns:
             raise ShipperError(f"{db_path} has no job table with path and status columns")
         rows = conn.execute(f"SELECT {', '.join(columns)} FROM job WHERE path IS NOT NULL AND path != ''").fetchall()
@@ -254,7 +265,10 @@ def finished_jobs(db_path, completed_path, arm_completed_path=None):
             log.debug("skipping %s: another job on that path is still %s", path, sorted(seen))
             continue
         successes = [job for job in jobs if job["status"] == SUCCESS_STATUS]
-        shippable[path] = max(successes, key=lambda job: job.get("job_id") or 0)
+        # A bonus disc's job never stands for a folder it shares with its film's job: ARM filed the
+        # bonus disc's extras into the film's folder, which is still the film's rip
+        own = [job for job in successes if not job.get("bonus_of_job_id")]
+        shippable[path] = max(own or successes, key=lambda job: job.get("job_id") or 0)
     return shippable
 
 
@@ -431,6 +445,22 @@ def colliding_files(cfg, sub_folder, local_folder, remote_name):
     return sorted(would_send - new_only)
 
 
+def bonus_remote_name(local_folder, job):
+    """
+    The film folder on the media box that a bonus disc's own folder ships into, or None for any other folder.
+
+    ARM names it ``<film folder> - bonus job<id>`` (:data:`BONUS_FOLDER`) when
+    the film's folder had shipped before the bonus disc finished.  Only a folder
+    whose row is that job, marked as a bonus disc, counts.
+    """
+    if not job or not job.get("bonus_of_job_id"):
+        return None
+    match = BONUS_FOLDER.match(os.path.basename(local_folder.rstrip(os.sep)))
+    if match is None or int(match.group("job_id")) != job.get("job_id"):
+        return None
+    return match.group("target")
+
+
 def remote_folder_names(local_folder, job, sub_folder=None):
     """
     Destination folder names to try for one job folder, in order.
@@ -444,7 +474,14 @@ def remote_folder_names(local_folder, job, sub_folder=None):
     The label is skipped for an unidentified folder, which ARM names after the
     label itself (``DVD_VIDEO - DVD_VIDEO`` says nothing), and whenever it
     matches the folder name; those go straight to the job id.
+
+    A bonus disc's own folder (:func:`bonus_remote_name`) has the film's folder
+    as its only name: its extras belong in there, so when they would replace a
+    file there the folder stays rather than landing beside it.
     """
+    target = bonus_remote_name(local_folder, job)
+    if target:
+        return [target]
     folder = os.path.basename(local_folder.rstrip(os.sep))
     names = [folder]
     label = _clean(job.get("label")) if job and sub_folder != UNIDENTIFIED else None
@@ -617,7 +654,7 @@ def resolve_remote_name(cfg, sub_folder, local_folder, job, dry_run=False, stats
     if remote_name is None or dry_run or job is None:
         return remote_name
     if not save_destination_state(cfg, job, source, remote_name):
-        if remote_name != os.path.basename(local_folder.rstrip(os.sep)):
+        if remote_name != (bonus_remote_name(local_folder, job) or os.path.basename(local_folder.rstrip(os.sep))):
             log.error("not shipping %s as %s without a record of that name; leaving it for the next run",
                       local_folder, remote_name)
             return None
@@ -677,9 +714,12 @@ def ship_folder(cfg, sub_folder, local_folder, dry_run=False, verbose=False, job
     remote_name = resolve_remote_name(cfg, sub_folder, local_folder, job, dry_run, stats)
     if remote_name is None:
         return False
-    renamed = remote_name != os.path.basename(local_folder.rstrip(os.sep))
+    target = bonus_remote_name(local_folder, job)
+    renamed = remote_name != (target or os.path.basename(local_folder.rstrip(os.sep)))
     if renamed:
         log.warning("shipping %s as %s instead", local_folder, remote_name)
+    elif target:
+        log.info("%s holds a bonus disc's extras; adding them to %s", local_folder, remote_name)
     pending = None
     if job is not None and cfg["remote_catalog_path"] and sub_folder != UNIDENTIFIED:
         pending = prepare_record_safely(cfg, sub_folder, local_folder, job, remote_name, dry_run, stats)
@@ -879,6 +919,7 @@ def catalog_record(cfg, sub_folder, local_folder, job, remote_name=None):
         ("label", _clean(job.get("label")) or ""),
         ("format", disc_format(job, rows)),
         ("role", "feature" if sub_folder == "tv" or any(row["main"] for row in rows) else "bonus"),
+        ("bonus_of", int(job["bonus_of_job_id"]) if bonus_remote_name(local_folder, job) else None),
         ("sleeve", _clean(job.get("sleeve_id"))),
         ("box", _clean(job.get("box"))),
         ("barcode", _clean(job.get("disc_barcode"))),

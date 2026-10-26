@@ -12,6 +12,7 @@ from pathlib import Path
 if find_spec("arm") is None:
     sys.path.append(str(Path(__file__).parents[2]))
 
+import arm.config.config as cfg  # noqa E402
 from arm.ripper import utils, makemkv, handbrake, ffmpeg  # noqa E402
 from arm.ui import app, db, constants  # noqa E402
 from arm.models.job import JobState  # noqa E402
@@ -25,6 +26,11 @@ MAIN_FEATURE_MIN_FRACTION = 0.7
 RUNTIME_TOLERANCE_FRACTION = 0.06
 RUNTIME_TOLERANCE_MIN = 180
 
+# Minimum title length for a bonus disc when arm.yaml has no BONUS_MINLENGTH
+BONUS_MINLENGTH_DEFAULT = 45
+# Files of a bonus disc's rip that are filed as extras
+VIDEO_EXTENSIONS = (".mkv", ".mp4", ".m4v", ".avi", ".ts", ".webm")
+
 
 def rip_visual_media(have_dupes, job, logfile, protection):
     """
@@ -36,24 +42,38 @@ def rip_visual_media(have_dupes, job, logfile, protection):
     :param protection: Does the disc have 99 track protection
     :return: None
     """
+    # A bonus disc rips every short title and files them all as the film's extras
+    bonus = apply_bonus_settings(job)
     # Fix the sub-folder type - (movie|tv|unknown)
     type_sub_folder = utils.convert_job_type(job.video_type)
     # Fix the job title - Title (Year) | Title
     job_title = utils.fix_job_title(job)
 
-    # We need to check/construct the final path, and the transcode path
-    transcode_out_path = os.path.join(job.config.TRANSCODE_PATH, type_sub_folder, job_title)
-    final_directory = os.path.join(job.config.COMPLETED_PATH, type_sub_folder, job_title)
+    if bonus:
+        # Not completed/<type>/<Title (Year)>: that is the film's folder, which may have shipped already,
+        # and an empty transcode folder of that name would stop the next rip of the title as a duplicate
+        transcode_out_path = os.path.join(job.config.TRANSCODE_PATH, type_sub_folder,
+                                          f"{job_title} - bonus job{job.job_id}")
+        utils.make_dir(transcode_out_path)
+        final_directory = bonus_folder(job)
+        logging.info(f"Bonus disc: filing every title in {os.path.join(final_directory, utils.bonus_extras_sub(job))}")
+    else:
+        # We need to check/construct the final path, and the transcode path
+        transcode_out_path = os.path.join(job.config.TRANSCODE_PATH, type_sub_folder, job_title)
+        final_directory = os.path.join(job.config.COMPLETED_PATH, type_sub_folder, job_title)
 
-    # Check folders for already ripped jobs -> creates folder
-    transcode_out_path = utils.check_for_dupe_folder(have_dupes, transcode_out_path, job)
-    # If dupes rips is disabled this might kill the run
-    final_directory = utils.check_for_dupe_folder(have_dupes, final_directory, job)
+        # Check folders for already ripped jobs -> creates folder
+        transcode_out_path = utils.check_for_dupe_folder(have_dupes, transcode_out_path, job)
+        # If dupes rips is disabled this might kill the run
+        final_directory = utils.check_for_dupe_folder(have_dupes, final_directory, job)
+    transcode_folder = transcode_out_path
+    bonus_transcode_path = transcode_folder if bonus else None
 
     # Update the job.path with the final directory
     utils.database_updater({'path': final_directory}, job)
-    # Save poster image from disc if enabled
-    utils.save_disc_poster(final_directory, job)
+    # Save poster image from disc if enabled (a bonus disc's would replace the film's)
+    if not bonus:
+        utils.save_disc_poster(final_directory, job)
 
     logging.info(f"Processing files to: {transcode_out_path}")
     makemkv_out_path = None
@@ -86,9 +106,29 @@ def rip_visual_media(have_dupes, job, logfile, protection):
         utils.delete_raw_files([transcode_out_path])
         transcode_out_path = transcode_in_path
 
+    # Marked as a bonus disc in the ui since the wait: file it as one all the same
+    db.session.refresh(job)
+    if utils.is_bonus_disc(job):
+        if not bonus:
+            logging.info(f"Job was marked as the bonus disc of job {job.bonus_of_job_id} during the rip; "
+                         "filing its titles as extras")
+            remove_empty_dir(final_directory)
+            bonus_transcode_path = transcode_folder
+            bonus = True
+        # The film's folder may have shipped (or the choice changed) since the rip started
+        final_directory = bonus_folder(job)
+        utils.database_updater({'path': final_directory}, job)
+    elif bonus:
+        # Not in the film's folder, where the main feature would meet the film's own file
+        logging.warning("Job is no longer marked as a bonus disc; filing its titles the usual way")
+        bonus = False
+        final_directory = utils.check_for_dupe_folder(
+            False, os.path.join(job.config.COMPLETED_PATH, type_sub_folder, job_title), job)
+        utils.database_updater({'path': final_directory}, job)
+
     # Update final path if user has set a custom/manual title
     logging.debug(f"Job title status: [{job.title_manual}]")
-    if job.title_manual:
+    if job.title_manual and not bonus:
         # Remove the old final dir
         utils.delete_raw_files([final_directory])
         job_title = utils.fix_job_title(job)
@@ -98,17 +138,24 @@ def rip_visual_media(have_dupes, job, logfile, protection):
 
     # Move to final folder
     move_files_post(transcode_out_path, job)
-    # Keep the webcam photo of the disc and the barcode scanned from its case with the rip
-    utils.copy_disc_photo(final_directory, job)
-    utils.copy_disc_barcode(final_directory, job)
-    # Movie the movie poster if we have one - no longer needed, now handled by save_movie_poster
-    utils.move_movie_poster(final_directory, transcode_out_path)
+    if bonus:
+        # Beside the film's own disc.jpg; the case barcode and poster are the film's already
+        utils.copy_disc_photo(final_directory, job, bonus_photo_name(job))
+    else:
+        # Keep the webcam photo of the disc and the barcode scanned from its case with the rip
+        utils.copy_disc_photo(final_directory, job)
+        utils.copy_disc_barcode(final_directory, job)
+        # Movie the movie poster if we have one - no longer needed, now handled by save_movie_poster
+        utils.move_movie_poster(final_directory, transcode_out_path)
     # Scan Emby if arm.yaml requires it
     utils.scan_emby()
     # Set permissions if arm.yaml requires it
     utils.set_permissions(final_directory)
     # If set in the arm.yaml remove the raw files
     utils.delete_raw_files([transcode_in_path, transcode_out_path, makemkv_out_path])
+    if bonus_transcode_path:
+        # Kept by DELRAWFILES: false, but empty and named after no title, so of no use to anyone
+        remove_empty_dir(bonus_transcode_path)
     # report errors if any
     notify_exit(job)
     logging.info("************* ARM processing complete *************")
@@ -202,12 +249,15 @@ def move_files_post(transcode_out_path, job):
     Logic for moving files post transcoding\n
     if series move all to 1 folder\n
     if movie check what source we got them from, for MakeMKV use skip_transcode_movie to pick the main feature\n
+    if a bonus disc, everything is an extra of the film it belongs to (file_bonus)\n
     :param transcode_out_path: This should either be the RAW_PATH from MakeMKV, /dev/srX or TRANSCODE_PATH
     :param job: current job
     :return: None
     """
     tracks = job.tracks.filter_by(ripped=True)  # .order_by(job.tracks.length.desc())
-    if job.video_type == "series":
+    if utils.is_bonus_disc(job):
+        file_bonus(transcode_out_path, job, os.listdir(transcode_out_path))
+    elif job.video_type == "series":
         for track in tracks:
             utils.move_files(transcode_out_path, track.filename, job, False)
     elif file_collection(transcode_out_path, job, os.listdir(transcode_out_path)):
@@ -223,6 +273,105 @@ def move_files_post(transcode_out_path, job):
                     break
                 # If HandBrake was used we can pass track.main_feature
                 utils.move_files(transcode_out_path, track.filename, job, track.main_feature)
+
+
+def bonus_minlength():
+    """BONUS_MINLENGTH from arm.yaml in whole seconds, BONUS_MINLENGTH_DEFAULT when unset or not a number"""
+    value = cfg.arm_config.get("BONUS_MINLENGTH", BONUS_MINLENGTH_DEFAULT)
+    try:
+        return max(0, int(str(value).strip()))
+    except (TypeError, ValueError):
+        logging.warning(f"BONUS_MINLENGTH {value!r} is not a number of seconds; using {BONUS_MINLENGTH_DEFAULT}")
+        return BONUS_MINLENGTH_DEFAULT
+
+
+def apply_bonus_settings(job):
+    """
+    Settings for a disc marked in the ui as the bonus disc of an earlier job (utils.bonus_parent)\n
+    The job takes the film's title, year and metadata id, and its config (this job's only) rips every
+    title of at least BONUS_MINLENGTH seconds in one MakeMKV pass: no maximum length, no duplicate-title
+    skipping (which rips title by title, re-scanning the disc for every one) and no main feature\n
+    :param job: Current job
+    :return: True when the job is a bonus disc
+    """
+    parent, film = utils.bonus_parent(job)
+    if parent is None:
+        return False
+    source = film or parent
+    minlength = bonus_minlength()
+    name = film.folder_name if film is not None else utils.fix_job_title(parent)
+    logging.info(f"Bonus disc of job {parent.job_id} ({name}, disc {parent.label}): "
+                 f"ripping every title of at least {minlength}s and filing them all as extras")
+    utils.database_updater({'MINLENGTH': str(minlength), 'MAXLENGTH': "99999", 'SKIP_DUPLICATE_TITLES': False,
+                            'MAINFEATURE': False}, job.config)
+    utils.database_updater({'title': source.title, 'year': source.year, 'imdb_id': source.imdb_id,
+                            'poster_url': source.poster_url, 'video_type': "movie", 'hasnicetitle': True}, job)
+    return True
+
+
+def bonus_target_folder(job):
+    """
+    The folder of the film a bonus disc belongs to: the parent job's own folder (job.path), or, for a
+    later film of its double feature, the film's ``Title (Year)`` folder beside it (``_<stage>``
+    suffixed when file_film had to)\n
+    :param job: Current job (a bonus disc)
+    :return: path
+    """
+    parent, film = utils.bonus_parent(job)
+    type_sub_folder = utils.convert_job_type("movie")
+    if film is not None and int(film.position or 1) > 1:
+        plain = os.path.join(job.config.COMPLETED_PATH, type_sub_folder, film.folder_name)
+        suffixed = f"{plain}_{parent.stage}"
+        return suffixed if os.path.isdir(suffixed) else plain
+    if parent.path:
+        return parent.path
+    return os.path.join(job.config.COMPLETED_PATH, type_sub_folder, utils.fix_job_title(parent))
+
+
+def bonus_folder(job):
+    """
+    Where a bonus disc's extras are filed: the film's folder (bonus_target_folder) while it is still in
+    the completed path, else ``<film folder> - bonus job<id>`` beside where it was. The completed-rip
+    shipper moves finished folders to the media box and removes them; a holding folder of that name
+    ships into the film's folder there, where a recreated film folder would pass for the film's own rip\n
+    :param job: Current job (a bonus disc)
+    :return: path
+    """
+    target = bonus_target_folder(job)
+    if os.path.isdir(target):
+        return target
+    return f"{target.rstrip(os.sep)} - bonus job{job.job_id}"
+
+
+def bonus_photo_name(job):
+    """``disc-bonus-<disc label>.jpg``: a bonus disc's photo, kept beside the film's own disc.jpg"""
+    return f"disc-bonus-{utils.bonus_tag(job)}.jpg"
+
+
+def file_bonus(out_path, job, files):
+    """
+    File a bonus disc's rip: every video file is an extra of the film's folder (job.path), named
+    ``<disc label>_<file>`` by utils.move_files, never ``<Title (Year)>.mkv``\n
+    :param out_path: RAW_PATH or TRANSCODE_PATH holding the ripped files
+    :param job: Current job (a bonus disc)
+    :param files: os.listdir(out_path)
+    :return: number of files filed
+    """
+    videos = sorted(name for name in files if name.lower().endswith(VIDEO_EXTENSIONS)
+                    and not name.startswith(".") and os.path.isfile(os.path.join(out_path, name)))
+    logging.info(f"Bonus disc: filing {len(videos)} title(s) as extras in {job.path}")
+    for name in videos:
+        utils.move_files(out_path, name, job, False)
+    return len(videos)
+
+
+def remove_empty_dir(path):
+    """Remove a folder this job made when nothing was put in it; anything else is left alone"""
+    try:
+        os.rmdir(path)
+        logging.info(f"Removed empty folder {path}")
+    except OSError:
+        pass
 
 
 def collection_films(job):

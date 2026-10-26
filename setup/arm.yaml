@@ -65,6 +65,12 @@ MINLENGTH: "600"
 # Use "99999" to indicate no maximum length
 MAXLENGTH: "99999"
 
+# Minimum length of track for a bonus disc (in seconds)
+# A disc marked in the ui as the bonus disc of an earlier job ("Bonus Disc" on the job) is ripped with this
+# minimum instead of MINLENGTH, in one pass over every title, and every title is filed in that film's
+# EXTRAS_SUB folder: featurettes are often a few minutes long
+BONUS_MINLENGTH: "45"
+
 # Wait for manual identification
 MANUAL_WAIT: true
 

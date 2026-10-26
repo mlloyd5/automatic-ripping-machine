@@ -107,6 +107,33 @@ rights on the media box: a key confined to receiving rsync transfers (see the
 Proxmox section) allows them.  `--dry-run` runs them too, so a smoke test
 shows the name each folder would get.
 
+### Bonus discs
+
+ARM can be told in its web UI that a disc is the bonus disc of a film it
+ripped earlier ("Bonus Disc" on the job, see the wiki's Bonus Discs page).
+Every title of such a disc is filed as an extra of that film, named
+`<disc label>_<title file>.mkv`, so it never has the film's own file name.
+The extras belong in the film's folder on the media box, never in a folder
+beside it:
+
+* When the film's folder is still on the ripper, ARM puts the extras into its
+  `extras/` folder.  The bonus disc's job then has the same `path` as the
+  film's, so the folder waits until the bonus disc has finished too, and ships
+  as the film's rip: the film's job row stands for it (destination name,
+  catalog record), not the bonus disc's.
+* When the film's folder has shipped already, ARM files the extras in
+  `<film folder> - bonus job<id>/extras/`.  That folder ships into
+  `<remote_movies_path>/<film folder>/`: rsync only adds the new files there.
+  The collision probe runs as for any folder, but there is no other name to
+  step aside to: when an extra would replace a file in the film's folder, the
+  folder stays on the ripper and the run exits 1.  Its catalog record is the
+  bonus disc's own (`role = "bonus"`, `bonus_of = <film's job id>`) and names
+  the film's folder as its `library`.
+* The film's folder is found by the name ARM gave it.  If the film itself
+  shipped under a suffix (`<Title (Year)> - <disc label>`, because the media
+  box already had that title), the extras go into the unsuffixed folder of the
+  same title, which Plex shows as the same movie.
+
 ## Requirements
 
 * Ripping box (wherever the shipper runs): Python 3.6+ (stdlib only),
@@ -270,6 +297,7 @@ source = "movies/Back to the Future (1985)"             # the ripper-side job fo
 label = "BACK_TO_THE_FUTURE"         # the disc's volume label
 format = "uhd"                       # uhd | bd | dvd
 role = "feature"                     # bonus when a movie disc has no main feature
+bonus_of = 40                        # a bonus disc's: the job of the film its extras joined
 sleeve = "TS-0007"                   # Sleeve Labels id, when the feature is on
 box = "Box 02"
 barcode = "025192412363"             # case barcode from the Barcode Scanner feature

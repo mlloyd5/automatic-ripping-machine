@@ -475,8 +475,8 @@ class CollisionProbe(unittest.TestCase):
                          ["X", "X - DVD_VIDEO", "X - job5"])
 
 
-class NoOverwrite(ShipperFixture):
-    """The media box already holds a file the transfer would replace: it is kept and the rip lands beside it."""
+class MediaBoxFixture(ShipperFixture):
+    """Catalog records on, Movie A's job filled in, and helpers for what the media box already holds."""
 
     def setUp(self):
         super().setUp()
@@ -501,6 +501,10 @@ class NoOverwrite(ShipperFixture):
 
     def _dest_folders(self, dest_sub):
         return sorted(os.listdir(os.path.join(self.dest, dest_sub)))
+
+
+class NoOverwrite(MediaBoxFixture):
+    """The media box already holds a file the transfer would replace: it is kept and the rip lands beside it."""
 
     def test_existing_feature_is_kept_and_the_rip_lands_beside_it(self):
         kept = self._plant("Movies", "Movie A (2001)", "Movie A (2001).mkv")
@@ -752,6 +756,112 @@ class NoOverwrite(ShipperFixture):
         self.assertIn("--timeout=30", shipper.build_rsync_command(cfg, "movies", folder))
         self.assertEqual(shipper.probe_timeout(cfg, os.path.join(self.tmp, "no-such-folder")), 30)
         self.assertEqual(shipper.probe_timeout(dict(cfg, rsync_timeout="0"), folder), 0)
+
+
+class BonusDisc(MediaBoxFixture):
+    """A bonus disc's extras join the film's folder on the media box, never a folder beside it."""
+
+    def setUp(self):
+        super().setUp()
+        conn = sqlite3.connect(self.db)
+        conn.execute("ALTER TABLE job ADD COLUMN bonus_of_job_id INTEGER")
+        conn.commit()
+        conn.close()
+
+    def _bonus(self, folder, files, status="success", label="MOVIE_A_BONUS"):
+        """
+        A bonus disc's job (of Movie A, job 1) filed in ``folder`` (``{job_id}`` is its job id), with ``files``.
+        Returns (job id, folder name).
+        """
+        conn = sqlite3.connect(self.db)
+        cursor = conn.execute("INSERT INTO job (status, video_type, title, year, label, disctype, stop_time, "
+                              "bonus_of_job_id) VALUES (?, 'movie', 'Movie A', '2001', ?, 'dvd', "
+                              "'2026-10-26 18:00:00', 1)", (status, label))
+        job_id = cursor.lastrowid
+        folder = folder.format(job_id=job_id)
+        conn.execute("UPDATE job SET path = ? WHERE job_id = ?", (self._local("movies", folder), job_id))
+        conn.commit()
+        conn.close()
+        if files:
+            self._folder("movies", folder, files)
+        return job_id, folder
+
+    def _film_shipped(self):
+        """Movie A's folder went to the media box before the bonus disc finished."""
+        self._plant("Movies", "Movie A (2001)", "Movie A (2001).mkv", content="content of Movie A (2001).mkv\n")
+        self._plant("Movies", "Movie A (2001)", "extras/trailer.mkv", content="content of extras/trailer.mkv\n")
+        shutil.rmtree(self._local("movies", "Movie A (2001)"))
+
+    def test_extras_join_the_shipped_film_folder(self):
+        self._film_shipped()
+        extras = ["extras/MOVIE_A_BONUS_title_t00.mkv", "extras/MOVIE_A_BONUS_title_t01.mkv",
+                  "disc-bonus-MOVIE_A_BONUS.jpg"]
+        job_id, holding = self._bonus("Movie A (2001) - bonus job{job_id}", extras)
+        self.assertEqual(self._run(), 0)
+        film = self._shipped("Movies", "Movie A (2001)")
+        for rel in extras:
+            self.assertEqual(self._read(os.path.join(film, rel)), f"content of {rel}\n")
+        # The film's own files are untouched, and nothing landed beside the film's folder.
+        self.assertEqual(self._read(os.path.join(film, "Movie A (2001).mkv")), "content of Movie A (2001).mkv\n")
+        self.assertEqual(self._read(os.path.join(film, "extras", "trailer.mkv")), "content of extras/trailer.mkv\n")
+        self.assertEqual(self._dest_folders("Movies"), ["Movie A (2001)"])
+        self.assertFalse(os.path.exists(self._local("movies", holding)))
+        # The record is the bonus disc's own, naming the film's folder and the job it belongs to.
+        name = next(n for n in os.listdir(self.records) if f"-job{job_id}." in n)
+        top, files = parse_record(self._read(os.path.join(self.records, name)))
+        self.assertEqual((top["job"], top["bonus_of"], top["role"]), (job_id, 1, "bonus"))
+        self.assertEqual(top["library"], "movies/Movie A (2001)")
+        self.assertEqual(top["source"], f"movies/{holding}")
+        self.assertEqual([f["path"] for f in files],
+                         ["movies/Movie A (2001)/extras/MOVIE_A_BONUS_title_t00.mkv",
+                          "movies/Movie A (2001)/extras/MOVIE_A_BONUS_title_t01.mkv"])
+        self.assertFalse(any(f["main"] for f in files))
+        transfer = next(c for c in self._transfers() if holding in c)
+        self.assertTrue(transfer.endswith("/Movies/Movie A (2001)/"), transfer)
+
+    def test_extra_that_would_replace_a_file_leaves_the_folder(self):
+        self._film_shipped()
+        kept = self._plant("Movies", "Movie A (2001)", "extras/MOVIE_A_BONUS_title_t00.mkv")
+        _, holding = self._bonus("Movie A (2001) - bonus job{job_id}", ["extras/MOVIE_A_BONUS_title_t00.mkv"])
+        self.assertEqual(self._run(), 1)
+        self.assertEqual(self._read(kept), "an earlier rip\n")
+        self.assertEqual(self._dest_folders("Movies"), ["Movie A (2001)"])
+        self.assertTrue(os.path.isfile(os.path.join(self._local("movies", holding), "extras",
+                                                    "MOVIE_A_BONUS_title_t00.mkv")))
+        self.assertEqual([c for c in self._transfers() if holding in c], [])
+
+    def test_extras_filed_in_the_film_folder_ship_with_the_film(self):
+        # The bonus disc finished while the film's folder was still on the ripper: one folder, the film's rip.
+        self._folder("movies", "Movie A (2001)", ["extras/MOVIE_A_BONUS_title_t00.mkv"])
+        job_id, _ = self._bonus("Movie A (2001)", None)
+        self.assertEqual(self._run(), 0)
+        film = self._shipped("Movies", "Movie A (2001)")
+        self.assertTrue(os.path.isfile(os.path.join(film, "Movie A (2001).mkv")))
+        self.assertTrue(os.path.isfile(os.path.join(film, "extras", "MOVIE_A_BONUS_title_t00.mkv")))
+        # Its record is the film's job's, not the bonus disc's.
+        self.assertEqual([n for n in os.listdir(self.records) if f"-job{job_id}." in n], [])
+        name = next(n for n in os.listdir(self.records) if "-job1." in n)
+        top, files = parse_record(self._read(os.path.join(self.records, name)))
+        self.assertEqual((top["job"], top["role"]), (1, "feature"))
+        self.assertNotIn("bonus_of", top)
+        self.assertIn("movies/Movie A (2001)/extras/MOVIE_A_BONUS_title_t00.mkv", [f["path"] for f in files])
+
+    def test_film_folder_waits_for_its_bonus_disc(self):
+        self._bonus("Movie A (2001)", None, status="ripping")
+        self.assertEqual(self._run(), 0)
+        self.assertTrue(os.path.isdir(self._local("movies", "Movie A (2001)")))
+        self.assertEqual(self._dest_folders("Movies"), [])
+
+    def test_bonus_remote_name_needs_the_bonus_job_itself(self):
+        folder = self._local("movies", "Movie A (2001) - bonus job11")
+        self.assertEqual(shipper.bonus_remote_name(folder, {"job_id": 11, "bonus_of_job_id": 1}), "Movie A (2001)")
+        self.assertEqual(shipper.remote_folder_names(folder, {"job_id": 11, "bonus_of_job_id": 1, "label": "X"}),
+                         ["Movie A (2001)"])
+        # Not a bonus disc, another job's folder, or not ARM's holding name: shipped under its own name.
+        self.assertIsNone(shipper.bonus_remote_name(folder, {"job_id": 11, "bonus_of_job_id": None}))
+        self.assertIsNone(shipper.bonus_remote_name(folder, {"job_id": 12, "bonus_of_job_id": 1}))
+        self.assertIsNone(shipper.bonus_remote_name(self._local("movies", "Movie A (2001)"),
+                                                    {"job_id": 11, "bonus_of_job_id": 1}))
 
 
 class KeptNameWithoutRecords(ShipperFixture):

@@ -205,6 +205,11 @@ class Job(db.Model):
     sleeve_id = db.Column(db.String(16), index=True)  # code on the sleeve label (T6-0001...), assigned once
     label_printed = db.Column(db.DateTime)  # when the sleeve label was last printed; None = still to print
     box = db.Column(db.String(64))  # box the sleeve was filed in
+    # No foreign key constraints: a film -> job -> film cycle would make Job.films ambiguous
+    bonus_of_job_id = db.Column(db.Integer)
+    """Set when this disc is the bonus disc of an earlier job: its titles are filed as that film's extras"""
+    bonus_of_film_id = db.Column(db.Integer)
+    """With bonus_of_job_id: the film of a double feature (a box set's supplemental disc) the extras belong to"""
     devpath = db.Column(db.String(15))
     mountpoint = db.Column(db.String(20))
     hasnicetitle = db.Column(db.Boolean)
@@ -223,6 +228,11 @@ class Job(db.Model):
     films = db.relationship('Film', backref='job', lazy='dynamic', order_by='Film.position')
     """The films on a disc that carries several (double features); empty for an ordinary disc"""
     config = db.relationship('Config', uselist=False, backref="job")
+    bonus_of = db.relationship('Job', primaryjoin='foreign(Job.bonus_of_job_id) == remote(Job.job_id)',
+                               viewonly=True)
+    """The job whose film this bonus disc belongs to; None for an ordinary disc"""
+    bonus_of_film = db.relationship('Film', primaryjoin='foreign(Job.bonus_of_film_id) == Film.film_id',
+                                    viewonly=True)
 
     def __init__(self, devpath):
         """Return a disc object"""
