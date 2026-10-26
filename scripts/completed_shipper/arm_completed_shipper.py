@@ -42,6 +42,9 @@ Safety rules:
   in ``catalog_spool_path`` as ``job<id>.destination`` until the folder has
   shipped, so a run that is interrupted part-way finishes in the same folder
   instead of probing again with only the files still left.
+* A double feature's further films, which ARM files in folders of their own
+  beside the job folder (the fork's ``film`` table), ship under the same rules
+  as the job folder, each with its own destination name and catalog record.
 * A lock file stops two runs overlapping.
 * Only the standard library plus ``rsync`` are needed.
 
@@ -111,8 +114,12 @@ PROBE_CHECKSUM_RATE = 50 * 1024 * 1024
 
 JOB_COLUMNS = ("job_id", "status", "path", "title", "title_manual", "year", "year_manual", "video_type",
                "imdb_id", "label", "disctype", "disc_barcode", "disc_barcode_title", "sleeve_id", "box",
-               "stop_time")
+               "stop_time", "stage")
 """Columns read from ARM's job table when present; a stock ARM lacks the fork's disc_barcode and sleeve ones."""
+FILM_COLUMNS = ("job_id", "position", "title", "year", "imdb_id", "track_number")
+"""Columns read from the fork's film table (the 2nd+ films of a double-feature disc); a stock ARM has no such table."""
+FILM_SUB_FOLDER = "movies"
+"""ARM files a double feature's further films beside the job folder, under COMPLETED_PATH/movies."""
 
 DEFAULTS = {
     "db_path": "/home/arm/db/arm.db",
@@ -199,6 +206,9 @@ def read_jobs(db_path):
 
     The DB is opened read-only; ARM keeps writing to it while we run.  Columns the
     fork added (sleeve id, barcode) are simply absent on a stock ARM database.
+    Each row also carries ``films``: the job's rows of the fork's film table that
+    ARM has filed (``track_number`` set) beyond the first, by position; empty for
+    an ordinary job and on a database without that table.
     """
     if not os.path.exists(db_path):
         raise ShipperError(f"ARM database not found: {db_path}")
@@ -210,9 +220,92 @@ def read_jobs(db_path):
         if "path" not in columns or "status" not in columns:
             raise ShipperError(f"{db_path} has no job table with path and status columns")
         rows = conn.execute(f"SELECT {', '.join(columns)} FROM job WHERE path IS NOT NULL AND path != ''").fetchall()
+        films = read_films(conn)
     finally:
         conn.close()
-    return [dict(zip(columns, row)) for row in rows]
+    jobs = [dict(zip(columns, row)) for row in rows]
+    for job in jobs:
+        job["films"] = films.get(job.get("job_id"), [])
+    return jobs
+
+
+def read_films(conn):
+    """
+    ``{job id: [film row, ...]}`` for the filed films after the first of every double-feature job.
+
+    The first film (lowest position) is the job's own title and lives in
+    ``job.path``; a film without a ``track_number`` was never filed (no ripped
+    title matched its runtime), so it has no folder.  Empty when the database
+    has no film table.
+    """
+    present = {row[1] for row in conn.execute("PRAGMA table_info(film)")}
+    if not {"job_id", "position", "title", "track_number"} <= present:
+        return {}
+    columns = [column for column in FILM_COLUMNS if column in present]
+    by_job = {}
+    for row in conn.execute(f"SELECT {', '.join(columns)} FROM film ORDER BY job_id, position"):
+        film = dict(zip(columns, row))
+        by_job.setdefault(film["job_id"], []).append(film)
+    return {job_id: [film for film in films[1:] if _clean(film["track_number"]) and _clean(film["title"])]
+            for job_id, films in by_job.items()}
+
+
+def film_folder_name(film):
+    """``Title (Year)``, or the title alone when the year is unknown: ARM's ``Film.folder_name``."""
+    year = _clean(film.get("year"))
+    if year and year != "0000":
+        return f"{film['title']} ({year})"
+    return str(film["title"])
+
+
+def film_folder_for(job, film, completed_path):
+    """
+    The local folder ARM filed one of a double feature's further films in.
+
+    ARM files it in ``COMPLETED_PATH/movies/<Title (Year)>``, or, when that
+    folder already existed, in ``<Title (Year)>_<job.stage>``.  ``job.stage``
+    is the job's start stamp (``time() * 100``), unique to it, so the suffixed
+    folder is the film's whenever it exists.  The plain folder is the film's
+    only if it changed after the job started: one older than that is the
+    folder that made ARM add the suffix, and is someone else's even once the
+    suffixed one has shipped.  Returns None when the film has no folder of its
+    own to claim.
+
+    ARM's UI may overwrite ``job.stage`` with rip progress text; without a
+    numeric stage there is neither a suffix to look for nor a start to compare
+    with, so the plain folder is taken as the film's and a suffixed one stays
+    for a hand transfer.
+    """
+    name = film_folder_name(film)
+    plain = os.path.realpath(os.path.join(completed_path, FILM_SUB_FOLDER, name))
+    stage = _clean(job.get("stage"))
+    if not stage or not stage.isdigit():
+        return plain
+    suffixed = os.path.realpath(os.path.join(completed_path, FILM_SUB_FOLDER, f"{name}_{stage}"))
+    if os.path.isdir(suffixed):
+        return suffixed
+    try:
+        changed = os.stat(plain).st_mtime
+    except OSError:
+        return plain  # gone (shipped) or never there: nothing to claim either way
+    if changed < int(stage) / 100:
+        log.debug("not claiming %s for film %s of job %s: it predates the job", plain, film.get("position"),
+                  job.get("job_id"))
+        return None
+    return plain
+
+
+def film_job(job, film):
+    """
+    The row a further film's folder ships with: its parent job's, with the film's title, year and metadata id.
+
+    ``film`` (its position) keeps the folder's destination state and catalog
+    record apart from the job folder's and the other films'.
+    """
+    row = {key: value for key, value in job.items() if key != "films"}
+    row.update(title=film.get("title"), title_manual=None, year=film.get("year"), year_manual=None,
+               imdb_id=film.get("imdb_id"), film=film.get("position"))
+    return row
 
 
 def local_folder_for(job_path, completed_path, arm_completed_path=None):
@@ -238,12 +331,23 @@ def finished_jobs(db_path, completed_path, arm_completed_path=None):
     A folder qualifies when at least one job with that path has status
     ``success`` and no job with that path is still unfinished.  The row kept is
     the newest successful job, which is the one whose rip the folder holds.
+
+    A double feature's further films (see :func:`read_films`) count as folders
+    of their own, each with its parent job's status and a :func:`film_job` row,
+    under the same rules: a film folder that is also another job's path waits
+    for that job too.  Only the films of a job whose ``job.path`` is under
+    COMPLETED_PATH are looked at, since ARM files them beside it.
     """
     by_folder = {}
     for job in read_jobs(db_path):
         local = local_folder_for(job["path"], completed_path, arm_completed_path)
-        if local is not None:
-            by_folder.setdefault(local, []).append(job)
+        if local is None:
+            continue
+        by_folder.setdefault(local, []).append(job)
+        for film in job["films"]:
+            folder = film_folder_for(job, film, completed_path)
+            if folder is not None:
+                by_folder.setdefault(folder, []).append(film_job(job, film))
 
     shippable = {}
     for path, jobs in by_folder.items():
@@ -477,8 +581,12 @@ def choose_remote_name(cfg, sub_folder, local_folder, job):
 
 
 def destination_state_path(cfg, job):
-    """``<catalog_spool_path>/job<id>.destination``: where a job folder's chosen destination name is kept."""
-    return os.path.join(cfg["catalog_spool_path"], f"job{job.get('job_id') or 0}{STATE_SUFFIX}")
+    """
+    ``<catalog_spool_path>/job<id>.destination``: where a job folder's chosen destination name is kept.
+
+    A double feature's further film keeps its own, ``job<id>-film<position>.destination``.
+    """
+    return os.path.join(cfg["catalog_spool_path"], f"{_job_key(job)}{STATE_SUFFIX}")
 
 
 def read_destination_state(cfg, job, source):
@@ -806,9 +914,17 @@ def disc_format(job, rows):
     return "dvd" if widest else "bd"
 
 
+def _job_key(job):
+    """``job<id>``, or ``job<id>-film<position>`` for a double feature's further film (see :func:`film_job`)."""
+    key = f"job{job.get('job_id') or 0}"
+    if job.get("film"):
+        key += f"-film{job['film']}"
+    return key
+
+
 def _job_tag(job):
-    """``-job<id>``, the part of a record name that identifies its job."""
-    return f"-job{job.get('job_id') or 0}"
+    """``-job<id>`` (``-job<id>-film<position>``), the part of a record name that identifies its job folder."""
+    return f"-{_job_key(job)}"
 
 
 def record_name(cfg, job, suffix=RECORD_SUFFIX):
@@ -850,13 +966,15 @@ def catalog_record(cfg, sub_folder, local_folder, job, remote_name=None):
     folder = os.path.basename(local_folder.rstrip(os.sep))
     remote_name = remote_name or folder
     library = library_path(sub_folder, remote_name)
+    # ARM names the main feature after its own folder, whatever the destination is called; a further
+    # film's after the film, even in a folder that carries a _<stage> suffix.
+    feature = film_folder_name(job) if job.get("film") and _clean(job.get("title")) else folder
     rows = []
     for relative in files:
         row = mkvheader.probe_row(os.path.join(local_folder, relative))
         stem = relative.rsplit(".", 1)[0]
         row["path"] = f"{library}/{relative}"
-        # ARM names the main feature after its own folder, whatever the destination is called.
-        row["main"] = "/" not in relative and stem == folder
+        row["main"] = "/" not in relative and stem == feature
         if not row["probed"]:
             log.debug("%s is not Matroska or unreadable; listed by size only", relative)
         rows.append(row)
@@ -868,6 +986,7 @@ def catalog_record(cfg, sub_folder, local_folder, job, remote_name=None):
     lines += _toml_lines([
         ("ripper", cfg["ripper_name"]),
         ("job", int(job.get("job_id") or 0)),
+        ("film", int(job["film"]) if job.get("film") else None),
         ("shipped", datetime.datetime.now().replace(microsecond=0).isoformat()),
         ("type", VIDEO_TYPES.get(sub_folder, _clean(job.get("video_type")) or "unknown")),
         ("title", title),

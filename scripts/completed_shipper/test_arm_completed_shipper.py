@@ -1279,5 +1279,139 @@ class CatalogRecords(ShipperFixture):
         self.assertEqual(self._records(), [])
 
 
+class DoubleFeature(ShipperFixture):
+    """A disc with several films: ARM files the 2nd+ films in folders of their own, beside job.path."""
+
+    STAGE = "176150000000"
+    FILM_2 = "Land Before Time IX (2002)"
+    FILM_3 = "Land Before Time X (2003)"
+
+    def setUp(self):
+        super().setUp()
+        conn = sqlite3.connect(self.db)
+        conn.execute("ALTER TABLE job ADD COLUMN stage VARCHAR(63)")
+        conn.execute("""CREATE TABLE film (
+            film_id INTEGER PRIMARY KEY, job_id INTEGER, position INTEGER, title VARCHAR(256), year VARCHAR(4),
+            imdb_id VARCHAR(15), video_type VARCHAR(20), poster_url VARCHAR(256), runtime INTEGER,
+            track_number VARCHAR(4))""")
+        conn.commit()
+        conn.close()
+        self._job("movies", "Land Before Time VIII (2001)", "success",
+                  files=["Land Before Time VIII (2001).mkv", "extras/title_t05.mkv"])
+        self.job_id = self._job_id("Land Before Time VIII")
+        self._set_job("Land Before Time VIII (2001)", title="Land Before Time VIII", year="2001",
+                      imdb_id="tt0000008", label="LAND_BEFORE_TIME_8_9", disctype="dvd", stage=self.STAGE,
+                      stop_time="2026-10-24 20:15:00")
+        self._film(1, "Land Before Time VIII", "2001", "tt0000008", "1")
+        self._film(2, "Land Before Time IX", "2002", "tt0000009", "3")
+        # No ripped title matched film 3's runtime, so ARM never filed it; a folder of that name is someone else's.
+        self._film(3, "Land Before Time X", "2003", "tt0000010", None)
+        self._folder("movies", self.FILM_2, files=[f"{self.FILM_2}.mkv"])
+        self._folder("movies", self.FILM_3, files=[f"{self.FILM_3}.mkv"])
+
+    def _film(self, position, title, year, imdb_id, track_number, job_id=None):
+        conn = sqlite3.connect(self.db)
+        conn.execute("INSERT INTO film (job_id, position, title, year, imdb_id, video_type, track_number) "
+                     "VALUES (?, ?, ?, ?, ?, 'movie', ?)",
+                     (job_id or self.job_id, position, title, year, imdb_id, track_number))
+        conn.commit()
+        conn.close()
+
+    def test_further_film_folder_ships_with_its_job(self):
+        self.assertEqual(self._run(), 0)
+        for name in ("Land Before Time VIII (2001)", self.FILM_2):
+            self.assertFalse(os.path.exists(self._local("movies", name)), name)
+        self.assertTrue(os.path.isfile(os.path.join(self._shipped("Movies", self.FILM_2), f"{self.FILM_2}.mkv")))
+        with open(os.path.join(self.tmp, "hook.log")) as handle:
+            self.assertIn(f"movies {self.FILM_2}\n", handle.read())
+
+    def test_film_without_track_number_is_ignored(self):
+        self.assertEqual(self._run(), 0)
+        self.assertTrue(os.path.isdir(self._local("movies", self.FILM_3)))
+        self.assertFalse(os.path.exists(self._shipped("Movies", self.FILM_3)))
+        self.assertNotIn(self.FILM_3, "\n".join(self._calls()))
+
+    def test_film_folder_waits_while_its_job_is_still_ripping(self):
+        self._set_job("Land Before Time VIII (2001)", status="ripping")
+        self.assertEqual(self._run(), 0)
+        self.assertTrue(os.path.isdir(self._local("movies", self.FILM_2)))
+        self.assertNotIn(self.FILM_2, "\n".join(self._calls()))
+
+    def test_film_folder_waits_for_another_job_on_that_path(self):
+        self._job("movies", self.FILM_2, "ripping", make_folder=False)
+        self.assertEqual(self._run(), 0)
+        self.assertTrue(os.path.isdir(self._local("movies", self.FILM_2)))
+        self.assertFalse(os.path.exists(self._local("movies", "Land Before Time VIII (2001)")))
+
+    def test_database_without_film_table(self):
+        conn = sqlite3.connect(self.db)
+        conn.execute("DROP TABLE film")
+        conn.commit()
+        conn.close()
+        self.assertEqual(self._run(), 0)
+        # The job folder ships as before; the film folder, unknown to the database, stays.
+        self.assertFalse(os.path.exists(self._local("movies", "Land Before Time VIII (2001)")))
+        self.assertTrue(os.path.isdir(self._local("movies", self.FILM_2)))
+        conn = sqlite3.connect(self.db)
+        self.assertEqual(shipper.read_films(conn), {})
+        conn.close()
+
+    def test_film_filed_beside_an_existing_folder_ships_from_the_stage_suffixed_one(self):
+        # ARM found "IX (2002)" already there (an older rip nobody tracks) and filed into "IX (2002)_<stage>".
+        os.rename(self._local("movies", self.FILM_2), self._local("movies", f"{self.FILM_2}_{self.STAGE}"))
+        self._folder("movies", self.FILM_2, files=["an older rip.mkv"])
+        before_the_job = int(self.STAGE) / 100 - 3600
+        os.utime(self._local("movies", self.FILM_2), (before_the_job, before_the_job))
+        self.assertEqual(self._run(), 0)
+        self.assertFalse(os.path.exists(self._local("movies", f"{self.FILM_2}_{self.STAGE}")))
+        self.assertTrue(os.path.isfile(os.path.join(self._shipped("Movies", f"{self.FILM_2}_{self.STAGE}"),
+                                                    f"{self.FILM_2}.mkv")))
+        self.assertTrue(os.path.isfile(os.path.join(self._local("movies", self.FILM_2), "an older rip.mkv")))
+
+    def test_stage_overwritten_by_progress_text_leaves_the_suffixed_folder(self):
+        os.rename(self._local("movies", self.FILM_2), self._local("movies", f"{self.FILM_2}_{self.STAGE}"))
+        self._set_job("Land Before Time VIII (2001)", stage="Track 2/2<br>Saving to MKV file")
+        self.assertEqual(self._run(), 0)
+        self.assertTrue(os.path.isdir(self._local("movies", f"{self.FILM_2}_{self.STAGE}")))
+
+    def test_film_folder_gets_its_own_catalog_record(self):
+        os.makedirs(self.records)
+        with open(self.conf, "a") as handle:
+            handle.write(f"remote_catalog_path = {self.records}\nripper_name = ts140\n")
+        os.rename(self._local("movies", self.FILM_2), self._local("movies", f"{self.FILM_2}_{self.STAGE}"))
+        self.assertEqual(self._run(), 0)
+        names = [n for n in os.listdir(self.records) if f"-job{self.job_id}" in n]
+        stamp = f"20261024-201500-ts140-job{self.job_id}"
+        self.assertEqual(sorted(names), [f"{stamp}-film2.toml", f"{stamp}.toml"])
+        with open(os.path.join(self.records, f"{stamp}-film2.toml")) as handle:
+            top, files = parse_record(handle.read())
+        self.assertEqual((top["job"], top["film"], top["title"], top["year"], top["imdb"]),
+                         (self.job_id, 2, "Land Before Time IX", 2002, "tt0000009"))
+        self.assertEqual((top["label"], top["role"]), ("LAND_BEFORE_TIME_8_9", "feature"))
+        self.assertEqual(top["library"], f"movies/{self.FILM_2}_{self.STAGE}")
+        self.assertEqual([f["main"] for f in files], [True])
+        with open(os.path.join(self.records, f"{stamp}.toml")) as handle:
+            top, _ = parse_record(handle.read())
+        self.assertEqual((top["title"], top["year"]), ("Land Before Time VIII", 2001))
+        self.assertNotIn("film", top)
+
+    def test_interrupted_film_transfer_keeps_its_own_destination_state(self):
+        # Both films' folders collide on the media box, so each ships under a name kept in the spool.
+        for name in ("Land Before Time VIII (2001)", self.FILM_2):
+            os.makedirs(self._shipped("Movies", name))
+            with open(os.path.join(self._shipped("Movies", name), f"{name}.mkv"), "w") as handle:
+                handle.write("an earlier rip\n")
+        self._interrupt(f"{self.FILM_2}/", "*.mkv")
+        self.assertEqual(self._run(), 1)
+        state = os.path.join(self.spool, f"job{self.job_id}-film2.destination")
+        self.assertEqual(shipper.read_record_key(state, "remote_name"), f"{self.FILM_2} - LAND_BEFORE_TIME_8_9")
+        self.assertFalse(os.path.exists(os.path.join(self.spool, f"job{self.job_id}.destination")))
+        self._no_interrupt()
+        self.assertEqual(self._run(), 0)
+        self.assertTrue(os.path.isfile(os.path.join(self._shipped("Movies", f"{self.FILM_2} - LAND_BEFORE_TIME_8_9"),
+                                                    f"{self.FILM_2}.mkv")))
+        self.assertFalse(os.path.exists(state))
+
+
 if __name__ == "__main__":
     unittest.main()
