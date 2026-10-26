@@ -8,8 +8,10 @@ Reference:
 """
 
 import collections
+import contextlib
 import dataclasses
 import enum
+import fcntl
 import itertools
 import logging
 import os
@@ -17,6 +19,7 @@ import re
 import shlex
 import shutil
 import subprocess
+import tempfile
 from time import sleep, time
 
 import arm.config.config as cfg
@@ -48,6 +51,12 @@ DISC_OPEN_ATTEMPTS = 3
 """How often makemkvcon info is run before a disc it cannot open is given up on"""
 DISC_OPEN_RETRY_WAIT = 30  # [s]
 """Pause between those attempts"""
+MAKEMKV_INFO_LOCK = os.path.join(tempfile.gettempdir(), "arm-makemkv-info.lock")
+"""Held by the running makemkvcon info scan; the rippers of all drives share it"""
+MAKEMKV_INFO_LOCK_TIMEOUT = 900  # [s]
+"""Longest wait for another drive's scan to finish"""
+MAKEMKV_INFO_LOCK_POLL = 5  # [s]
+"""How often a waiting scan checks whether the lock is free"""
 
 ERROR_MESSAGE_OPERATION_RESULT = "Internal error - Operation result is incorrect (132)"
 ERROR_MESSAGE_TRAY_OPEN = "Scsi error - NOT READY:MEDIUM NOT PRESENT - TRAY OPEN"
@@ -566,6 +575,39 @@ def parse_line(line):
     return msg_type, message
 
 
+@contextlib.contextmanager
+def info_scan_lock():
+    """
+    Let only one makemkvcon info scan run at a time, whichever drive it is for
+
+    Two discs scanned at once can make MakeMKV fail to open one of them ("Failed to open disc"),
+    seen on the t620 when Blu-rays went into two drives within seconds. Only the scans wait for
+    each other; rips (makemkvcon mkv) still run side by side. A scan that holds the lock longer
+    than MAKEMKV_INFO_LOCK_TIMEOUT is taken to hang and is not waited for any longer.
+    """
+    try:
+        lock_file = open(MAKEMKV_INFO_LOCK, "a")
+    except OSError as error:
+        logging.warning(f"Cannot open {MAKEMKV_INFO_LOCK} ({error}); scanning without waiting for other drives")
+        yield
+        return
+    with lock_file:
+        deadline = time() + MAKEMKV_INFO_LOCK_TIMEOUT
+        while True:
+            try:
+                fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time() >= deadline:
+                    logging.warning(f"Another drive's MakeMKV scan has run for over {MAKEMKV_INFO_LOCK_TIMEOUT}s; "
+                                    "scanning anyway")
+                    break
+                logging.debug("Waiting for another drive's MakeMKV scan to finish")
+                sleep(MAKEMKV_INFO_LOCK_POLL)
+        # closing the file at the end of the with block releases the lock
+        yield
+
+
 def makemkv_info(job, select=None, index=9999, options=None):
     """
     Use MakeMKV info to search the system for optical drives
@@ -619,10 +661,11 @@ def makemkv_info(job, select=None, index=9999, options=None):
     job.status = JobState.VIDEO_WAITING.value
     db.session.commit()
     utils.sleep_check_process("makemkvcon", max_processes, sleep=(10, wait_time, 10))
-    job.status = JobState.VIDEO_INFO.value
-    db.session.commit()
     try:
-        yield from run(info_options, select)
+        with info_scan_lock():
+            job.status = JobState.VIDEO_INFO.value
+            db.session.commit()
+            yield from run(info_options, select)
     finally:
         logging.info("MakeMKV info exits.")
         job.status = JobState.VIDEO_WAITING.value
