@@ -56,6 +56,55 @@ def _fake_updater(args, job):
     return True
 
 
+def _result(title, year, votes=0, **extra):
+    base = {"Title": title, "Year": year, "Type": "movie", "imdbID": f"tt{abs(hash(title + year)) % 10**7:07d}",
+            "Poster": f"https://img/{title}.jpg", "vote_count": votes}
+    base.update(extra)
+    return base
+
+
+HOME_ALONE = [_result("Home Alone 3", "1997", 1500), _result("Home Sweet Home Alone", "2021", 700),
+              _result("Home Alone 2: Lost in New York", "1992", 6000), _result("Home, Alone", "", 2),
+              _result("Home Alone", "2023", 1), _result("Home Alone", "1990", 11000),
+              _result("Home Alone", "1969", 3)]
+
+
+@unittest.skipIf(IMPORT_ERROR is not None, f"ARM could not be imported here: {IMPORT_ERROR}")
+class TestBestSearchResult(unittest.TestCase):
+    def test_exact_title_beats_the_providers_first_result(self):
+        best = identify.best_search_result(HOME_ALONE, "Home Alone")
+        self.assertEqual((best["Title"], best["Year"]), ("Home Alone", "1990"))
+
+    def test_year_narrows_the_exact_matches(self):
+        best = identify.best_search_result(HOME_ALONE, "Home Alone", "1969")
+        self.assertEqual(best["Year"], "1969")
+        # a year nothing matches falls back to the best exact match
+        best = identify.best_search_result(HOME_ALONE, "Home Alone", "1975")
+        self.assertEqual(best["Year"], "1990")
+
+    def test_punctuation_and_case_do_not_matter(self):
+        results = [_result("Coal Miner's Daughter: A Celebration of the Life and Music of Loretta Lynn", "2022", 9),
+                   _result("Coal Miner's Daughter", "1980", 400)]
+        best = identify.best_search_result(results, "COAL MINERS DAUGHTER")
+        self.assertEqual(best["Year"], "1980")
+
+    def test_no_exact_match_keeps_the_first_result(self):
+        best = identify.best_search_result(HOME_ALONE, "Home")
+        self.assertEqual(best["Title"], "Home Alone 3")
+        self.assertEqual(identify.best_search_result(HOME_ALONE, None)["Title"], "Home Alone 3")
+        self.assertIsNone(identify.best_search_result([], "Home Alone"))
+
+    def test_update_job_uses_the_best_match(self):
+        job = _job()
+        with mock.patch.object(identify.utils, "database_updater", side_effect=_fake_updater):
+            identify.update_job(job, {"Search": HOME_ALONE}, "Home Alone")
+        self.assertEqual((job.title, job.year), ("Home-Alone", "1990"))  # the ripper's filename cleaner
+        with mock.patch.object(identify.utils, "database_updater", side_effect=_fake_updater):
+            identify.update_job(job, {"Search": HOME_ALONE})
+        self.assertEqual((job.title, job.year), ("Home-Alone-3", "1997"))
+        self.assertIsNone(identify.update_job(job, {"Search": []}, "Home Alone"))
+
+
 @unittest.skipIf(IMPORT_ERROR is not None, f"ARM could not be imported here: {IMPORT_ERROR}")
 class TestBarcodeComesFirst(unittest.TestCase):
     """identify() asks the case barcode before the CRC database and the label search."""
