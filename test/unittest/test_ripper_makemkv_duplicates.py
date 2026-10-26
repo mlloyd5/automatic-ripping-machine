@@ -261,6 +261,13 @@ class TestMakemkvMkvRouting(unittest.TestCase):
         commands = [call.args[0] for call in self.run_mock.call_args_list]
         self.assertEqual([cmd[cmd.index("dev:/dev/sr0") + 1] for cmd in commands], ["0", "2"])
 
+    def test_no_titles_fails_instead_of_ripping_all(self):
+        # A blind "all" rip has no track rows to move the files by, so it would be deleted with the raw folder
+        job = _job([])
+        with self.assertRaises(makemkv.utils.RipperException):
+            makemkv.makemkv_mkv(job, "/raw")
+        self.run_mock.assert_not_called()
+
     def test_track_flags_are_committed_before_ripping(self):
         # Left uncommitted, the flags were autoflushed and held SQLite's write lock for the whole
         # rip (RED 2 on the t620), so the other drives' jobs failed with "database is locked".
