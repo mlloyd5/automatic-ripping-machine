@@ -11,20 +11,42 @@ subtitle tracks, chapter count and the segment title.
 ``probe(path)`` returns a dict; ``probe_row(path)`` the same as the TSV columns
 the catalog's inventory uses.  Run as a script it prints one TSV line per file
 under the given paths.
+
+A corrupt header (an element size or SeekHead position no real file has) is
+refused instead of read: scalar elements are capped at 1 MiB and seeks at the
+file's end, so a damaged file can never make this read gigabytes or raise
+anything but ``NotMatroska``/``MalformedHeader``/``OSError`` from ``probe``
+(``probe_row`` never raises at all).
 """
 
+import logging
 import os
 import struct
 import sys
 
 INFO, TRACKS, CHAPTERS, CLUSTER, SEEKHEAD = 0x1549A966, 0x1654AE6B, 0x1043A770, 0x1F43B675, 0x114D9B74
 EBML_HEADER, SEGMENT = 0x1A45DFA3, 0x18538067
+TIMECODE_SCALE, DURATION, SEGMENT_TITLE = 0x2AD7B1, 0x4489, 0x7BA9
+TRACK_ENTRY, TRACK_TYPE, CODEC_ID, LANGUAGE, VIDEO, PIXEL_WIDTH, PIXEL_HEIGHT = (
+    0xAE, 0x83, 0x86, 0x22B59C, 0xE0, 0xB0, 0xBA)
+EDITION_ENTRY, CHAPTER_ATOM = 0x45B9, 0xB6
+SEEK, SEEK_ID, SEEK_POSITION = 0x4DBB, 0x53AB, 0x53AC
 MEDIA_EXTENSIONS = (".mkv", ".mka", ".mks", ".mk3d", ".webm")
 """Containers this module can read; anything else is listed by size alone."""
+MAX_SCALAR_SIZE = 1 << 20
+"""Largest number, float or string element read (1 MiB); a bigger declared size means a corrupt header."""
+MAX_EBML_OFFSET = (1 << 56) - 2
+"""Largest size or position EBML can express; a SeekHead position above it is corrupt, not just past the end."""
+
+log = logging.getLogger("mkvheader")
 
 
 class NotMatroska(Exception):
     """The file does not start with an EBML header."""
+
+
+class MalformedHeader(ValueError):
+    """The header declares an element size or position no sane Matroska file has."""
 
 
 def _read_id(handle):
@@ -71,17 +93,104 @@ def _children(handle, end):
         handle.seek(start + size)
 
 
+def _read_scalar(handle, size):
+    """The payload of a number, float or string element; refuses sizes no such element has."""
+    if size < 0 or size > MAX_SCALAR_SIZE:
+        raise MalformedHeader(f"scalar element of {size} bytes at offset {handle.tell()}")
+    return handle.read(size)
+
+
 def _uint(handle, size):
-    return int.from_bytes(handle.read(size), "big")
+    return int.from_bytes(_read_scalar(handle, size), "big")
 
 
 def _float(handle, size):
-    data = handle.read(size)
-    return struct.unpack(">f", data)[0] if size == 4 else struct.unpack(">d", data)[0]
+    data = _read_scalar(handle, size)
+    try:
+        return struct.unpack(">f", data)[0] if size == 4 else struct.unpack(">d", data)[0]
+    except struct.error:
+        raise MalformedHeader(f"float element of {size} bytes ({len(data)} readable)") from None
 
 
 def _string(handle, size):
-    return handle.read(size).decode("utf-8", "replace").rstrip("\x00")
+    return _read_scalar(handle, size).decode("utf-8", "replace").rstrip("\x00")
+
+
+def _parse_info(handle, end, result, timing):
+    """Segment Info: timecode scale, duration and title."""
+    for child_id, child_size, _ in _children(handle, end):
+        if child_id == TIMECODE_SCALE:
+            timing["scale"] = _uint(handle, child_size)
+        elif child_id == DURATION:
+            timing["duration"] = _float(handle, child_size)
+        elif child_id == SEGMENT_TITLE:
+            result["title"] = _string(handle, child_size)
+
+
+def _parse_track(handle, end, result):
+    """One TrackEntry: the first video track's codec and picture size, audio tracks, subtitle count."""
+    track = {"type": 0, "codec": "", "lang": "und"}
+    for track_id, track_size, track_start in _children(handle, end):
+        if track_id == TRACK_TYPE:
+            track["type"] = _uint(handle, track_size)
+        elif track_id == CODEC_ID:
+            track["codec"] = _string(handle, track_size)
+        elif track_id == LANGUAGE:
+            track["lang"] = _string(handle, track_size)
+        elif track_id == VIDEO:
+            for video_id, video_size, _ in _children(handle, track_start + track_size):
+                if video_id == PIXEL_WIDTH:
+                    result["width"] = _uint(handle, video_size)
+                elif video_id == PIXEL_HEIGHT:
+                    result["height"] = _uint(handle, video_size)
+    if track["type"] == 1 and not result["video"]:
+        result["video"] = track["codec"].replace("V_", "", 1)
+    elif track["type"] == 2:
+        result["audio"].append(track["lang"] + "/" + track["codec"].replace("A_", "", 1))
+    elif track["type"] == 0x11:
+        result["subs"] += 1
+
+
+def _parse_tracks(handle, end, result):
+    for child_id, child_size, child_start in _children(handle, end):
+        if child_id == TRACK_ENTRY:
+            _parse_track(handle, child_start + child_size, result)
+
+
+def _parse_chapters(handle, end, result):
+    """Chapters: the ChapterAtom count of the largest EditionEntry."""
+    for child_id, child_size, child_start in _children(handle, end):
+        if child_id == EDITION_ENTRY:
+            atoms = _children(handle, child_start + child_size)
+            count = sum(1 for atom_id, _, _ in atoms if atom_id == CHAPTER_ATOM)
+            result["chapters"] = max(result["chapters"], count)
+
+
+def _parse_seekhead(handle, end, seeks):
+    """SeekHead: ``seeks[element id] = position relative to the Segment data``."""
+    for child_id, child_size, child_start in _children(handle, end):
+        if child_id != SEEK:
+            continue
+        seek_id = seek_position = None
+        for key_id, key_size, _ in _children(handle, child_start + child_size):
+            if key_id == SEEK_ID:
+                seek_id = _uint(handle, key_size)
+            elif key_id == SEEK_POSITION:
+                seek_position = _uint(handle, key_size)
+        if seek_id is not None and seek_position is not None:
+            seeks[seek_id] = seek_position
+
+
+def _parse_element(handle, element_id, end, result, timing, seeks):
+    """Read one top-level Segment child that a catalog cares about; ignore the rest."""
+    if element_id == INFO:
+        _parse_info(handle, end, result, timing)
+    elif element_id == TRACKS:
+        _parse_tracks(handle, end, result)
+    elif element_id == CHAPTERS:
+        _parse_chapters(handle, end, result)
+    elif element_id == SEEKHEAD:
+        _parse_seekhead(handle, end, seeks)
 
 
 def probe(path):
@@ -93,14 +202,16 @@ def probe(path):
              the ``V_`` prefix), ``audio`` (list of ``lang/CODEC``), ``subs``
              (count), ``chapters`` (count) and ``title``
     :raises NotMatroska: when the file has no EBML header
+    :raises MalformedHeader: when the header declares an absurd element size or position
     :raises OSError: when it cannot be read
     """
     result = {"size": os.path.getsize(path), "seconds": -1.0, "width": 0, "height": 0, "video": "",
               "audio": [], "subs": 0, "chapters": 0, "title": ""}
-    duration = None
-    timecode_scale = 1000000
+    timing = {"duration": None, "scale": 1000000}
+    seeks = {}
 
     with open(path, "rb") as handle:
+        file_size = os.fstat(handle.fileno()).st_size
         if _read_id(handle) != EBML_HEADER:
             raise NotMatroska(path)
         size = _read_size(handle)
@@ -111,97 +222,57 @@ def probe(path):
         segment = handle.tell()
         segment_end = segment + size if size and size > 0 else result["size"]
         seen = set()
-        seeks = {}
-
-        def parse(element_id, size, start):
-            nonlocal duration, timecode_scale
-            if element_id == INFO:
-                for child_id, child_size, _ in _children(handle, start + size):
-                    if child_id == 0x2AD7B1:
-                        timecode_scale = _uint(handle, child_size)
-                    elif child_id == 0x4489:
-                        duration = _float(handle, child_size)
-                    elif child_id == 0x7BA9:
-                        result["title"] = _string(handle, child_size)
-            elif element_id == TRACKS:
-                for child_id, child_size, child_start in _children(handle, start + size):
-                    if child_id != 0xAE:
-                        continue
-                    track = {"type": 0, "codec": "", "lang": "und"}
-                    for track_id, track_size, track_start in _children(handle, child_start + child_size):
-                        if track_id == 0x83:
-                            track["type"] = _uint(handle, track_size)
-                        elif track_id == 0x86:
-                            track["codec"] = _string(handle, track_size)
-                        elif track_id == 0x22B59C:
-                            track["lang"] = _string(handle, track_size)
-                        elif track_id == 0xE0:
-                            for video_id, video_size, _ in _children(handle, track_start + track_size):
-                                if video_id == 0xB0:
-                                    result["width"] = _uint(handle, video_size)
-                                elif video_id == 0xBA:
-                                    result["height"] = _uint(handle, video_size)
-                    if track["type"] == 1 and not result["video"]:
-                        result["video"] = track["codec"].replace("V_", "", 1)
-                    elif track["type"] == 2:
-                        result["audio"].append(track["lang"] + "/" + track["codec"].replace("A_", "", 1))
-                    elif track["type"] == 0x11:
-                        result["subs"] += 1
-            elif element_id == CHAPTERS:
-                for child_id, child_size, child_start in _children(handle, start + size):
-                    if child_id == 0x45B9:  # EditionEntry: count its ChapterAtoms
-                        count = sum(1 for atom_id, _, _ in _children(handle, child_start + child_size) if atom_id == 0xB6)
-                        result["chapters"] = max(result["chapters"], count)
-            elif element_id == SEEKHEAD:
-                for child_id, child_size, child_start in _children(handle, start + size):
-                    if child_id != 0x4DBB:
-                        continue
-                    seek_id = seek_position = None
-                    for key_id, key_size, _ in _children(handle, child_start + child_size):
-                        if key_id == 0x53AB:
-                            seek_id = int.from_bytes(handle.read(key_size), "big")
-                        elif key_id == 0x53AC:
-                            seek_position = _uint(handle, key_size)
-                    if seek_id is not None and seek_position is not None:
-                        seeks[seek_id] = seek_position
 
         for element_id, size, start in _children(handle, segment_end):
             if element_id == CLUSTER:
                 break
             seen.add(element_id)
-            parse(element_id, size, start)
+            _parse_element(handle, element_id, start + size, result, timing, seeks)
         for wanted in (INFO, TRACKS, CHAPTERS):
-            if wanted not in seen and wanted in seeks:
-                handle.seek(segment + seeks[wanted])
-                element_id = _read_id(handle)
-                size = _read_size(handle)
-                if element_id == wanted and size is not None:
-                    parse(element_id, size, handle.tell())
+            if wanted in seen or wanted not in seeks:
+                continue
+            if seeks[wanted] > MAX_EBML_OFFSET:
+                raise MalformedHeader(f"SeekHead position {seeks[wanted]} for element {wanted:#x}")
+            if segment + seeks[wanted] >= file_size:
+                continue  # past the end of a truncated file: nothing there to read
+            handle.seek(segment + seeks[wanted])
+            element_id = _read_id(handle)
+            size = _read_size(handle)
+            if element_id == wanted and size is not None:
+                _parse_element(handle, element_id, handle.tell() + size, result, timing, seeks)
 
-    if duration is not None:
-        result["seconds"] = duration * timecode_scale / 1e9
+    if timing["duration"] is not None:
+        result["seconds"] = timing["duration"] * timing["scale"] / 1e9
     return result
+
+
+def _size_only_row(path):
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        size = 0
+    return {"size": str(size), "seconds": "", "resolution": "", "video": "", "audio": "", "subs": "",
+            "chapters": "", "title": "", "probed": False}
 
 
 def probe_row(path):
     """
-    The catalog's probe columns for one file, as strings.
+    The catalog's probe columns for one file, as strings.  Never raises.
 
-    A file that is not Matroska (or cannot be read) gets its size and blank
-    probe fields, so it still appears in an inventory.
+    A file that is not Matroska, cannot be read or has a corrupt header gets
+    its size and blank probe fields, so it still appears in an inventory.  A
+    corrupt header is logged as a warning.
 
     :return: dict with ``size``, ``seconds``, ``resolution``, ``video``,
              ``audio``, ``subs``, ``chapters``, ``title`` and ``probed`` (bool)
     """
     try:
         info = probe(path)
-    except (NotMatroska, OSError, struct.error):
-        try:
-            size = os.path.getsize(path)
-        except OSError:
-            size = 0
-        return {"size": str(size), "seconds": "", "resolution": "", "video": "", "audio": "", "subs": "",
-                "chapters": "", "title": "", "probed": False}
+    except (NotMatroska, OSError):
+        return _size_only_row(path)
+    except Exception as err:  # optional metadata: a corrupt header must never stop the caller
+        log.warning("%s: unreadable Matroska header (%s: %s); listed by size only", path, type(err).__name__, err)
+        return _size_only_row(path)
     return {"size": str(info["size"]),
             "seconds": "%.0f" % info["seconds"] if info["seconds"] >= 0 else "",
             "resolution": "%dx%d" % (info["width"], info["height"]),

@@ -42,10 +42,15 @@ Catalog records:
   media file shipped with what its Matroska header says (size, duration,
   resolution, codecs, chapters).  A media catalog that keeps discs, cases and
   files as records can be fed from these instead of a separate probe.
-* The record is built while the files are still local, written to
-  ``catalog_spool_path`` once rsync has delivered the folder, then shipped
-  with its own rsync and removed from the spool.  A record whose transfer
-  failed waits in the spool and goes on the next run, before anything else.
+* The record is built before the folder's rsync starts, while every file is
+  still local, and written to ``catalog_spool_path`` as ``<name>.pending``.
+  A run that is interrupted and resumed reuses that pending record instead of
+  describing only the files still left.  Once rsync has delivered the whole
+  folder the record is renamed to ``<name>.toml``, shipped with its own rsync
+  and removed from the spool.  A record whose transfer failed waits in the
+  spool and goes on the next run, before anything else.
+* The record is optional metadata: nothing about building or spooling it can
+  stop a folder from shipping.
 """
 
 import argparse
@@ -54,6 +59,7 @@ import datetime
 import fcntl
 import logging
 import os
+import re
 import shlex
 import socket
 import sqlite3
@@ -69,6 +75,9 @@ SUCCESS_STATUS = "success"
 FINISHED_STATUSES = ("success", "fail")
 VIDEO_TYPES = {"movies": "movie", "tv": "series"}
 RECORD_SUFFIX = ".toml"
+PENDING_SUFFIX = ".pending"
+"""A record built before its folder's transfer finished; renamed to RECORD_SUFFIX once the folder has shipped."""
+TMP_SUFFIX = ".tmp"
 MEDIA_EXTENSIONS = (".mkv", ".mp4", ".m4v", ".webm", ".avi", ".ts")
 """Files a job folder holds that belong in a media catalog; sidecars (disc.jpg, disc.barcode, posters) do not."""
 UHD_MIN_WIDTH = 3000
@@ -105,6 +114,10 @@ log = logging.getLogger("arm-completed-shipper")
 
 class ShipperError(Exception):
     """Configuration or environment problem that stops the run."""
+
+
+class RecordError(Exception):
+    """A catalog record could not be spooled (already logged, with its text); the folder still ships."""
 
 
 # --------------------------------------------------------------------------- config
@@ -312,15 +325,25 @@ def ship_folder(cfg, sub_folder, local_folder, dry_run=False, verbose=False, job
     """
     Rsync one job folder and remove the local copy on success.  Returns True on success.
 
-    With ``job`` (its ARM database row) and ``remote_catalog_path`` set, a catalog
-    record is built from the files before rsync removes them and shipped after
-    the folder.  A record that fails to ship stays in the spool for the next run;
-    the folder, already on the media box, still counts as shipped, but the run
-    exits 1 (``stats["failed"]``) so the problem is noticed.
+    With ``job`` (its ARM database row) and ``remote_catalog_path`` set, a
+    catalog record is spooled as ``.pending`` before rsync starts (or the one an
+    interrupted earlier run left is reused), renamed to ``.toml`` once the
+    folder has shipped completely, and shipped after the folder.  A record that
+    fails to ship stays in the spool for the next run; the folder, already on
+    the media box, still counts as shipped, but the run exits 1
+    (``stats["failed"]``) so the problem is noticed.  A record that cannot be
+    built or spooled never stops the folder itself from shipping.
     """
-    record = None
+    pending = None
     if job is not None and cfg["remote_catalog_path"] and sub_folder != UNIDENTIFIED:
-        record = catalog_record(cfg, sub_folder, local_folder, job)
+        try:
+            pending = prepare_record(cfg, sub_folder, local_folder, job, dry_run=dry_run)
+        except Exception as err:  # optional metadata: never block the transfer
+            if not isinstance(err, RecordError):
+                log.exception("could not prepare the catalog record for %s; shipping the folder without it",
+                              local_folder)
+            if stats is not None:
+                stats["failed"] += 1
     cmd = build_rsync_command(cfg, sub_folder, local_folder, dry_run=dry_run, verbose=verbose)
     log.info("shipping [%s] %s -> %s", sub_folder, local_folder, cmd[-1])
     log.debug("rsync argv: %s", " ".join(shlex.quote(part) for part in cmd))
@@ -330,18 +353,15 @@ def ship_folder(cfg, sub_folder, local_folder, dry_run=False, verbose=False, job
         return False
     if dry_run:
         log.info("dry run: would remove %s", local_folder)
-        if record:
-            log.info("dry run: would write catalog record %s", record[0])
-            log.debug("catalog record:\n%s", record[1])
         return True
     prune_empty_dirs(local_folder)
     if os.path.exists(local_folder):
         log.error("rsync succeeded but %s still has content; not treating as shipped", local_folder)
         return False
     log.info("shipped and removed %s", local_folder)
-    if record:
-        spooled = spool_record(cfg, *record)
-        if spooled and ship_record(cfg, spooled):
+    if pending:
+        finished = finish_record(pending)
+        if finished and ship_record(cfg, finished):
             if stats is not None:
                 stats["records"] += 1
         elif stats is not None:
@@ -430,14 +450,24 @@ def disc_format(job, rows):
     return "dvd" if widest else "bd"
 
 
-def record_name(cfg, job):
+def _job_tag(job):
+    """``-job<id>``, the part of a record name that identifies its job."""
+    return f"-job{job.get('job_id') or 0}"
+
+
+def record_name(cfg, job, suffix=RECORD_SUFFIX):
     """``<stop time>-<ripper>-job<id>.toml``: sorts by rip time and is the same whenever the job is re-shipped."""
     stamp = _clean(job.get("stop_time"))
     try:
         when = datetime.datetime.fromisoformat(stamp) if stamp else datetime.datetime.now()
     except ValueError:
         when = datetime.datetime.now()
-    return f"{when.strftime('%Y%m%d-%H%M%S')}-{cfg['ripper_name']}-job{job.get('job_id') or 0}{RECORD_SUFFIX}"
+    return f"{when.strftime('%Y%m%d-%H%M%S')}-{cfg['ripper_name']}{_job_tag(job)}{suffix}"
+
+
+def library_path(sub_folder, local_folder):
+    """``<sub folder>/<job folder>``: the record's ``library`` key, and where the folder sits under completed_path."""
+    return f"{sub_folder}/{os.path.basename(local_folder.rstrip(os.sep))}"
 
 
 def catalog_record(cfg, sub_folder, local_folder, job):
@@ -445,15 +475,16 @@ def catalog_record(cfg, sub_folder, local_folder, job):
     Build the catalog record for one job folder about to ship.
 
     Reads the Matroska header of every media file in the folder, so it must run
-    before rsync removes them.  Returns ``(file name, TOML text)``, or None when
-    the folder holds no media file (nothing for a catalog to register).
+    before rsync starts removing them.  Returns ``(file name, TOML text)`` (the
+    name ends in ``.toml``), or None when the folder holds no media file
+    (nothing for a catalog to register).
     """
     files = folder_media_files(local_folder)
     if not files:
         log.warning("no media file in %s; no catalog record written", local_folder)
         return None
     folder = os.path.basename(local_folder.rstrip(os.sep))
-    library = f"{sub_folder}/{folder}"
+    library = library_path(sub_folder, local_folder)
     rows = []
     for relative in files:
         row = mkvheader.probe_row(os.path.join(local_folder, relative))
@@ -502,18 +533,184 @@ def catalog_record(cfg, sub_folder, local_folder, job):
     return record_name(cfg, job), "\n".join(lines) + "\n"
 
 
+def _write_atomically(path, text):
+    """Write ``text`` to ``path`` via ``path.tmp`` and ``os.replace``, so a kill never leaves a truncated file."""
+    tmp = path + TMP_SUFFIX
+    try:
+        with open(tmp, "w", encoding="utf-8") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+
+
 def spool_record(cfg, name, text):
-    """Write a record into the spool.  Returns its path, or None when the spool is not writable."""
+    """
+    Write a record into the spool atomically.  Returns its path, or None when the spool is not writable.
+
+    On failure the record's text is logged at error level, so it can still be
+    recovered from the journal.
+    """
+    path = os.path.join(cfg["catalog_spool_path"], name)
     try:
         os.makedirs(cfg["catalog_spool_path"], exist_ok=True)
-        path = os.path.join(cfg["catalog_spool_path"], name)
-        with open(path, "w", encoding="utf-8") as handle:
-            handle.write(text)
+        _write_atomically(path, text)
     except OSError as err:
-        log.error("could not write catalog record %s: %s", name, err)
+        log.error("could not write catalog record %s: %s; its text follows so it can be recovered:\n%s",
+                  path, err, text)
         return None
     log.info("catalog record %s written", path)
     return path
+
+
+_TOML_ESCAPES = {'"': '"', "\\": "\\", "b": "\b", "t": "\t", "n": "\n", "f": "\f", "r": "\r"}
+
+
+def _toml_unescape(body):
+    """The value of a TOML basic string's body (between the quotes), as :func:`_toml_string` escapes it."""
+    def replace(match):
+        code = match.group(1)
+        if code[0] in "uU":
+            return chr(int(code[1:], 16))
+        return _TOML_ESCAPES.get(code, code)
+    return re.sub(r'\\(u[0-9A-Fa-f]{4}|U[0-9A-Fa-f]{8}|.)', replace, body)
+
+
+def read_record_key(path, key):
+    """
+    One top-level key of a record file; None when the key or file is absent or the file is unreadable.
+
+    A string value comes back unescaped; any other value (a number, a boolean)
+    as its TOML text.  Only the top-level keys before the first ``[[files]]``
+    table are looked at.  Enough TOML for the records this shipper writes,
+    without needing ``tomllib`` (Python 3.11+).
+    """
+    try:
+        with open(path, encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if line.startswith("["):
+                    break
+                name, sep, value = line.partition(" = ")
+                if not sep or name != key:
+                    continue
+                if len(value) >= 2 and value[0] == value[-1] == '"':
+                    return _toml_unescape(value[1:-1])
+                return value
+    except FileNotFoundError:
+        pass
+    except (OSError, UnicodeDecodeError) as err:
+        log.warning("could not read catalog record %s: %s", path, err)
+    return None
+
+
+def _spooled(cfg, suffix):
+    """Spool entries ending in ``suffix``, oldest name first."""
+    spool = cfg["catalog_spool_path"]
+    if not os.path.isdir(spool):
+        return []
+    return [os.path.join(spool, name) for name in sorted(os.listdir(spool)) if name.endswith(suffix)]
+
+
+def pending_record_path(cfg, job, library=None):
+    """
+    The ``.pending`` record an earlier run spooled for ``job``, or None.
+
+    Matched on the ``-job<id>.pending`` end of the name only, so a changed
+    ripper name or rip-time format cannot orphan it.  With ``library`` (see
+    :func:`library_path`) a pending record whose ``library`` key names another
+    folder (a job id reused after an ARM database reset) is not returned.
+    When several match, the newest name wins.
+    """
+    tail = _job_tag(job) + PENDING_SUFFIX
+    matches = [path for path in _spooled(cfg, tail)
+               if library is None or read_record_key(path, "library") == library]
+    return matches[-1] if matches else None
+
+
+def prepare_record(cfg, sub_folder, local_folder, job, dry_run=False):
+    """
+    The ``.pending`` record for a folder about to ship: the one an earlier run spooled, or a new one.
+
+    Called before the folder's rsync starts, so a new record describes every
+    file even when this transfer is interrupted and resumed later.  Returns
+    the pending record's path, or None when there is nothing to ship (no media
+    file, or a dry run).
+
+    :raises RecordError: when the spool is not writable (the record's text has been logged)
+    """
+    existing = pending_record_path(cfg, job, library_path(sub_folder, local_folder))
+    if existing:
+        log.info("reusing catalog record %s from an earlier, unfinished transfer", existing)
+        return existing
+    built = catalog_record(cfg, sub_folder, local_folder, job)
+    if built is None:
+        return None
+    name, text = built
+    name = name[:-len(RECORD_SUFFIX)] + PENDING_SUFFIX
+    if dry_run:
+        log.info("dry run: would write catalog record %s", name)
+        log.debug("catalog record:\n%s", text)
+        return None
+    path = spool_record(cfg, name, text)
+    if path is None:
+        raise RecordError(name)
+    return path
+
+
+def finish_record(pending_path):
+    """
+    Turn a ``.pending`` record into a ``.toml`` one once its folder has shipped.  Returns the new path or None.
+
+    ``shipped`` is set to now, the time the transfer finished.  Both steps use
+    ``os.replace``, so a kill leaves either the (possibly updated) ``.pending``
+    or the ``.toml``, never a truncated file.
+    """
+    final = pending_path[:-len(PENDING_SUFFIX)] + RECORD_SUFFIX
+    try:
+        with open(pending_path, encoding="utf-8") as handle:
+            text = handle.read()
+        stamp = _toml_lines([("shipped", datetime.datetime.now().replace(microsecond=0).isoformat())])[0]
+        text, count = re.subn(r"(?m)^shipped = .*$", lambda _: stamp, text, count=1)
+        if count:
+            _write_atomically(pending_path, text)
+        os.replace(pending_path, final)
+    except OSError as err:
+        log.error("could not finish catalog record %s: %s; the next run retries it", pending_path, err)
+        return None
+    return final
+
+
+def settle_pending_records(cfg, dry_run=False):
+    """
+    Finish ``.pending`` records whose job folder is no longer in completed_path.
+
+    That happens when a run was killed after the folder shipped but before its
+    record was renamed, and when a folder was removed by hand.  The shipper
+    cannot list the media box to tell the two apart, so it assumes the folder
+    shipped: the record becomes ``.toml`` (and ships with the others), with a
+    warning naming it.  A pending record whose folder is still there is left
+    for :func:`ship_folder` to reuse.
+    """
+    for pending in _spooled(cfg, PENDING_SUFFIX):
+        library = read_record_key(pending, "library")
+        if not library:
+            log.warning("catalog record %s names no library folder; leaving it in the spool", pending)
+            continue
+        if os.path.isdir(os.path.join(cfg["completed_path"], library)):
+            continue
+        if dry_run:
+            log.info("dry run: would finish catalog record %s (%s is gone)", pending, library)
+            continue
+        log.warning("%s is no longer in %s; assuming it shipped and finishing its catalog record %s",
+                    library, cfg["completed_path"], os.path.basename(pending))
+        finish_record(pending)
 
 
 def record_destination(cfg):
@@ -552,17 +749,15 @@ def ship_record(cfg, record_path):
 
 
 def pending_records(cfg):
-    """Spooled records, oldest name first."""
-    spool = cfg["catalog_spool_path"]
-    if not os.path.isdir(spool):
-        return []
-    return [os.path.join(spool, name) for name in sorted(os.listdir(spool)) if name.endswith(RECORD_SUFFIX)]
+    """Finished (``.toml``) records waiting in the spool, oldest name first; never ``.pending`` or ``.tmp`` ones."""
+    return _spooled(cfg, RECORD_SUFFIX)
 
 
 def ship_pending_records(cfg, dry_run, stats):
     """Ship records left over from earlier runs.  Returns True when none is left."""
     if not cfg["remote_catalog_path"]:
         return True
+    settle_pending_records(cfg, dry_run)
     all_clear = True
     for record_path in pending_records(cfg):
         if dry_run:

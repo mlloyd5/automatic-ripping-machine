@@ -17,8 +17,10 @@ import stat
 import struct
 import subprocess
 import sys
+import random
 import tempfile
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -27,10 +29,19 @@ import mkvheader  # noqa: E402
 
 FAKE_RSYNC = """#!/bin/sh
 # Test double: log the call, optionally fail, otherwise run the real rsync.
+# SHIPPER_TEST_INTERRUPT_FOR / _BEFORE: for a matching call, transfer (and remove) everything except
+# the files matching the _BEFORE exclude pattern, then exit as if the run had been killed.
 printf '%s\\n' "$*" >> "$SHIPPER_TEST_LOG"
 if [ -n "$SHIPPER_TEST_FAIL_FOR" ]; then
     case "$*" in
         *"$SHIPPER_TEST_FAIL_FOR"*) echo "fake rsync: forced failure" >&2; exit 23 ;;
+    esac
+fi
+if [ -n "$SHIPPER_TEST_INTERRUPT_FOR" ]; then
+    case "$*" in
+        *"$SHIPPER_TEST_INTERRUPT_FOR"*)
+            "$SHIPPER_TEST_REAL_RSYNC" --exclude="$SHIPPER_TEST_INTERRUPT_BEFORE" "$@"
+            echo "fake rsync: interrupted" >&2; exit 20 ;;
     esac
 fi
 exec "$SHIPPER_TEST_REAL_RSYNC" "$@"
@@ -60,7 +71,8 @@ class ShipperFixture(unittest.TestCase):
         self.assertIsNotNone(real, "rsync must be installed to run this test")
         os.environ["SHIPPER_TEST_LOG"] = self.log
         os.environ["SHIPPER_TEST_REAL_RSYNC"] = real
-        os.environ.pop("SHIPPER_TEST_FAIL_FOR", None)
+        for name in ("SHIPPER_TEST_FAIL_FOR", "SHIPPER_TEST_INTERRUPT_FOR", "SHIPPER_TEST_INTERRUPT_BEFORE"):
+            os.environ.pop(name, None)
 
         self.conf = os.path.join(self.tmp, "shipper.conf")
         with open(self.conf, "w") as handle:
@@ -372,11 +384,25 @@ def ebml(element_id, payload):
     return bytes.fromhex(element_id) + (size | (1 << (7 * length))).to_bytes(length, "big") + payload
 
 
+def seek_head(entries):
+    """A SeekHead for (element id hex, position) pairs; 8-byte positions keep its size fixed."""
+    return ebml("114D9B74", b"".join(
+        ebml("4DBB", ebml("53AB", bytes.fromhex(element)) + ebml("53AC", position.to_bytes(8, "big")))
+        for element, position in entries))
+
+
 def make_mkv(path, width=3840, height=2160, seconds=5400.0, video="V_MPEGH/ISO/HEVC",
-             audio=(("eng", "A_TRUEHD"), ("und", "A_AC3")), subs=2, chapters=3, title="Test Title"):
-    """Write a Matroska file with just the header elements a catalog reads, then one Cluster."""
+             audio=(("eng", "A_TRUEHD"), ("und", "A_AC3")), subs=2, chapters=3, title="Test Title",
+             chapters_after_cluster=False, seek_position=None):
+    """
+    Write a Matroska file with just the header elements a catalog reads, then one Cluster.
+
+    With ``chapters_after_cluster`` the Chapters element follows the Cluster and a SeekHead at the
+    top of the Segment points at it (or at ``seek_position``, when given).
+    """
     header = ebml("1A45DFA3", ebml("4286", 1) + ebml("4282", "matroska") + ebml("4287", 4) + ebml("4285", 2))
-    info = ebml("1549A966", ebml("2AD7B1", 1000000) + ebml("4489", struct.pack(">d", seconds * 1000)) + ebml("7BA9", title))
+    info = ebml("1549A966", ebml("2AD7B1", 1000000) + ebml("4489", struct.pack(">d", seconds * 1000))
+                + ebml("7BA9", title))
     tracks = ebml("AE", ebml("D7", 1) + ebml("83", 1) + ebml("86", video)
                   + ebml("E0", ebml("B0", width) + ebml("BA", height)))
     for number, (lang, codec) in enumerate(audio, 2):
@@ -387,8 +413,27 @@ def make_mkv(path, width=3840, height=2160, seconds=5400.0, video="V_MPEGH/ISO/H
     atoms = b"".join(ebml("B6", ebml("73C4", 1000 + n) + ebml("91", n * 1000000)) for n in range(chapters))
     chapter_element = ebml("1043A770", ebml("45B9", ebml("45BC", 1) + atoms)) if chapters else b""
     cluster = ebml("1F43B675", ebml("E7", 0) + ebml("A3", b"\x81\x00\x00\x80" + b"\x00" * 64))
+    if chapters_after_cluster:
+        head_size = len(seek_head([("1043A770", 0)]))
+        if seek_position is None:
+            seek_position = head_size + len(info + tracks + cluster)
+        segment = seek_head([("1043A770", seek_position)]) + info + tracks + cluster + chapter_element
+    else:
+        segment = info + tracks + chapter_element + cluster
     with open(path, "wb") as handle:
-        handle.write(header + ebml("18538067", info + tracks + chapter_element + cluster))
+        handle.write(header + ebml("18538067", segment))
+    return path
+
+
+def corrupt_language_size(path, declared=1 << 50):
+    """Rewrite the first audio Language element ("eng") of a make_mkv file to declare ``declared`` bytes."""
+    with open(path, "rb") as handle:
+        data = handle.read()
+    good = bytes.fromhex("22B59C") + b"\x83eng"
+    bad = bytes.fromhex("22B59C") + ((1 << 56) | declared).to_bytes(8, "big") + b"eng"
+    assert data.count(good) == 1
+    with open(path, "wb") as handle:
+        handle.write(data.replace(good, bad))
     return path
 
 
@@ -444,6 +489,69 @@ class MatroskaHeader(unittest.TestCase):
         lines = result.stdout.splitlines()
         self.assertEqual(len(lines), 2)
         self.assertEqual(lines[0].split("\t")[3], "3840x2160")
+
+    def test_seekhead_is_followed_to_elements_after_the_cluster(self):
+        path = make_mkv(os.path.join(self.tmp, "late.mkv"), chapters=5, chapters_after_cluster=True)
+        info = mkvheader.probe(path)
+        self.assertEqual(info["chapters"], 5)
+        self.assertEqual((info["width"], info["title"]), (3840, "Test Title"))
+
+    def test_seekhead_past_the_end_of_a_truncated_file_is_skipped(self):
+        path = make_mkv(os.path.join(self.tmp, "short.mkv"), chapters_after_cluster=True, seek_position=1 << 40)
+        info = mkvheader.probe(path)
+        self.assertEqual((info["chapters"], info["width"], info["title"]), (0, 3840, "Test Title"))
+
+    def test_absurd_seekhead_position_gives_the_size_only_row(self):
+        path = make_mkv(os.path.join(self.tmp, "seek.mkv"), chapters_after_cluster=True, seek_position=1 << 63)
+        with self.assertRaises(mkvheader.MalformedHeader):
+            mkvheader.probe(path)
+        with self.assertLogs("mkvheader", "WARNING"):
+            row = mkvheader.probe_row(path)
+        self.assertFalse(row["probed"])
+        self.assertEqual(row["size"], str(os.path.getsize(path)))
+        self.assertEqual(row["resolution"], "")
+
+    def test_corrupt_element_size_is_refused_not_read(self):
+        path = corrupt_language_size(make_mkv(os.path.join(self.tmp, "lang.mkv")))
+        with self.assertRaises(mkvheader.MalformedHeader):
+            mkvheader.probe(path)
+        with self.assertLogs("mkvheader", "WARNING") as logs:
+            row = mkvheader.probe_row(path)
+        self.assertFalse(row["probed"])
+        self.assertEqual(row["size"], str(os.path.getsize(path)))
+        self.assertIn("lang.mkv", logs.output[0])
+
+    def test_truncation_at_every_offset_never_escapes(self):
+        path = make_mkv(os.path.join(self.tmp, "full.mkv"), chapters_after_cluster=True)
+        with open(path, "rb") as handle:
+            data = handle.read()
+        cut = os.path.join(self.tmp, "cut.mkv")
+        for length in range(len(data)):
+            with open(cut, "wb") as handle:
+                handle.write(data[:length])
+            try:
+                mkvheader.probe(cut)
+            except (mkvheader.NotMatroska, mkvheader.MalformedHeader):
+                pass
+            with self.assertLogs("mkvheader", "DEBUG"):
+                mkvheader.log.debug("keep assertLogs happy when probe_row logs nothing")
+                self.assertEqual(mkvheader.probe_row(cut)["size"], str(length))
+
+    def test_random_byte_flips_only_raise_parser_errors(self):
+        path = make_mkv(os.path.join(self.tmp, "fuzz.mkv"))
+        with open(path, "rb") as handle:
+            data = handle.read()
+        fuzzed = os.path.join(self.tmp, "fuzzed.mkv")
+        rng = random.Random(11)
+        for _ in range(1500):
+            mutated = bytearray(data)
+            mutated[rng.randrange(160)] = rng.randrange(256)
+            with open(fuzzed, "wb") as handle:
+                handle.write(mutated)
+            try:
+                mkvheader.probe(fuzzed)
+            except (mkvheader.NotMatroska, mkvheader.MalformedHeader):
+                pass
 
 
 # ---------------------------------------------------------------------- catalog records
@@ -601,6 +709,152 @@ class CatalogRecords(ShipperFixture):
     def test_toml_strings_are_escaped(self):
         self.assertEqual(shipper._toml_string('He said "hi" \\ there'), '"He said \\"hi\\" \\\\ there"')
         self.assertEqual(shipper._toml_string("tab\there"), '"tab\\u0009here"')
+
+    # ------------------------------------------------------------------ pending records
+
+    def _cfg(self):
+        return shipper.load_config(self.conf)
+
+    def _record_files(self, name):
+        with open(os.path.join(self.records, name)) as handle:
+            return parse_record(handle.read())
+
+    def test_interrupted_transfer_keeps_the_record_built_from_the_complete_folder(self):
+        # Run 1 delivers (and removes) the feature, then dies before extras/.
+        os.environ["SHIPPER_TEST_INTERRUPT_FOR"] = "Movie A (2001)"
+        os.environ["SHIPPER_TEST_INTERRUPT_BEFORE"] = "extras"
+        self.assertEqual(self._run(), 1)
+        local = self._local("movies", "Movie A (2001)")
+        self.assertFalse(os.path.exists(os.path.join(local, "Movie A (2001).mkv")))
+        self.assertTrue(os.path.isfile(os.path.join(local, "extras", "trailer.mkv")))
+        spooled = self._spooled()
+        self.assertEqual(spooled, ["20261025-140311-ts140-job1.pending"])
+        self.assertFalse(any(n.endswith(".toml") and "-job1" in n for n in self._records()))
+
+        # Run 2 finishes the folder and ships the record written while the feature was still local.
+        for name in ("SHIPPER_TEST_INTERRUPT_FOR", "SHIPPER_TEST_INTERRUPT_BEFORE"):
+            os.environ.pop(name)
+        self.assertEqual(self._run(), 0)
+        self.assertFalse(os.path.exists(local))
+        self.assertEqual(self._spooled(), [])
+        top, files = self._record_files("20261025-140311-ts140-job1.toml")
+        self.assertEqual([f["path"] for f in files],
+                         ["movies/Movie A (2001)/Movie A (2001).mkv", "movies/Movie A (2001)/extras/trailer.mkv"])
+        self.assertEqual([f["main"] for f in files], [True, False])
+        self.assertEqual((top["role"], top["format"]), ("feature", "uhd"))
+        self.assertEqual(files[0]["resolution"], "3840x2160")
+
+    def test_record_is_spooled_pending_before_rsync_starts(self):
+        seen = []
+        real_run = subprocess.run
+
+        def spy(cmd, *args, **kwargs):
+            if "--remove-source-files" in cmd and "Movie A" in cmd[-2]:
+                seen.append(sorted(os.listdir(self.spool)))
+            return real_run(cmd, *args, **kwargs)
+
+        with mock.patch.object(shipper.subprocess, "run", side_effect=spy):
+            self.assertEqual(self._run(), 0)
+        # Written atomically: the pending record alone, no .tmp beside it.
+        self.assertEqual(seen, [["20261025-140311-ts140-job1.pending"]])
+        self.assertEqual(self._spooled(), [])
+
+    def test_spool_writes_are_atomic(self):
+        cfg = self._cfg()
+        path = shipper.spool_record(cfg, "x-job9.pending", 'library = "movies/X"\n')
+        self.assertEqual(self._spooled(), ["x-job9.pending"])
+        with open(path) as handle:
+            self.assertEqual(handle.read(), 'library = "movies/X"\n')
+        # A write that fails part-way leaves neither a truncated record nor its .tmp.
+        with mock.patch.object(shipper.os, "replace", side_effect=OSError("disk full")):
+            with self.assertLogs("arm-completed-shipper", "ERROR"):
+                self.assertIsNone(shipper.spool_record(cfg, "y-job10.pending", "text"))
+        self.assertEqual(self._spooled(), ["x-job9.pending"])
+
+    def test_pending_and_tmp_records_are_never_shipped(self):
+        os.makedirs(self.spool)
+        # Movie A's folder is still in completed_path: its pending record waits for ship_folder.
+        for name in ("20261025-140311-ts140-job1.pending", "20261025-140311-ts140-job1.pending.tmp",
+                     "20261025-140311-ts140-job1.toml.tmp"):
+            with open(os.path.join(self.spool, name), "w") as handle:
+                handle.write('library = "movies/Movie A (2001)"\n')
+        cfg = self._cfg()
+        self.assertEqual(shipper.pending_records(cfg), [])
+        stats = {"shipped": 0, "failed": 0, "records": 0}
+        self.assertTrue(shipper.ship_pending_records(cfg, False, stats))
+        self.assertEqual(self._records(), [])
+        self.assertEqual(len(self._spooled()), 3)
+        self.assertEqual(self._calls(), [])
+
+    def test_pending_record_of_a_vanished_folder_is_finished_and_shipped(self):
+        os.makedirs(self.spool)
+        with open(os.path.join(self.spool, "20200101-000000-ts140-job77.pending"), "w") as handle:
+            handle.write('ripper = "ts140"\njob = 77\nshipped = "2020-01-01T00:00:00"\n'
+                         'library = "movies/Gone (1999)"\n\n[[files]]\npath = "movies/Gone (1999)/Gone (1999).mkv"\n')
+        cfg = self._cfg()
+        stats = {"shipped": 0, "failed": 0, "records": 0}
+        with self.assertLogs("arm-completed-shipper", "WARNING") as logs:
+            self.assertTrue(shipper.ship_pending_records(cfg, False, stats))
+        self.assertIn("movies/Gone (1999)", "\n".join(logs.output))
+        self.assertEqual(self._records(), ["20200101-000000-ts140-job77.toml"])
+        self.assertEqual(self._spooled(), [])
+        top, _ = self._record_files("20200101-000000-ts140-job77.toml")
+        self.assertNotEqual(top["shipped"], "2020-01-01T00:00:00")
+
+    def test_pending_record_lookup_and_key_reader(self):
+        cfg = self._cfg()
+        job = {"job_id": 1, "stop_time": "2026-10-25 14:03:11"}
+        self.assertIsNone(shipper.pending_record_path(cfg, job))
+        shipper.spool_record(cfg, "20261025-140311-old-name-job1.pending",
+                             'title = "Say \\"hi\\" \\\\ \\u0009"\njob = 1\nlibrary = "movies/Movie A (2001)"\n'
+                             'destination = "/m/Movie A (2001)"\n\n[[files]]\npath = "x"\n')
+        shipper.spool_record(cfg, "20261025-140311-ts140-job11.pending", 'library = "movies/Other"\n')
+        # Found by job id alone, whatever the ripper or time parts of the name say.
+        found = shipper.pending_record_path(cfg, job)
+        self.assertEqual(os.path.basename(found), "20261025-140311-old-name-job1.pending")
+        self.assertEqual(shipper.pending_record_path(cfg, job, "movies/Movie A (2001)"), found)
+        self.assertIsNone(shipper.pending_record_path(cfg, job, "movies/Somewhere Else"))
+        self.assertEqual(shipper.read_record_key(found, "destination"), "/m/Movie A (2001)")
+        self.assertEqual(shipper.read_record_key(found, "title"), 'Say "hi" \\ \t')
+        self.assertEqual(shipper.read_record_key(found, "job"), "1")
+        self.assertIsNone(shipper.read_record_key(found, "path"))  # inside [[files]], not top level
+        self.assertIsNone(shipper.read_record_key(found + ".absent", "library"))
+        self.assertEqual(shipper.record_name(cfg, job, shipper.PENDING_SUFFIX), "20261025-140311-ts140-job1.pending")
+
+    def test_unwritable_spool_logs_the_record_and_still_ships(self):
+        blocker = os.path.join(self.tmp, "not-a-dir")
+        with open(blocker, "w") as handle:
+            handle.write("")
+        with open(self.conf, "a") as handle:
+            handle.write(f"catalog_spool_path = {blocker}/spool\n")
+        with self.assertLogs("arm-completed-shipper", "ERROR") as logs:
+            self.assertEqual(self._run(), 1)
+        self.assertFalse(os.path.exists(self._local("movies", "Movie A (2001)")))
+        self.assertEqual(self._records(), [])
+        text = "\n".join(logs.output)
+        self.assertIn('title = "Movie A"', text)
+        self.assertIn('path = "movies/Movie A (2001)/Movie A (2001).mkv"', text)
+
+    def test_malformed_header_still_ships_the_folder_and_writes_a_record(self):
+        corrupt_language_size(os.path.join(self._local("movies", "Movie A (2001)"), "Movie A (2001).mkv"))
+        with self.assertLogs("mkvheader", "WARNING"):
+            self.assertEqual(self._run(), 0)
+        self.assertFalse(os.path.exists(self._local("movies", "Movie A (2001)")))
+        self.assertTrue(os.path.isfile(os.path.join(self._shipped("Movies", "Movie A (2001)"), "Movie A (2001).mkv")))
+        top, files = self._record_files("20261025-140311-ts140-job1.toml")
+        self.assertTrue(files[0]["main"])
+        self.assertGreater(files[0]["size"], 0)
+        self.assertNotIn("resolution", files[0])
+        self.assertEqual((top["role"], top["format"]), ("feature", "bd"))
+
+    def test_record_that_cannot_be_built_never_blocks_the_folder(self):
+        with mock.patch.object(shipper, "catalog_record", side_effect=RuntimeError("boom")):
+            with self.assertLogs("arm-completed-shipper", "ERROR"):
+                self.assertEqual(self._run(), 1)
+        self.assertFalse(os.path.exists(self._local("movies", "Movie A (2001)")))
+        self.assertFalse(os.path.exists(self._local("tv", "Show A (2010)")))
+        self.assertFalse(os.path.exists(self._local("unidentified", "UNKNOWN_DISC")))
+        self.assertEqual(self._records(), [])
 
 
 if __name__ == "__main__":

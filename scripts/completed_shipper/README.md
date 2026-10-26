@@ -177,7 +177,7 @@ each shipped `movies/` or `tv/` folder leaves one TOML record there, named
 ```toml
 ripper = "ts140"
 job = 12
-shipped = "2026-10-25T14:03:11"
+shipped = "2026-10-25T14:03:11"       # when the folder's transfer finished
 type = "movie"                       # movie | series, from the folder shipped
 title = "Back to the Future"
 year = 1985
@@ -218,15 +218,37 @@ listed by size alone.  Keys ARM did not fill (no barcode scanned, no sleeve
 label, a stock ARM database without those columns) are left out rather than
 written empty.
 
-The record is built while the files are still local, written to
-`catalog_spool_path` once rsync has delivered the folder, then copied with its
-own rsync to `remote_catalog_path` (which must exist; the same ssh key and
-options, no bandwidth cap) and removed from the spool.  A record whose copy
-failed stays in the spool, the run exits 1, and the next run ships it before
-anything else.  Unidentified rips get no record: the catalog cannot register a
-disc without a title, and those folders are renamed by hand anyway.  A folder
-with no media file (only sidecars) gets none either.  A dry run logs what it
-would write (`-v` prints the record) and touches nothing.
+The record is built before the folder's rsync starts, while every file is
+still local, and written atomically (via a `.tmp` file and a rename) to
+`catalog_spool_path` as `<name>.pending`.  If that transfer is interrupted,
+the next run finds the pending record by its `-job<id>.pending` ending and
+reuses it, so the record still lists the files the first run already
+delivered and removed.  Once rsync has exited 0 and the folder is empty, the
+record is renamed to `<name>.toml` (with `shipped` set to that moment), copied
+with its own rsync to `remote_catalog_path` (which must exist; the same ssh
+key and options, no bandwidth cap) and removed from the spool.  A record whose
+copy failed stays in the spool as `.toml`, the run exits 1, and the next run
+ships it before anything else.  Only `.toml` files are ever shipped from the
+spool; `.pending` and `.tmp` ones never are.
+
+A `.pending` record whose job folder is no longer in `completed_path` (the run
+was killed between the folder shipping and the rename, or the folder was
+removed by hand) is finished and shipped at the start of the next run, with a
+warning naming it: the shipper cannot list the media box to tell the two cases
+apart, so it assumes the folder shipped.  A pending record is matched to its
+folder by job id and its `library` key, so a job id reused after an ARM
+database reset never picks up another rip's record.
+
+The record is optional metadata and never stops a folder from shipping: a file
+whose Matroska header is corrupt is listed by size alone (with a warning), a
+record that cannot be built is logged and the folder ships without it, and a
+spool that cannot be written logs the record's full text at error level, so it
+can be recovered from the journal.  Those last two make the run exit 1.
+
+Unidentified rips get no record: the catalog cannot register a disc without a
+title, and those folders are renamed by hand anyway.  A folder with no media
+file (only sidecars) gets none either.  A dry run logs what it would write
+(`-v` prints the record) and touches nothing.
 
 Nothing here reads the records.  On the setup this was written for, the
 catalog lives in git on another machine and imports them from the media box
@@ -308,9 +330,13 @@ behaviour, resume after an interrupted copy, dry run, the lock, container to
 host path mapping (`arm_completed_path`), the rsync command shape (`-s`,
 `--partial-dir`, unquoted remote path), and the catalog records: their
 content from a database with and without the fork's columns, the Matroska
-header reader on hand-built files, a record whose transfer fails and ships on
-the next run, and that dry runs, unidentified rips and media-less folders
-leave none.
+header reader on hand-built files (SeekHead following, truncation at every
+byte offset, random byte flips, corrupt element sizes and positions), a record
+whose transfer fails and ships on the next run, an interrupted folder transfer
+whose record still lists every file, pending records (atomic writes, never
+shipped early, finished when their folder is gone), an unwritable spool, a
+corrupt header or failing record build that still ships the folder, and that
+dry runs, unidentified rips and media-less folders leave none.
 
 ```bash
 python3 -m unittest scripts/completed_shipper/test_arm_completed_shipper.py
