@@ -20,6 +20,7 @@ from arm.models import Job, Film
 
 from arm.ripper import utils
 from arm.ripper import disc_photo
+from arm.ripper import disc_vision
 from arm.ripper.ProcessHandler import arm_subprocess
 from arm.ui import db
 
@@ -114,6 +115,13 @@ def identify(job):
             except Exception as error:
                 logging.error(f"Barcode lookup failed: {error}", exc_info=True)
             if not res:
+                # The disc's own label, read by a vision model, names the release more precisely
+                # than the case does, and is more reliable than a label search on "CARTOONS_D3".
+                try:
+                    res = identify_from_photo_vision(job)
+                except Exception as error:
+                    logging.error(f"Disc photo vision lookup failed: {error}", exc_info=True)
+            if not res:
                 res = identify_collection_from_label(job)
             if job.disctype == "dvd":
                 res = identify_dvd(job, title_known=res) or res
@@ -125,7 +133,7 @@ def identify(job):
                 job.hasnicetitle = False
                 db.session.commit()
             if not job.hasnicetitle:
-                title_from_barcode_product(job)
+                title_from_disc_photo(job) or title_from_barcode_product(job)
 
             logging.info(f"Disc title Post ident -  title:{job.title} "
                          f"year:{job.year} video_type:{job.video_type} "
@@ -680,6 +688,85 @@ def identify_from_photo(job):
     return False
 
 
+def identify_from_photo_vision(job):
+    """
+    Identify the disc from what a vision model reads on its label in the webcam photo.
+
+    Runs for video discs not yet identified (``hasnicetitle`` is False) that have a photo, when
+    DISC_PHOTO_VISION_URL is set: after the case barcode and before the CRC64 database and the
+    label search, since the printed label names the release better than its volume label does.
+    What the model read is kept on the job (JSON) so the title fix pages can offer it and
+    :func:`title_from_disc_photo` can name the disc when nothing online matches. The title (and
+    the title with its subtitle) is searched online with the year read, exact matches only.
+
+    :return: True when a title was found from the photo
+    """
+    url = str(cfg.arm_config.get("DISC_PHOTO_VISION_URL", "") or "").strip()
+    if not url:
+        return False
+    if job.disctype not in ["dvd", "bluray"] or not job.disc_photo or job.hasnicetitle:
+        return False
+    photo_path = os.path.join(cfg.arm_config.get("DISC_PHOTO_PATH", ""), job.disc_photo)
+    if not os.path.isfile(photo_path):
+        logging.warning(f"Disc photo {photo_path} is missing, skipping the vision model")
+        return False
+
+    model = str(cfg.arm_config.get("DISC_PHOTO_VISION_MODEL", "") or disc_vision.DEFAULT_MODEL)
+    try:
+        timeout = int(cfg.arm_config.get("DISC_PHOTO_VISION_TIMEOUT") or disc_vision.DEFAULT_TIMEOUT)
+    except (TypeError, ValueError):
+        timeout = disc_vision.DEFAULT_TIMEOUT
+    logging.info(f"Disc not identified, asking vision model {model} at {url} about disc photo {job.disc_photo}")
+    answer = disc_vision.read_disc_photo(photo_path, url, model, timeout)
+    if not answer:
+        logging.info("Vision model could not read a title off the disc photo")
+        return False
+    logging.info(f"Vision model read title {answer['title']!r} subtitle {answer['subtitle']!r} "
+                 f"year {answer['year']!r} studio {answer['studio']!r} "
+                 f"(confidence {answer['confidence']:.2f}, rotated {answer.get('rotation')} degrees)")
+    utils.database_updater({'disc_photo_vision': json.dumps(answer)}, job)
+
+    for title in disc_vision.search_titles(answer):
+        best = search_film(title, answer['year'])
+        if best:
+            apply_search_result(job, best)
+            logging.info(f"Identified disc from photo as '{job.title}' ({job.year}) via '{title}'")
+            return True
+    logging.info("No title online is exactly what the vision model read; "
+                 "leaving the disc to its CRC64 record and label")
+    return False
+
+
+def title_from_disc_photo(job):
+    """
+    Name a disc nothing online matched after what the vision model read on its label.
+
+    Runs last in :func:`identify` for video discs still without a nice title, before
+    :func:`title_from_barcode_product`: the disc names itself more precisely than its case does
+    (job 34's case said "59 Cartoon Classics", the disc "Toon Time: Ultimate Cartoon Collection").
+    A title the disc itself supplied (a Blu-ray's bdmt_eng.xml) is kept, and a read the model was
+    not reasonably sure of is ignored. ``hasnicetitle`` stays False: this is a name, not an
+    identification.
+
+    :return: True when the title was set from the photo
+    """
+    if job.hasnicetitle or not getattr(job, 'disc_photo_vision', None):
+        return False
+    if job.title not in (None, "", "not identified") and str(job.title) != str(job.label):
+        return False
+    title, year = disc_vision.label_title(disc_vision.parse_answer(job.disc_photo_vision))
+    if not title:
+        return False
+    title = utils.clean_for_filename(title)
+    args = {'title': title, 'title_auto': title}
+    if year:
+        args.update({'year': year, 'year_auto': year})
+    logging.info(f"Nothing online matched the disc; naming it after its label as read from the photo: "
+                 f"'{title}' ({year})")
+    utils.database_updater(args, job)
+    return True
+
+
 def _provider_search(title, year=None):
     """
     Ask the configured metadata provider about a title without touching the job.
@@ -879,7 +966,8 @@ def title_from_barcode_product(job):
     """
     Name a disc nothing online matched after its case barcode's product title.
 
-    Runs last in :func:`identify` for video discs still without a nice title. A DVD whose
+    Runs last in :func:`identify` for video discs still without a nice title, after
+    :func:`title_from_disc_photo` (the disc's own label, when a vision model read it). A DVD whose
     barcode resolved to a product (``disc_barcode_title``) but whose title no provider has, and
     whose label found nothing exact either, would otherwise be filed under its label
     (``CARTOONS_D3``); the product title ("59 Cartoon Classics") is the better name for the
