@@ -38,6 +38,10 @@ class RipperException(Exception):
     pass
 
 
+class EmptyDriveException(RipperException):
+    """ARM was started for a drive that never had a disc loaded: nothing to rip, nothing to report."""
+
+
 def notify(job, title: str, body: str):
     """
     Send notifications with apprise\n
@@ -623,6 +627,14 @@ def put_track(job, t_no, seconds, aspect, fps, mainfeature, source, filename="",
     database_adder(job_track)
 
 
+def drive_ready_timeout() -> int:
+    """Seconds to wait for a drive to report a readable disc (DRIVE_READY_TIMEOUT, default 60)."""
+    try:
+        return max(int(cfg.arm_config.get("DRIVE_READY_TIMEOUT", 60)), 1)
+    except (TypeError, ValueError):
+        return 60
+
+
 def arm_setup(arm_log: Logger) -> None:
     """
     Setup arm - Create all the directories we need for arm to run
@@ -962,9 +974,9 @@ def attach_disc_photo(job) -> Optional[str]:
         logging.debug("Disc photo folder not configured or missing, skipping photo attach")
         return None
     try:
-        max_age = int(cfg.arm_config.get("DISC_PHOTO_MAX_AGE", 180))
+        max_age = int(cfg.arm_config.get("DISC_PHOTO_MAX_AGE", 600))
     except (TypeError, ValueError):
-        max_age = 180
+        max_age = 600
     before = job.start_time or datetime.datetime.now()
     devname = os.path.basename(str(job.devpath))
     filename = disc_photo.find_disc_photo(photo_dir, devname, before, max_age)
@@ -992,9 +1004,9 @@ def attach_disc_barcode(job) -> Optional[str]:
         logging.debug("Disc photo folder not configured or missing, skipping barcode attach")
         return None
     try:
-        max_age = int(cfg.arm_config.get("DISC_PHOTO_MAX_AGE", 180))
+        max_age = int(cfg.arm_config.get("DISC_PHOTO_MAX_AGE", 600))
     except (TypeError, ValueError):
-        max_age = 180
+        max_age = 600
     before = job.start_time or datetime.datetime.now()
     devname = os.path.basename(str(job.devpath))
     found = disc_photo.find_disc_barcode(photo_dir, devname, before, max_age)

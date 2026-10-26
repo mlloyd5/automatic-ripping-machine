@@ -29,15 +29,31 @@ from arm.ui import utils as ui_utils
 
 def find_mount(devpath: str) -> str | None:
     """
-    Find existing, readable mountpoint for ``devpath`` by calling ``findmnt``
+    Find an existing, readable mountpoint of the disc in ``devpath`` by calling ``findmnt``
+
+    Only mounts whose *source* is the device count. With a Proxmox LXC device passthrough the
+    device node is itself the target of a tiny tmpfs bind mount, and asking ``findmnt`` about the
+    path alone returns that mount, with ``/dev/sr0`` as the "mountpoint" of the disc.
 
     :return: Absolute path of mountpoint as ``str`` if any, else ``None``
     """
-    if output := arm_subprocess(["findmnt", "--json", devpath]):
-        mountpoints = json.loads(output)
-        for mountpoint in mountpoints["filesystems"]:
-            if os.access(mountpoint["target"], os.R_OK):
-                return mountpoint["target"]
+    try:
+        result = subprocess.run(["findmnt", "--json", "--source", devpath],
+                                capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError) as error:
+        logging.debug(f"findmnt could not be run: {error}")
+        return None
+    if result.returncode != 0 or not result.stdout.strip():
+        return None  # findmnt exits 1 when nothing is mounted from the device
+    try:
+        mountpoints = json.loads(result.stdout)
+    except ValueError:
+        logging.debug(f"findmnt returned no JSON: {result.stdout!r}")
+        return None
+    for mountpoint in mountpoints.get("filesystems") or []:
+        target = mountpoint.get("target")
+        if target and os.path.isdir(target) and os.access(target, os.R_OK):
+            return target
     return None
 
 

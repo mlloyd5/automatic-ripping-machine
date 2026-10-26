@@ -26,7 +26,7 @@ if find_spec("arm") is None:
 import arm.config.config as cfg  # noqa E402
 from arm.models.config import Config  # noqa: E402
 from arm.models.job import Job, JobState  # noqa: E402
-from arm.models.system_drives import SystemDrives  # noqa: E402
+from arm.models.system_drives import SystemDrives, CDS  # noqa: E402
 from arm.ripper import (arm_ripper, identify, logger,  # noqa: E402
                         music_brainz, utils)
 from arm.ripper.ARMInfo import ARMInfo  # noqa E402
@@ -51,6 +51,10 @@ def entry():
         action=argparse.BooleanOptionalAction,
     )
     return parser.parse_args()
+
+
+DISC_LOADING_STATES = (CDS.DRIVE_NOT_READY, CDS.NO_INFO)
+"""Tray states that mean a disc is in the drive but could not (yet) be read."""
 
 
 def log_udev_params(dev_path):
@@ -207,17 +211,18 @@ def setup():
     utils.arm_setup(arm_log)
     drive = SystemDrives.query.filter_by(mount=devpath).one()  # unique mounts
 
-    # With some drives and some disks, there is a race condition between creating the Job()
-    # below and the drive being ready, so give it a chance to get ready (observed with LG SP80NB80)
-    for num in range(1, 11):
-        drive.tray_status()
-        if drive.ready:
-            break
-        msg = f"[{num} of 10] Drive [{drive.mount}] appears to be empty or is not ready. Waiting 1s"
-        logging.info(msg)
-        time.sleep(1)
-    else:  # no break
-        raise utils.RipperException(f"Timed out waiting for drive to be ready (ioctl tray status: {drive.tray}).")
+    # udev starts ARM when the tray closes, which is well before some drives can read the disc
+    # (an LG SP80NB80 needs a moment, an HL-DT-ST DT80N ~16 s with a dual-layer DVD): wait for it.
+    timeout = utils.drive_ready_timeout()
+    seen = drive.wait_until_ready(timeout, logger=arm_log)
+    if not drive.ready:
+        states = ", ".join(state.name for state in seen)
+        if any(state in DISC_LOADING_STATES for state in seen):
+            raise utils.RipperException(
+                f"Timed out after {timeout}s waiting for drive {devpath} to be ready (tray status: {states})."
+            )
+        # Nothing was ever loaded: a tray left open, or a queued udev event replayed after the eject
+        raise utils.EmptyDriveException(f"No disc in drive {devpath} (tray status: {states}).")
 
     # ARM Job starts
     # Create new job
@@ -286,6 +291,8 @@ if __name__ == "__main__":
     try:
         setup()
         main()
+    except utils.EmptyDriveException as error:
+        logging.info(f"Nothing to rip: {error}")
     except Exception as error:
         logging.critical("A fatal error has occurred and ARM is exiting.")
         print_stacktrace = (

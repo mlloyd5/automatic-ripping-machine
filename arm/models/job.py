@@ -3,6 +3,7 @@ import logging
 import os
 import psutil
 import pyudev
+import shutil
 import subprocess
 import time
 
@@ -99,6 +100,65 @@ JOB_STATUS_TRANSCODING = {
     JobState.TRANSCODE_ACTIVE,
     JobState.TRANSCODE_WAITING,
 }
+
+
+_CDROM_ID_PATHS = ("/lib/udev/cdrom_id", "/usr/lib/udev/cdrom_id")
+_BLKID_PATHS = ("/sbin/blkid", "/usr/sbin/blkid", "/bin/blkid", "/usr/bin/blkid")
+_MEDIA_PROPERTY_PREFIXES = ("ID_CDROM_MEDIA", "ID_FS_")
+
+
+def _find_tool(name, fallbacks):
+    """``shutil.which`` plus the places udev helpers live that are not on a user's PATH."""
+    found = shutil.which(name)
+    if found:
+        return found
+    for candidate in fallbacks:
+        if os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
+def _run_properties(cmd, timeout=60):
+    """Run a udev helper and parse its ``KEY=VALUE`` output; empty on any failure."""
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.SubprocessError) as error:
+        logging.debug(f"{cmd[0]} could not be run: {error}")
+        return {}
+    if result.returncode != 0:
+        logging.debug(f"{cmd[0]} exited {result.returncode}: {result.stderr.strip()}")
+        return {}
+    properties = {}
+    for line in result.stdout.splitlines():
+        key, separator, value = line.partition("=")
+        if separator and key.strip():
+            properties[key.strip()] = value.strip()
+    return properties
+
+
+def read_media_properties(devpath):
+    """
+    Ask the drive itself what is loaded, with the helpers udev uses: ``cdrom_id`` for the media
+    type (ID_CDROM_MEDIA_DVD, ..._BD, ..._TRACK_COUNT_AUDIO) and ``blkid`` for ID_FS_LABEL.
+
+    udev's own copy of these properties can be stale when ARM starts: in the Docker image ARM
+    runs as the child of the udev worker for the drive, so the "disc ready" event that carries
+    the properties is still queued behind ARM itself, and the udev database shows the previous
+    state of the drive (nothing loaded, or the last disc).
+
+    :return: ``{"ID_CDROM_MEDIA": "1", ...}``, or ``{}`` when no medium is reported
+    """
+    cdrom_id = _find_tool("cdrom_id", _CDROM_ID_PATHS)
+    if cdrom_id is None:
+        logging.debug("cdrom_id not found; relying on udev for the disc properties")
+        return {}
+    properties = _run_properties([cdrom_id, devpath])
+    if properties.get("ID_CDROM_MEDIA") != "1":
+        return {}
+    blkid = _find_tool("blkid", _BLKID_PATHS)
+    if blkid:
+        properties.update(_run_properties([blkid, "-p", "-o", "udev", devpath]))
+    return properties
 
 
 class Job(db.Model):
@@ -200,9 +260,21 @@ class Job(db.Model):
         """Parse udev for properties of current disc"""
         context = pyudev.Context()
         device = pyudev.Devices.from_device_file(context, self.devpath)
+        properties = dict(device.items())
+        probed = read_media_properties(self.devpath)
+        if probed:
+            if "ID_CDROM_MEDIA" not in properties:
+                logging.info("udev has no media properties for this drive yet; using what cdrom_id and blkid report")
+            properties = {key: value for key, value in properties.items()
+                          if not key.startswith(_MEDIA_PROPERTY_PREFIXES)}
+            properties.update(probed)
+        self.apply_disc_properties(properties)
+
+    def apply_disc_properties(self, properties):
+        """Set label and disctype from udev style ``ID_*`` properties"""
         self.disctype = "unknown"
 
-        for key, value in device.items():
+        for key, value in properties.items():
             logging.debug(f"pyudev: {key}: {value}")
             if key == "ID_FS_LABEL":
                 self.label = value
