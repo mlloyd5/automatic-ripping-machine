@@ -121,7 +121,9 @@ def create_early_logger(stdout=True, syslog=True, file=True):
     logger.setLevel(cfg.arm_config["LOGLEVEL"])
 
     if file:
-        logger.addHandler(_create_file_handler("arm.log"))
+        # On the root logger, so everything logged before the job log exists (the wait for the
+        # drive, a failure during setup) lands in arm.log; setup_job_log() swaps it for the job's file.
+        logging.getLogger().addHandler(_create_file_handler("arm.log"))
 
     if syslog:
         # create syslog logger handler

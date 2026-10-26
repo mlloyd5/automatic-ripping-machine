@@ -6,6 +6,7 @@ import fcntl
 import logging
 import os
 import re
+import time
 from subprocess import CalledProcessError
 
 from arm.ripper.ProcessHandler import arm_subprocess
@@ -29,6 +30,30 @@ class CDS(enum.Enum):
     DISC_OK = 4
     """CDS_DISC_OK"""
     ERROR = None
+
+
+CDROMEJECT = 0x5309
+"""ioctl request: eject the disc / open the tray (linux/cdrom.h)"""
+CDROMCLOSETRAY = 0x5319
+"""ioctl request: close the tray (linux/cdrom.h)"""
+
+
+def _tray_ioctl(devpath, request):
+    """
+    Send a tray request (CDROMEJECT or CDROMCLOSETRAY) straight to the drive.
+
+    This is what ``eject --cdrom`` does, minus eject(1)'s mount-table lookup. That lookup breaks
+    where the device node is itself a mount target: Proxmox passes a drive into an LXC by
+    bind-mounting a tiny tmpfs at ``/dev/sr0``, so eject(1) decides "none" is mounted there and
+    gives up without touching the drive.
+
+    :raise OSError: when the device cannot be opened or the drive rejects the request
+    """
+    handle = os.open(devpath, os.O_RDONLY | os.O_NONBLOCK)
+    try:
+        fcntl.ioctl(handle, request, 0)
+    finally:
+        os.close(handle)
 
 
 def _tray_status(devpath, logger=logging):
@@ -184,6 +209,37 @@ class SystemDrives(db.Model):  # pylint: disable=too-many-instance-attributes
         logging.debug(f"Drive '{self.mount}': tray status '{self.tray}'")
         return self.tray
 
+    def wait_until_ready(self, timeout, interval=1.0, logger=logging, sleep=time.sleep, clock=time.monotonic):
+        """
+        Poll the tray status until the drive reports a readable disc or ``timeout`` seconds pass.
+
+        udev starts ARM when the tray closes, which is well before a slow drive can read the disc:
+        an HL-DT-ST DT80N reports DRIVE_NOT_READY (with a flicker of TRAY_OPEN) for about 16 s
+        after the close with a dual-layer DVD.
+
+        :param timeout: seconds to keep polling
+        :param interval: seconds between polls
+        :param logger: where progress goes (the job log does not exist yet at this point)
+        :param sleep: injectable for tests
+        :param clock: injectable for tests
+        :return: the distinct tray states seen, in order; ``self.ready`` says whether the drive got there
+        """
+        deadline = clock() + max(float(timeout), 0.0)
+        seen = []
+        while True:
+            status = self.tray_status()
+            if not seen or seen[-1] != status:
+                seen.append(status)
+                if status != CDS.DISC_OK:
+                    logger.info(f"Drive [{self.mount}] is not ready (tray status: {status.name}); "
+                                f"waiting up to {timeout}s")
+            if self.ready:
+                return seen
+            remaining = deadline - clock()
+            if remaining <= 0:
+                return seen
+            sleep(min(interval, remaining))
+
     @property
     def tray(self):
         """Tray Status EnumItem
@@ -207,11 +263,12 @@ class SystemDrives(db.Model):  # pylint: disable=too-many-instance-attributes
     def eject(self, method="eject"):
         """Open or close the drive
 
-        Uses [eject](https://man7.org/linux/man-pages/man1/eject.1.html)
+        The tray ioctl goes to the drive first; [eject](https://man7.org/linux/man-pages/man1/eject.1.html)
+        (``--cdrom --scsi``) is only the fallback for drives that reject it, since eject(1) itself
+        fails wherever the device node is a mount target (see ``_tray_ioctl``).
 
         Parameters
         ----------
-        logger: logging.Logger
         method: str: eject (default), close, toggle
 
         Returns
@@ -220,6 +277,28 @@ class SystemDrives(db.Model):  # pylint: disable=too-many-instance-attributes
             Returns `None` if no (known) error occurred and `str` with the error
             message otherwise.
         """
+        try:
+            error = self._eject_ioctl(method)
+            if error is None:
+                return None
+            logging.warning(f"Tray ioctl failed for '{self.mount}' ({error}); trying eject(1)")
+            return self._eject_command(method)
+        finally:
+            self.release_current_job()
+
+    def _eject_ioctl(self, method):
+        """Send the tray request for ``method`` straight to the drive; error text or None."""
+        request = CDROMCLOSETRAY if method == "close" else CDROMEJECT
+        if method == "toggle":
+            request = CDROMCLOSETRAY if self.tray_status() == CDS.TRAY_OPEN else CDROMEJECT
+        try:
+            _tray_ioctl(self.mount, request)
+        except (OSError, TypeError) as err:
+            return str(err)
+        return None
+
+    def _eject_command(self, method):
+        """Run eject(1) for ``method``; error text or None."""
         methods = {
             "eject": [],
             "close": ["--trayclose"],
@@ -230,9 +309,8 @@ class SystemDrives(db.Model):  # pylint: disable=too-many-instance-attributes
         try:
             arm_subprocess(cmd, check=True)
         except CalledProcessError as err:
-            return err.stderr
-        finally:
-            self.release_current_job()
+            return err.output or err.stderr
+        return None
 
     def debug(self, logger=logging):
         """

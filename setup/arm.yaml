@@ -71,6 +71,10 @@ MANUAL_WAIT: true
 # Wait time for manual identification (in seconds)
 MANUAL_WAIT_TIME: 60
 
+# How long to wait (in seconds) for the drive to report a readable disc after udev starts ARM.
+# udev fires when the tray closes; slow drives need another 15-20 seconds to spin the disc up.
+DRIVE_READY_TIMEOUT: 60
+
 # Allows you to format the date/time to your own liking
 # This will be used throughout ARM and ARMui
 DATE_FORMAT: "%m-%d-%Y %H:%M:%S"
@@ -421,9 +425,10 @@ CAMERA_JPEG_QUALITY: 85
 # Docker default is inside the media volume so photos persist.
 DISC_PHOTO_PATH: "/home/arm/media/disc_photos/"
 
-# Maximum age (seconds) of a photo for it to be attached to a job starting on that drive.
-# Covers the delay between the tray closing and udev starting ARM.
-DISC_PHOTO_MAX_AGE: 180
+# Maximum age (seconds) of a photo or barcode scan for it to be attached to a job starting on that
+# drive. Covers the delay between scanning the case, closing the tray, the drive spinning the disc up
+# (DRIVE_READY_TIMEOUT) and a retry or two; a scan is only ever attached to one job.
+DISC_PHOTO_MAX_AGE: 600
 
 # Delete disc photos older than this many days that are not attached to any job
 # (empty-tray closes and ejects produce unattached photos).
