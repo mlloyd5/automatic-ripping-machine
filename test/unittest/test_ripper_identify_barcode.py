@@ -74,6 +74,10 @@ WALL_E_HYPHEN = [_result("East of Wall", "2025", 30), _result("End of the Wall",
                  _result("Wall Engravings", "1968", 36), _result("Eyes Behind the Wall", "1977", 22)]
 WALL_E_YEAR = [_result("WALL\u00b7E's Treasures & Trinkets", "2008", 7), _result("Wall Street", "1987", 2358),
                _result("WALL\u00b7E", "2008", 21096), _result("BURN\u00b7E", "2008", 837)]
+# Job 34 on the ts140: upcitemdb knows barcode 096009736194 as "59 Cartoon Classics (DVD)" (the case
+# says "59 Cartoon Classics Featuring Casper"), TMDB has nothing by that name, and the label search for
+# "CARTOONS_D3" returned this one result, which the ripper took.
+CARTOONS_D3 = [_result("Greatest Cartoons of the Golden Era Vol. 3", "2024", 2)]
 
 
 @unittest.skipIf(IMPORT_ERROR is not None, f"ARM could not be imported here: {IMPORT_ERROR}")
@@ -118,6 +122,23 @@ class TestBestSearchResult(unittest.TestCase):
         self.assertEqual((job.title, job.year), ("Home-Alone-3", "1997"))
         self.assertIsNone(identify.update_job(job, {"Search": []}, "Home Alone"))
 
+    def test_update_job_refuses_a_near_miss_once_the_barcode_named_the_disc(self):
+        job = _job(label="CARTOONS_D3", disc_barcode_title="59 Cartoon Classics (DVD)")
+        with mock.patch.object(identify.utils, "database_updater", side_effect=_fake_updater) as updater:
+            self.assertIsNone(identify.update_job(job, {"Search": CARTOONS_D3}, "CARTOONS_D3"))
+            self.assertIsNone(identify.update_job(job, {"Search": CARTOONS_D3}, "CARTOONS+D3"))
+        updater.assert_not_called()
+        self.assertEqual((job.title, job.hasnicetitle), ("not identified", False))
+        # an exact match is still taken, so the CRC64 database's title keeps getting its details
+        with mock.patch.object(identify.utils, "database_updater", side_effect=_fake_updater):
+            identify.update_job(job, {"Search": HOME_ALONE}, "HOME_ALONE")
+        self.assertEqual((job.title, job.year, job.hasnicetitle), ("Home-Alone", "1990", True))
+        # without a barcode the label search guesses as it always has
+        job = _job(label="CARTOONS_D3")
+        with mock.patch.object(identify.utils, "database_updater", side_effect=_fake_updater):
+            identify.update_job(job, {"Search": CARTOONS_D3}, "CARTOONS_D3")
+        self.assertEqual(job.title, "Greatest-Cartoons-of-the-Golden-Era-Vol.-3")
+
 
 @unittest.skipIf(IMPORT_ERROR is not None, f"ARM could not be imported here: {IMPORT_ERROR}")
 class TestBarcodeComesFirst(unittest.TestCase):
@@ -148,6 +169,8 @@ class TestBarcodeComesFirst(unittest.TestCase):
 
     def _dvd(self, job, title_known=False):
         self.calls.append(("dvd", title_known))
+        if not title_known and job.title in (None, "", "not identified"):
+            job.title = str(job.label)  # identify_dvd's failsafe when no search found anything
         return True
 
     def _video_job(self, disctype):
@@ -175,6 +198,51 @@ class TestBarcodeComesFirst(unittest.TestCase):
         with mock.patch.object(identify, "identify_from_barcode", return_value=False):
             identify.identify(self._video_job("bluray"))
         self.assertEqual(self.calls, ["bluray"])
+
+    def test_product_title_names_a_disc_nothing_matched(self):
+        """Job 34: upcitemdb knew the release, nothing online had the title, the label is CARTOONS_D3."""
+        def barcode_miss(job):
+            job.disc_barcode_title = "59 Cartoon Classics (DVD)"
+            return False
+
+        job = self._video_job("dvd")
+        job.label = "CARTOONS_D3"
+        with mock.patch.object(identify, "identify_from_barcode", side_effect=barcode_miss), \
+                mock.patch.object(identify.utils, "database_updater", side_effect=_fake_updater):
+            identify.identify(job)
+        self.assertEqual(self.calls, [("dvd", False)])
+        self.assertEqual((job.title, job.title_auto, job.year, job.hasnicetitle),
+                         ("59-Cartoon-Classics", "59-Cartoon-Classics", "", False))
+
+    def test_product_title_year_and_label_without_a_barcode(self):
+        def barcode_miss(job):
+            job.disc_barcode_title = "Obscure Picture (DVD, 1987)"
+            return False
+
+        job = self._video_job("dvd")
+        with mock.patch.object(identify, "identify_from_barcode", side_effect=barcode_miss), \
+                mock.patch.object(identify.utils, "database_updater", side_effect=_fake_updater):
+            identify.identify(job)
+        self.assertEqual((job.title, job.year), ("Obscure-Picture", "1987"))
+        # no barcode: the label stays the failsafe title, as before
+        job = self._video_job("dvd")
+        with mock.patch.object(identify, "identify_from_barcode", return_value=False), \
+                mock.patch.object(identify.utils, "database_updater", side_effect=_fake_updater):
+            identify.identify(job)
+        self.assertEqual(job.title, "LOGICAL_VOLUME")
+
+    def test_product_title_does_not_replace_a_title_the_disc_gave(self):
+        """A Blu-ray's bdmt_eng.xml title, or one the CRC64 database set, is kept."""
+        job = self._video_job("bluray")
+        job.disc_barcode_title = "Some Boxed Set (Blu-ray)"
+        job.title = "The-Real-Title"
+        with mock.patch.object(identify, "identify_from_barcode", return_value=False), \
+                mock.patch.object(identify.utils, "database_updater", side_effect=_fake_updater):
+            identify.identify(job)
+        self.assertEqual(job.title, "The-Real-Title")
+        job = _job(hasnicetitle=True, title="Found-Film", disc_barcode_title="Found Film (DVD)")
+        self.assertFalse(identify.title_from_barcode_product(job))
+        self.assertEqual(job.title, "Found-Film")
 
     def test_barcode_failure_never_stops_identification(self):
         with mock.patch.object(identify, "identify_from_barcode", side_effect=RuntimeError("upcitemdb down")):

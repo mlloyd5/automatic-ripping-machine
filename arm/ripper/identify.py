@@ -124,6 +124,8 @@ def identify(job):
             else:
                 job.hasnicetitle = False
                 db.session.commit()
+            if not job.hasnicetitle:
+                title_from_barcode_product(job)
 
             logging.info(f"Disc title Post ident -  title:{job.title} "
                          f"year:{job.year} video_type:{job.video_type} "
@@ -401,14 +403,23 @@ def update_job(job, search_results, title=None, year=None):
     used to update a successfully found job
     :param job: job obj
     :param search_results: json returned from metadata provider
-    :param title: the title that was searched for, to prefer an exact match (see best_search_result)
+    :param title: the title that was searched for, to prefer an exact match (see best_search_result);
+                  when the job carries a product title from its case barcode only an exact match counts
     :param year: the year that was searched for
-    :return: None if error
+    :return: None if error or nothing acceptable
     """
     # logging.debug(f"s =======  {search_results}")
     if 'Search' not in search_results or not search_results['Search']:
         return None
-    best = best_search_result(search_results['Search'], title, year)
+    # Once the case barcode has named the product, a label search is only a guess at the real
+    # title: a page of near misses ("Cartoons D3" finds only "Greatest Cartoons of the Golden
+    # Era Vol. 3") must not outrank the product title (see title_from_barcode_product).
+    product = getattr(job, 'disc_barcode_title', None)
+    best = best_search_result(search_results['Search'], title, year, exact_only=bool(product))
+    if best is None:
+        logging.info(f"Search for '{title}' found nothing titled exactly that; the case barcode says the disc "
+                     f"is '{product}', so '{search_results['Search'][0]['Title']}' is not taken")
+        return None
     if best is not search_results['Search'][0]:
         logging.info(f"Search for '{title}' returned '{search_results['Search'][0]['Title']}' first; "
                      f"taking the exact match '{best['Title']}' ({best['Year']})")
@@ -862,6 +873,37 @@ def _identify_video_from_barcode(job):
     logging.info("No title online is exactly the barcode's product title; "
                  "leaving the disc to its CRC64 record and label")
     return False
+
+
+def title_from_barcode_product(job):
+    """
+    Name a disc nothing online matched after its case barcode's product title.
+
+    Runs last in :func:`identify` for video discs still without a nice title. A DVD whose
+    barcode resolved to a product (``disc_barcode_title``) but whose title no provider has, and
+    whose label found nothing exact either, would otherwise be filed under its label
+    (``CARTOONS_D3``); the product title ("59 Cartoon Classics") is the better name for the
+    unidentified folder and the title fix page. A title the disc itself supplied (a Blu-ray's
+    bdmt_eng.xml) is kept. ``hasnicetitle`` stays False: this is a name, not an identification.
+
+    :return: True when the title was set from the product title
+    """
+    raw = getattr(job, 'disc_barcode_title', None)
+    if job.hasnicetitle or not raw:
+        return False
+    if job.title not in (None, "", "not identified") and str(job.title) != str(job.label):
+        return False
+    title, year = disc_photo.clean_upc_title(raw)
+    if not title:
+        return False
+    title = utils.clean_for_filename(title)
+    args = {'title': title, 'title_auto': title}
+    if year:
+        args.update({'year': year, 'year_auto': year})
+    logging.info(f"Nothing online matched the disc; naming it after its case barcode's product title: "
+                 f"'{title}' ({year})")
+    utils.database_updater(args, job)
+    return True
 
 
 def _identify_music_from_barcode(job):
