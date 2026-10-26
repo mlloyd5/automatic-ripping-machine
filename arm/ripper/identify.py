@@ -105,10 +105,16 @@ def identify(job):
         logging.info("Disc identified as video")
 
         if cfg.arm_config["GET_VIDEO_TITLE"]:
+            # The case barcode is the UPC of this exact release, so it goes first: a disc label
+            # like "ALASKA" has hundreds of matches online, the barcode's product title has one.
             res = False
+            try:
+                res = identify_from_barcode(job)
+            except Exception as error:
+                logging.error(f"Barcode lookup failed: {error}", exc_info=True)
             if job.disctype == "dvd":
-                res = identify_dvd(job)
-            if job.disctype == "bluray":
+                res = identify_dvd(job, title_known=res) or res
+            if job.disctype == "bluray" and not res:
                 res = identify_bluray(job)
             if res:
                 get_video_details(job)
@@ -218,9 +224,14 @@ def identify_bluray(job):
     return True
 
 
-def identify_dvd(job):
+def identify_dvd(job, title_known=False):
     """ Manipulates the DVD title and calls OMDB to try and
-    lookup the title """
+    lookup the title
+
+    :param title_known: the title was already found (from the case barcode): still compute the
+                        CRC and check for track 99, but do not replace it from the CRC database
+                        or the label search
+    """
 
     logging.debug(f"\n\r{job.pretty_table()}")
     # Some older DVDs aren't actually labelled
@@ -237,7 +248,10 @@ def identify_dvd(job):
         arm_api_json = json.loads(dvd_info_xml)
         logging.debug(f"dvd xml - {arm_api_json}")
         logging.debug(f"results = {arm_api_json['results']}")
-        if arm_api_json['success']:
+        if arm_api_json['success'] and title_known:
+            logging.info(f"CRC64 database knows this disc as {arm_api_json['results']['0']['title']}; "
+                         f"keeping the barcode's {job.title}")
+        elif arm_api_json['success']:
             logging.info("Found crc64 id from online API")
             logging.info(f"title is {arm_api_json['results']['0']['title']}")
             args = {
@@ -270,13 +284,16 @@ def identify_dvd(job):
     logging.debug(f"dvd_title SKU$: {dvd_title}")
 
     # Do we really need metaselector if we have got from ARM online db?
-    try:
-        dvd_info_xml = metadata_selector(job, dvd_title, year)
-        logging.debug(f"DVD_INFO_XML: {dvd_info_xml}")
-        identify_loop(job, dvd_info_xml, dvd_title, year)
-    except Exception:
-        dvd_info_xml = None
-        logging.debug("Cant connect to online service!")
+    if title_known:
+        logging.info(f"Title already identified from the case barcode: {job.title} ({job.year})")
+    else:
+        try:
+            dvd_info_xml = metadata_selector(job, dvd_title, year)
+            logging.debug(f"DVD_INFO_XML: {dvd_info_xml}")
+            identify_loop(job, dvd_info_xml, dvd_title, year)
+        except Exception:
+            dvd_info_xml = None
+            logging.debug("Cant connect to online service!")
     # Failsafe so that we always have a title.
     if job.title is None or job.title == "None":
         job.title = str(job.label)
@@ -590,11 +607,13 @@ def identify_from_photo(job):
 
 def identify_from_barcode(job):
     """
-    Fallback identification: look up the UPC/EAN scanned from the disc case.
+    Identify the disc from the UPC/EAN scanned from its case.
 
-    Runs when BARCODE_LOOKUP is enabled, the job has a barcode and the disc is still not
-    identified (``hasnicetitle`` is False). Video discs go through upcitemdb and then the
-    normal metadata search; music discs ask MusicBrainz for a release with that barcode.
+    Runs when BARCODE_LOOKUP is enabled, the job has a barcode and the disc is not yet
+    identified (``hasnicetitle`` is False): first thing for video discs, since the barcode
+    names the exact release, and as the fallback for music discs. Video discs go through
+    upcitemdb and then the normal metadata search; music discs ask MusicBrainz for a release
+    with that barcode.
     The looked-up product title is kept on the job so the title fix pages can offer it even
     when no online match is found.
 
