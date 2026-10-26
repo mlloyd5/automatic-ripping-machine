@@ -686,6 +686,12 @@ def makemkv_mkv(job, rawpath):
     logging.info(f"Job running in {mode} mode")
     # Get track info form mkv rip
     get_track_info(job.drive.mdisc, job)
+    # Without a title list, ripping "all" goes wrong: the duplicate check has nothing to go on, and the
+    # files are moved to the completed folder by their track rows, so none are moved and the whole rip
+    # is deleted with the raw folder (RED 2 on the t620, where MakeMKV could not open the disc).
+    if not job.tracks.all():
+        raise utils.RipperException(f"MakeMKV found no titles of at least {job.config.MINLENGTH}s on the disc "
+                                    "(or could not open it)")
     # Titles that are copies of another title (same content, different playlist) get ripped once only
     skipped = skip_duplicate_titles(job) if job.config.SKIP_DUPLICATE_TITLES else []
     # route to ripping functions.
