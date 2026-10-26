@@ -16,7 +16,7 @@ import pydvdid
 import xmltodict
 import xml.parsers.expat
 import arm.config.config as cfg
-from arm.models import Job
+from arm.models import Job, Film
 
 from arm.ripper import utils
 from arm.ripper import disc_photo
@@ -25,6 +25,7 @@ from arm.ui import db
 
 # flake8: noqa: W605
 from arm.ui import utils as ui_utils
+from arm.ui import metadata as ui_metadata
 
 
 def find_mount(devpath: str) -> str | None:
@@ -112,6 +113,8 @@ def identify(job):
                 res = identify_from_barcode(job)
             except Exception as error:
                 logging.error(f"Barcode lookup failed: {error}", exc_info=True)
+            if not res:
+                res = identify_collection_from_label(job)
             if job.disctype == "dvd":
                 res = identify_dvd(job, title_known=res) or res
             if job.disctype == "bluray" and not res:
@@ -652,6 +655,147 @@ def identify_from_photo(job):
     return False
 
 
+def _provider_search(title, year=None):
+    """
+    Ask the configured metadata provider about a title without touching the job.
+
+    :return: the provider's response in OMDB style (``Search`` list), or None
+    """
+    if not title or str(title).strip().lower() in ("", "not identified"):
+        return None
+    provider = str(cfg.arm_config.get('METADATA_PROVIDER', '')).lower()
+    if provider == "tmdb":
+        return ui_utils.tmdb_search(str(title), str(year) if year else None)
+    if provider == "omdb":
+        return ui_utils.call_omdb_api(str(title), str(year) if year else None)
+    logging.debug(f"unknown metadata provider {provider!r}, not searching for {title!r}")
+    return None
+
+
+def search_film(title, year=None):
+    """
+    The provider's best match for one film title (see best_search_result): with the year, with
+    the year before it (a disc often comes out the year after the film), then without a year.
+
+    :return: one search result in OMDB style (``Title``, ``Year``, ``imdbID``, ...) or None
+    """
+    attempts = [str(year), str(int(year) - 1)] if year and str(year).isdigit() else []
+    attempts.append(None)
+    for attempt in attempts:
+        try:
+            response = _provider_search(title, attempt)
+        except Exception as error:
+            logging.debug(f"Metadata lookup for '{title}' ({attempt}) failed: {error}")
+            response = None
+        if response and response.get('Search'):
+            best = best_search_result(response['Search'], title, attempt)
+            if best:
+                return best
+    return None
+
+
+def film_runtime(result):
+    """
+    The runtime of a search result, in seconds, from the provider that returned it (a search
+    result carries no runtime; TMDB needs the film's details, OMDB a lookup by IMDb id).
+
+    :return: seconds or None
+    """
+    provider = str(cfg.arm_config.get('METADATA_PROVIDER', '')).lower()
+    try:
+        if provider == "tmdb" and result.get('id'):
+            return ui_metadata.tmdb_runtime(result['id'])
+        if provider == "omdb" and result.get('imdbID'):
+            return ui_metadata.omdb_runtime(result['imdbID'])
+    except Exception as error:
+        logging.debug(f"Runtime lookup for '{result.get('Title')}' failed: {error}")
+    return None
+
+
+def store_films(job, films):
+    """
+    Replace the job's film rows with these, in disc order.
+
+    :param films: search results in OMDB style with a ``runtime`` key (seconds or None)
+    """
+    for existing in list(job.films):
+        db.session.delete(existing)
+    db.session.commit()
+    for position, film in enumerate(films, start=1):
+        utils.database_adder(Film(job_id=job.job_id, position=position,
+                                  title=utils.clean_for_filename(str(film['Title'])), year=str(film['Year']),
+                                  imdb_id=film.get('imdbID'), video_type=film.get('Type') or "movie",
+                                  poster_url=film.get('Poster'), runtime=film.get('runtime')))
+
+
+def identify_collection(job, titles, source):
+    """
+    Identify each film of a disc that carries several (a double feature) and record them on the job.
+
+    The first film becomes the job's title, year and output folder, as it would be for a single
+    film; the rest are filed in their own folders once ripped (``arm_ripper.file_collection``
+    matches the ripped titles to the films by runtime). Needs at least two distinct films found,
+    otherwise nothing is changed and the caller searches the text as one title.
+
+    :param titles: the film titles in disc order (``disc_photo.split_collection_title``)
+    :param source: where the titles came from, for the log
+    :return: True when the disc was identified as a collection
+    """
+    found = []
+    for title in titles:
+        best = search_film(title)
+        if not best:
+            logging.info(f"No match online for '{title}' ({source})")
+            continue
+        if best.get('imdbID') and best['imdbID'] in [film.get('imdbID') for film in found]:
+            logging.info(f"'{title}' ({source}) matched the same film as an earlier title, skipping it")
+            continue
+        best = dict(best)
+        best['runtime'] = film_runtime(best)
+        logging.info(f"'{title}' ({source}) is '{best['Title']}' ({best['Year']}), "
+                     f"runtime {best['runtime'] or 'unknown'}")
+        found.append(best)
+    if len(found) < 2:
+        return False
+    store_films(job, found)
+    first = found[0]
+    args = {
+        'year_auto': str(first['Year']), 'year': str(first['Year']),
+        'title_auto': utils.clean_for_filename(str(first['Title'])), 'title': utils.clean_for_filename(str(first['Title'])),
+        'video_type_auto': first.get('Type') or "movie", 'video_type': first.get('Type') or "movie",
+        'imdb_id_auto': first.get('imdbID'), 'imdb_id': first.get('imdbID'),
+        'poster_url_auto': first.get('Poster'), 'poster_url': first.get('Poster'),
+        'hasnicetitle': True,
+    }
+    utils.database_updater(args, job)
+    logging.info(f"Disc carries {len(found)} films ({source}): "
+                 + ", ".join(f"{film['Title']} ({film['Year']})" for film in found)
+                 + f"; the job is filed as the first, {job.title} ({job.year})")
+    return True
+
+
+def identify_collection_from_label(job):
+    """
+    A disc label such as ``STUART_LITTLE_1_AND_2`` names its films: identify them as a collection.
+
+    Runs for video discs that are not yet identified, after the case barcode and before the
+    label search.
+
+    :return: True when the disc was identified as a collection
+    """
+    if job.hasnicetitle or not job.label or job.label == "not identified":
+        return False
+    titles = disc_photo.split_collection_title(job.label)
+    if len(titles) < 2:
+        return False
+    logging.info(f"Disc label '{job.label}' names several films: {titles}")
+    try:
+        return identify_collection(job, titles, f"label {job.label}")
+    except Exception as error:
+        logging.error(f"Collection lookup from the label failed: {error}", exc_info=True)
+        return False
+
+
 def identify_from_barcode(job):
     """
     Identify the disc from the UPC/EAN scanned from its case.
@@ -686,6 +830,11 @@ def _identify_video_from_barcode(job):
     best = candidates[0]
     logging.info(f"Barcode {job.disc_barcode} is '{best['raw']}' -> searching '{best['title']}' ({best['year']})")
     utils.database_updater({'disc_barcode_title': best['raw'][:256]}, job)
+    titles = disc_photo.split_collection_title(best['raw'])
+    if len(titles) > 1:
+        if identify_collection(job, titles, f"barcode {job.disc_barcode}"):
+            return True
+        logging.info("Could not identify every film the product title names; searching it as one title")
     for candidate in candidates[:3]:
         try:
             response = try_with_year(job, None, candidate['title'], candidate['year'])

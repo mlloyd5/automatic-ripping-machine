@@ -18,6 +18,7 @@ import arm.config.config as cfg
 # THESE IMPORTS ARE REQUIRED FOR THE db.Relationships to work
 from arm.models.track import Track  # noqa: F401
 from arm.models.config import Config  # noqa: F401
+from arm.models.film import Film  # noqa: F401
 
 
 def _disc_dir_exists(mountpoint, name):
@@ -219,6 +220,8 @@ class Job(db.Model):
     manual_start = db.Column(db.Boolean)
     manual_mode = db.Column(db.Boolean)
     tracks = db.relationship('Track', backref='job', lazy='dynamic')
+    films = db.relationship('Film', backref='job', lazy='dynamic', order_by='Film.position')
+    """The films on a disc that carries several (double features); empty for an ordinary disc"""
     config = db.relationship('Config', uselist=False, backref="job")
 
     def __init__(self, devpath):

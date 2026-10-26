@@ -15,6 +15,7 @@ from time import time, strftime, gmtime
 
 import arm.config.config as cfg
 from arm.models.config import Config
+from arm.models.film import Film
 from arm.models.job import Job, JobState, JOB_STATUS_FINISHED
 from arm.models.notifications import Notifications
 from arm.models.track import Track
@@ -419,6 +420,7 @@ def delete_job(job_id, mode):
                     app.logger.debug("No errors: job_id=" + str(post_value))
                     drive_utils.job_cleanup(job_id)
                     Track.query.filter_by(job_id=job_id).delete()
+                    Film.query.filter_by(job_id=job_id).delete()
                     Job.query.filter_by(job_id=job_id).delete()
                     Config.query.filter_by(job_id=job_id).delete()
                     notification = Notifications(f"Job: {job_id} was Deleted!",

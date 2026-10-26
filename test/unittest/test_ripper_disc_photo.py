@@ -226,6 +226,33 @@ class TestCleanUpcTitle(unittest.TestCase):
         self.assertEqual(disc_photo.clean_upc_title(None), (None, None))
 
 
+class TestSplitCollectionTitle(unittest.TestCase):
+    def test_slash_separated_product_titles(self):
+        self.assertEqual(disc_photo.split_collection_title("Stuart Little / Stuart Little 2 (DVD)"),
+                         ["Stuart Little", "Stuart Little 2"])
+        self.assertEqual(disc_photo.split_collection_title("Home Alone / Home Alone 2: Lost in New York (DVD)"),
+                         ["Home Alone", "Home Alone 2: Lost in New York"])
+        self.assertEqual(disc_photo.split_collection_title("The Mummy / The Mummy Returns 2-Movie Collection [DVD]"),
+                         ["The Mummy", "The Mummy Returns"])
+        self.assertEqual(disc_photo.split_collection_title("Double Feature: Grease / Grease 2"), ["Grease", "Grease 2"])
+
+    def test_numbered_runs_and_disc_labels(self):
+        self.assertEqual(disc_photo.split_collection_title("Stuart Little 1 & 2 Double Feature (DVD, 2004)"),
+                         ["Stuart Little", "Stuart Little 2"])
+        self.assertEqual(disc_photo.split_collection_title("STUART_LITTLE_1_AND_2"),
+                         ["STUART LITTLE", "STUART LITTLE 2"])
+        self.assertEqual(disc_photo.split_collection_title("Toy Story 1/2/3 (Blu-ray)"),
+                         ["Toy Story", "Toy Story 2", "Toy Story 3"])
+        # "Vol. 1" is part of the title, not the first of a run
+        self.assertEqual(disc_photo.split_collection_title("Kill Bill Vol. 1 & 2"),
+                         ["Kill Bill Vol 1", "Kill Bill Vol 2"])
+
+    def test_single_films_are_not_split(self):
+        for title in ("Fast & Furious (DVD)", "Dumb and Dumber (DVD)", "Inception (Blu-ray + DVD, 2010)",
+                      "Blade Runner 2049 4K UHD + Blu-ray", "Jurassic Park III", "LOGICAL_VOLUME", "", None):
+            self.assertEqual(disc_photo.split_collection_title(title), [], title)
+
+
 class TestUpcLookup(unittest.TestCase):
     PAYLOAD = {"code": "OK", "total": 2, "items": [
         {"title": "Some Toy Robot", "category": "Toys & Games > Robots"},

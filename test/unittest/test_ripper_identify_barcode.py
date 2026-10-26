@@ -268,3 +268,130 @@ class TestIdentifyFromBarcode(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+def _runtime(title):
+    return {"Stuart Little": 84 * 60, "Stuart Little 2": 78 * 60}.get(title)
+
+
+STUART_LITTLE = {
+    "Stuart Little": [_result("Stuart Little 2", "2002", 2000, id=11), _result("Stuart Little", "1999", 3000, id=10)],
+    "Stuart Little 2": [_result("Stuart Little 2", "2002", 2000, id=11)],
+}
+
+
+@unittest.skipIf(IMPORT_ERROR is not None, f"ARM could not be imported here: {IMPORT_ERROR}")
+class TestIdentifyCollection(unittest.TestCase):
+    """A product title or label naming several films identifies each of them."""
+
+    def setUp(self):
+        os.environ["ARM_CONFIG_FILE"] = _CONFIG
+        if cfg.arm_config_path != _CONFIG:
+            importlib.reload(cfg)
+        cfg.arm_config["BARCODE_LOOKUP"] = True
+        cfg.arm_config["METADATA_PROVIDER"] = "tmdb"
+        self.stored = []
+        self.patches = [
+            mock.patch.object(identify.utils, "database_updater", side_effect=_fake_updater),
+            mock.patch.object(identify, "store_films", side_effect=lambda job, films: self.stored.append(films)),
+            mock.patch.object(identify, "film_runtime", side_effect=lambda result: _runtime(result["Title"])),
+            mock.patch.object(identify, "_provider_search",
+                              side_effect=lambda title, year=None: {"Search": STUART_LITTLE[title]}
+                              if title in STUART_LITTLE else None),
+        ]
+        for patch in self.patches:
+            patch.start()
+
+    def tearDown(self):
+        for patch in self.patches:
+            patch.stop()
+
+    def test_each_film_is_found_and_the_first_names_the_job(self):
+        job = _job()
+        self.assertTrue(identify.identify_collection(job, ["Stuart Little", "Stuart Little 2"], "test"))
+        self.assertEqual((job.title, job.year, job.hasnicetitle), ("Stuart-Little", "1999", True))
+        self.assertEqual(job.imdb_id, STUART_LITTLE["Stuart Little"][1]["imdbID"])
+        self.assertEqual([(film["Title"], film["runtime"]) for film in self.stored[0]],
+                         [("Stuart Little", 84 * 60), ("Stuart Little 2", 78 * 60)])
+
+    def test_one_film_found_is_not_a_collection(self):
+        job = _job()
+        self.assertFalse(identify.identify_collection(job, ["Stuart Little", "Obscure Film"], "test"))
+        self.assertFalse(identify.identify_collection(job, ["Stuart Little 2", "Stuart Little 2"], "test"))
+        self.assertEqual((job.title, job.hasnicetitle), ("not identified", False))
+        self.assertEqual(self.stored, [])
+
+    def test_search_film_tries_the_year_the_year_before_then_none(self):
+        asked = []
+        with mock.patch.object(identify, "_provider_search",
+                               side_effect=lambda title, year=None: asked.append(year) or None):
+            self.assertIsNone(identify.search_film("Stuart Little", "2004"))
+        self.assertEqual(asked, ["2004", "2003", None])
+        self.assertEqual(identify.search_film("Stuart Little")["Year"], "1999")
+
+    def test_barcode_product_title_naming_two_films(self):
+        candidates = [{"title": "Stuart Little Stuart Little 2", "year": None,
+                       "raw": "Stuart Little / Stuart Little 2 (DVD)"}]
+        job = _job(disc_barcode="043396430099")
+        with mock.patch.object(identify.disc_photo, "lookup_upc", return_value=candidates), \
+                mock.patch.object(identify, "try_with_year") as single:
+            self.assertTrue(identify.identify_from_barcode(job))
+        single.assert_not_called()
+        self.assertEqual((job.title, job.year), ("Stuart-Little", "1999"))
+        self.assertEqual(job.disc_barcode_title, "Stuart Little / Stuart Little 2 (DVD)")
+
+    def test_barcode_collection_miss_searches_the_product_title_as_one(self):
+        candidates = [{"title": "Obscure Film Obscure Film 2", "year": None,
+                       "raw": "Obscure Film / Obscure Film 2 (DVD)"}]
+        job = _job()
+        with mock.patch.object(identify.disc_photo, "lookup_upc", return_value=candidates), \
+                mock.patch.object(identify, "try_with_year", return_value=None) as single, \
+                mock.patch.object(identify, "try_without_year", return_value=None):
+            self.assertFalse(identify.identify_from_barcode(job))
+        single.assert_called_once()
+        self.assertEqual(self.stored, [])
+
+    def test_label_naming_two_films(self):
+        with mock.patch.object(identify, "identify_collection", return_value=True) as collection:
+            self.assertTrue(identify.identify_collection_from_label(_job(label="STUART_LITTLE_1_AND_2")))
+            self.assertFalse(identify.identify_collection_from_label(_job(label="LOGICAL_VOLUME")))
+            self.assertFalse(identify.identify_collection_from_label(_job(label="STUART_LITTLE_1_AND_2",
+                                                                          hasnicetitle=True)))
+        collection.assert_called_once_with(mock.ANY, ["STUART LITTLE", "STUART LITTLE 2"],
+                                           "label STUART_LITTLE_1_AND_2")
+
+
+@unittest.skipIf(IMPORT_ERROR is not None, f"ARM could not be imported here: {IMPORT_ERROR}")
+class TestRuntimeParsing(unittest.TestCase):
+    def test_omdb_runtime_strings(self):
+        self.assertEqual(identify.ui_metadata.parse_runtime("84 min"), 84 * 60)
+        self.assertEqual(identify.ui_metadata.parse_runtime("1h 24min"), 84 * 60)
+        self.assertEqual(identify.ui_metadata.parse_runtime("2 h"), 120 * 60)
+        self.assertIsNone(identify.ui_metadata.parse_runtime("N/A"))
+        self.assertIsNone(identify.ui_metadata.parse_runtime(None))
+
+
+@unittest.skipIf(IMPORT_ERROR is not None, f"ARM could not be imported here: {IMPORT_ERROR}")
+class TestStoreFilms(unittest.TestCase):
+    """store_films writes real rows: the film table from the migration, read back through Job.films."""
+
+    def test_rows_replace_earlier_ones_in_disc_order(self):
+        os.environ["ARM_CONFIG_FILE"] = _CONFIG
+        if cfg.arm_config_path != _CONFIG:
+            importlib.reload(cfg)
+        import arm.ui.routes  # noqa: F401  creates the database like runui.py does
+
+        job = identify.Job.__mapper__.class_manager.new_instance()
+        job.devpath, job.title, job.status = "/dev/sr9", "not identified", "active"
+        identify.db.session.add(job)
+        identify.db.session.commit()
+        identify.store_films(job, [_result("Stuart Little 2", "2002", 2000, runtime=78 * 60)])
+        identify.store_films(job, [_result("Stuart Little", "1999", 3000, runtime=84 * 60),
+                                   _result("Stuart Little 2", "2002", 2000, runtime=None)])
+        films = list(identify.Job.query.get(job.job_id).films)
+        self.assertEqual([(film.position, film.title, film.year, film.runtime, film.folder_name, film.track_number)
+                          for film in films],
+                         [(1, "Stuart-Little", "1999", 84 * 60, "Stuart-Little (1999)", None),
+                          (2, "Stuart-Little-2", "2002", None, "Stuart-Little-2 (2002)", None)])
+        self.assertEqual(films[0].imdb_id, _result("Stuart Little", "1999")["imdbID"])
+        self.assertEqual(films[1].job.job_id, job.job_id)

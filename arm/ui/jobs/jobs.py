@@ -53,6 +53,9 @@ def ocr_suggestion(job):
                 barcode['title'] = title
                 candidates.append(title)
                 year = barcode_year
+            # a double feature's product title names each film: offer them one by one too
+            candidates.extend(part for part in disc_photo.split_collection_title(job.disc_barcode_title)
+                              if part.lower() not in (x.lower() for x in candidates))
     if job.disc_photo_ocr:
         ocr_candidates, ocr_year = disc_photo.clean_ocr_text(job.disc_photo_ocr)
         candidates.extend(c for c in ocr_candidates if c.lower() not in (x.lower() for x in candidates))

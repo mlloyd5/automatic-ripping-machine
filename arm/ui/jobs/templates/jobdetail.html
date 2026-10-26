@@ -240,6 +240,23 @@
                                         {% if jobs.disc_barcode_title %}<br/><small class="text-muted">{{ jobs.disc_barcode_title }}</small>{% endif %}
                                     </td>
                                 </tr>
+                                {% set films = jobs.films|list %}
+                                {% if films|length > 1 %}
+                                <tr>
+                                    <td style="text-align:left"><strong>films</strong></td>
+                                    <td style="text-align:left">
+                                        <small class="text-muted">This disc carries {{ films|length }} films. The first is filed in the job folder, the others in their own folders.</small>
+                                        <ol class="mb-0 pl-3">
+                                        {% for film in films %}
+                                            <li>{{ film.title }} ({{ film.year }})
+                                                {% if film.imdb_id %}<a href="https://www.imdb.com/title/{{ film.imdb_id }}" target="_blank">{{ film.imdb_id }}</a>{% endif %}
+                                                <small class="text-muted">runtime {{ (film.runtime // 60) ~ ' min' if film.runtime else 'unknown' }}{% if film.track_number %}, filed from title {{ film.track_number }}{% endif %}</small>
+                                            </li>
+                                        {% endfor %}
+                                        </ol>
+                                    </td>
+                                </tr>
+                                {% endif %}
                                 <tr>
                                     <td style="text-align:left"><strong>sleeve_id</strong></td>
                                     <td style="text-align:left">

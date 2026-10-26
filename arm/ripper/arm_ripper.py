@@ -20,6 +20,11 @@ from arm.models.job import JobState  # noqa E402
 # no runtime is known) to be considered as the main feature. Keeps a many-chapter bonus reel from winning.
 MAIN_FEATURE_MIN_FRACTION = 0.7
 
+# A ripped title is taken for a film of a double feature when its runtime is within this fraction of
+# the runtime the metadata provider gives (PAL discs run 4% fast), and never closer than this many seconds.
+RUNTIME_TOLERANCE_FRACTION = 0.06
+RUNTIME_TOLERANCE_MIN = 180
+
 
 def rip_visual_media(have_dupes, job, logfile, protection):
     """
@@ -205,6 +210,8 @@ def move_files_post(transcode_out_path, job):
     if job.video_type == "series":
         for track in tracks:
             utils.move_files(transcode_out_path, track.filename, job, False)
+    elif file_collection(transcode_out_path, job, os.listdir(transcode_out_path)):
+        pass  # a double feature: each film went to its own folder
     else:
         for track in tracks:
             if tracks.count() == 1:
@@ -216,6 +223,147 @@ def move_files_post(transcode_out_path, job):
                     break
                 # If HandBrake was used we can pass track.main_feature
                 utils.move_files(transcode_out_path, track.filename, job, track.main_feature)
+
+
+def collection_films(job):
+    """
+    The films a double-feature job was identified as, in disc order; empty for an ordinary job\n
+    :param job: Current job
+    :return: list of Film
+    """
+    try:
+        films = list(job.films)
+    except (AttributeError, TypeError):
+        return []
+    return sorted(films, key=lambda film: int(film.position or 0))
+
+
+def expected_length(film, track):
+    """
+    The film's runtime as this title plays it: a PAL disc (25 fps) runs film material 4% fast, so
+    an 84 minute film is an 80.6 minute title there, which is closer to a 78 minute sequel than to
+    itself unless corrected for\n
+    :param film: a Film with a runtime
+    :param track: the ripped track (its fps says whether the disc is PAL)
+    :return: seconds
+    """
+    runtime = int(film.runtime)
+    try:
+        fps = float(track.fps or 0)
+    except (TypeError, ValueError):
+        fps = 0.0
+    if 24.5 <= fps <= 25.5:
+        runtime = round(runtime * 24 / 25)
+    return runtime
+
+
+def match_tracks_to_films(tracks, films):
+    """
+    Pair the ripped titles with the films of a double feature by runtime\n
+    Each title and film is used once; the closest runtimes pair first, and a title has to be within
+    RUNTIME_TOLERANCE_FRACTION (at least RUNTIME_TOLERANCE_MIN seconds) of the film's runtime as the
+    disc plays it (see expected_length). Films the provider gave no runtime for, and titles without
+    a length, are not matched\n
+    :param tracks: ripped tracks that have a file
+    :param films: the job's films (collection_films)
+    :return: dict of film position -> track
+    """
+    pairs = []
+    for film in films:
+        if not film.runtime:
+            continue
+        for track in tracks:
+            if not track.length:
+                continue
+            expected = expected_length(film, track)
+            tolerance = max(RUNTIME_TOLERANCE_MIN, expected * RUNTIME_TOLERANCE_FRACTION)
+            difference = abs(int(track.length) - expected)
+            if difference <= tolerance:
+                pairs.append((difference, expected, film, track))
+    pairs.sort(key=lambda pair: pair[0])
+    matched, used_tracks = {}, set()
+    for difference, expected, film, track in pairs:
+        if film.position in matched or track.track_number in used_tracks:
+            continue
+        matched[film.position] = track
+        used_tracks.add(track.track_number)
+        pal = f" ({expected}s at {track.fps} fps)" if expected != int(film.runtime) else ""
+        logging.info(f"Title {track.track_number} ({track.filename}, {track.length}s) is {film.folder_name}: "
+                     f"{difference}s off its {film.runtime}s runtime{pal}")
+    return matched
+
+
+def file_film(out_path, filename, film, job):
+    """
+    Move a ripped title into its own ``Title (Year)`` folder as that film's main feature\n
+    :param out_path: folder holding the ripped file
+    :param filename: the ripped file
+    :param film: the Film it is
+    :param job: Current job (for the completed path, the extension and permissions)
+    :return: the film's folder
+    """
+    type_sub_folder = utils.convert_job_type(job.video_type)
+    film_path = os.path.join(job.config.COMPLETED_PATH, type_sub_folder, film.folder_name)
+    if utils.make_dir(film_path) is False:
+        logging.info(f"Output directory \"{film_path}\" already exists.")
+        film_path = film_path + "_" + str(job.stage)
+        utils.make_dir(film_path)
+    film_file = os.path.join(film_path, f"{film.folder_name}.{job.config.DEST_EXT}")
+    logging.info(f"Track is the main title of {film.folder_name}. Moving '{os.path.join(out_path, filename)}' "
+                 f"to {film_file}")
+    utils.move_files_main(os.path.join(out_path, filename), film_file, film_path)
+    utils.set_permissions(film_path)
+    return film_path
+
+
+def file_collection(out_path, job, files):
+    """
+    File the rip of a disc that carries several films (identify.identify_collection)\n
+    Each ripped title whose runtime matches a film becomes that film's main feature: the first film's
+    in the job folder, every other film's in its own ``Title (Year)`` folder under the same type
+    folder. When the runtimes cannot place the first film, the usual main-feature rule
+    (pick_main_feature) chooses it from the titles left over, so a rip is never worse than a single
+    film's. Titles no film claims are extras of the job folder, as for a single film\n
+    :param out_path: RAW_PATH or TRANSCODE_PATH holding the ripped files
+    :param job: Current job
+    :param files: os.listdir(out_path)
+    :return: True when the job is a collection and was filed here, False to file it the usual way
+    """
+    films = collection_films(job)
+    if job.video_type != "movie" or len(films) < 2:
+        return False
+    present = set(files)
+    ripped = [track for track in job.tracks.filter_by(ripped=True) if track.filename in present]
+    logging.info(f"Disc carries {len(films)} films: " + ", ".join(film.folder_name for film in films))
+    matched = match_tracks_to_films(ripped, films)
+    leftover = [track for track in ripped if track.track_number not in
+                {track.track_number for track in matched.values()}]
+    first = films[0]
+    if first.position not in matched and leftover:
+        chosen = pick_main_feature([track.filename for track in leftover], job, out_path)
+        matched[first.position] = next(track for track in leftover if track.filename == chosen)
+        leftover = [track for track in leftover if track.filename != chosen]
+        logging.info(f"No ripped title matched the runtime of {first.folder_name}; filing title "
+                     f"{matched[first.position].track_number} as it by the main-feature rule")
+    for film in films:
+        track = matched.get(film.position)
+        if track is None:
+            logging.warning(f"No ripped title matched the runtime of {film.folder_name} "
+                            f"({film.runtime or 'unknown'}s); it is not filed")
+            continue
+        if film.position == first.position:
+            utils.move_files(out_path, track.filename, job, True)
+        else:
+            file_film(out_path, track.filename, film, job)
+        utils.database_updater({'track_number': track.track_number}, film)
+    for track in leftover:
+        if job.config.MAINFEATURE:
+            logging.info(f"MAINFEATURE IS {job.config.MAINFEATURE} - Skipping move of {track.filename}")
+        elif str(job.config.EXTRAS_SUB).lower() != "none":
+            utils.move_files(out_path, track.filename, job, False)
+        else:
+            logging.info(f"Not moving extra: \"{track.filename}\" - Sub folder is not set or named incorrectly")
+    return True
 
 
 def rip_with_mkv(current_job, protection=0):
