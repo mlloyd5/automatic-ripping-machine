@@ -348,30 +348,77 @@ def get_video_details(job):
         logging.info(f"Identification failed with the error: {error}. Continuing...")
 
 
-def update_job(job, search_results):
+def _normalise_title(text) -> str:
+    """Lower case letters and digits only, so "Coal Miner's Daughter" and "COAL MINERS DAUGHTER" agree."""
+    return re.sub(r"[^a-z0-9]", "", str(text or "").lower())
+
+
+def best_search_result(results, title=None, year=None):
+    """
+    Pick the result a title search most likely meant.
+
+    The metadata providers rank by their own popularity, which puts "Home Alone 3" first for
+    the query "Home Alone" and the 2022 documentary first for "Coal Miners Daughter". When the
+    query is a real title (a case barcode's product title, a disc label), a result whose title
+    is exactly the query beats everything else; among several exact matches (remakes, shorts
+    with the same name) the one with the most votes wins, after the year when one was asked
+    for. With no exact match the provider's first result stands, as before.
+
+    :param results: the ``Search`` list in OMDB style (``Title``, ``Year``), TMDB results keep
+                    their ``vote_count``
+    :return: one entry of ``results``
+    """
+    if not results:
+        return None
+    wanted = _normalise_title(title)
+    if not wanted:
+        return results[0]
+    exact = [r for r in results if _normalise_title(r.get("Title") or r.get("title")) == wanted]
+    if year:
+        same_year = [r for r in exact if str(r.get("Year") or "")[:4] == str(year)[:4]]
+        exact = same_year or exact
+    if not exact:
+        return results[0]
+
+    def rank(result):
+        try:
+            votes = int(result.get("vote_count") or 0)
+        except (TypeError, ValueError):
+            votes = 0
+        return votes, bool(str(result.get("Year") or "").strip())
+    return max(exact, key=rank)
+
+
+def update_job(job, search_results, title=None, year=None):
     """
     used to update a successfully found job
     :param job: job obj
     :param search_results: json returned from metadata provider
+    :param title: the title that was searched for, to prefer an exact match (see best_search_result)
+    :param year: the year that was searched for
     :return: None if error
     """
     # logging.debug(f"s =======  {search_results}")
-    if 'Search' not in search_results:
+    if 'Search' not in search_results or not search_results['Search']:
         return None
-    new_year = search_results['Search'][0]['Year']
-    title = utils.clean_for_filename(search_results['Search'][0]['Title'])
+    best = best_search_result(search_results['Search'], title, year)
+    if best is not search_results['Search'][0]:
+        logging.info(f"Search for '{title}' returned '{search_results['Search'][0]['Title']}' first; "
+                     f"taking the exact match '{best['Title']}' ({best['Year']})")
+    new_year = best['Year']
+    title = utils.clean_for_filename(best['Title'])
     logging.debug(f"Webservice successful.  New title is {title}.  New Year is: {new_year}")
     args = {
         'year_auto': str(new_year),
         'year': str(new_year),
         'title_auto': title,
         'title': title,
-        'video_type_auto': search_results['Search'][0]['Type'],
-        'video_type': search_results['Search'][0]['Type'],
-        'imdb_id_auto': search_results['Search'][0]['imdbID'],
-        'imdb_id': search_results['Search'][0]['imdbID'],
-        'poster_url_auto': search_results['Search'][0]['Poster'],
-        'poster_url': search_results['Search'][0]['Poster'],
+        'video_type_auto': best['Type'],
+        'video_type': best['Type'],
+        'imdb_id_auto': best['imdbID'],
+        'imdb_id': best['imdbID'],
+        'poster_url_auto': best['Poster'],
+        'poster_url': best['Poster'],
         'hasnicetitle': True
     }
     return utils.database_updater(args, job)
@@ -403,12 +450,12 @@ def metadata_selector(job, title=None, year=None):
         logging.debug("provider tmdb")
         search_results = ui_utils.tmdb_search(title, year)
         if search_results is not None:
-            update_job(job, search_results)
+            update_job(job, search_results, title, year)
     elif cfg.arm_config['METADATA_PROVIDER'].lower() == "omdb":
         logging.debug("provider omdb")
         search_results = ui_utils.call_omdb_api(str(title), str(year))
         if search_results is not None:
-            update_job(job, search_results)
+            update_job(job, search_results, title, year)
     else:
         logging.debug(cfg.arm_config['METADATA_PROVIDER'])
         logging.debug("unknown provider - doing nothing, saying nothing. Getting Kryten")
