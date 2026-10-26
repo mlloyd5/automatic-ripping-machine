@@ -472,8 +472,12 @@ def metadata_selector(job, title=None, year=None):
     # The year can be wrong. A Blu-ray's comes from the date of its bdmt_eng.xml, which is when
     # that release was authored: 2016 for a pressing of RED 2 (2013), and TMDB filtered to 2016
     # has no RED 2, so its first result "High & Low The Red Rain" was taken. When the year
-    # leaves out every exact title match but the same search without it finds one, drop the year.
-    if year and not has_exact_match(search_results, title):
+    # search returns films but none whose title even starts with the query, and the same search
+    # without the year finds the exact title, drop the year. A label is often the start of the
+    # title: "Stagecoach" in 2017 finds "Stagecoach: The Texas Jack Story", the film on the disc,
+    # where the yearless search would take the 1939 "Stagecoach". An empty year search is left
+    # to identify_loop, which tries the year before next.
+    if year and has_results(search_results) and not has_title_starting_with(search_results, title):
         without_year = provider_search(provider, title, None)
         if has_exact_match(without_year, title):
             logging.info(f"Search for '{title}' in {year} has no exact title match; "
@@ -489,6 +493,19 @@ def provider_search(provider, title, year):
     if provider == "tmdb":
         return ui_utils.tmdb_search(title, year)
     return ui_utils.call_omdb_api(str(title), str(year))
+
+
+def has_results(search_results) -> bool:
+    """Whether a search returned anything at all."""
+    return bool(search_results and search_results.get('Search'))
+
+
+def has_title_starting_with(search_results, title) -> bool:
+    """Whether a search returned a result whose title starts with ``title`` (compared as in best_search_result)."""
+    wanted = _normalise_title(title)
+    return has_results(search_results) and any(
+        _normalise_title(result.get("Title") or result.get("title")).startswith(wanted)
+        for result in search_results['Search'])
 
 
 def has_exact_match(search_results, title) -> bool:

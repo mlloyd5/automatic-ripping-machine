@@ -44,6 +44,10 @@ DUPLICATE_DURATION_TOLERANCE = 2  # [s]
 """Titles whose durations differ by more than this are never treated as duplicates of each other"""
 DUPLICATE_FILESIZE_TOLERANCE = 0.02
 """Titles whose sizes differ by more than this fraction of the larger one are never treated as duplicates"""
+DISC_OPEN_ATTEMPTS = 3
+"""How often makemkvcon info is run before a disc it cannot open is given up on"""
+DISC_OPEN_RETRY_WAIT = 30  # [s]
+"""Pause between those attempts"""
 
 ERROR_MESSAGE_OPERATION_RESULT = "Internal error - Operation result is incorrect (132)"
 ERROR_MESSAGE_TRAY_OPEN = "Scsi error - NOT READY:MEDIUM NOT PRESENT - TRAY OPEN"
@@ -1021,13 +1025,15 @@ class TrackInfoProcessor:
         self.filesize = 0
         self.source_file = ""
         self.segment_map = ""
+        self.open_failed = False
 
     def process_messages(self):
         output_types = (
             OutputType.CINFO |
             OutputType.SINFO |
             OutputType.TCOUNT |
-            OutputType.TINFO
+            OutputType.TINFO |
+            OutputType.MSG
         )
         options = []  # add relevant options here if needed
 
@@ -1042,6 +1048,8 @@ class TrackInfoProcessor:
             self._handle_track_or_stream_info(message)
         elif isinstance(message, Titles):
             self._handle_titles(message)
+        elif isinstance(message, MakeMKVMessage) and message.code == MessageID.RIP_DISC_OPEN_ERROR:
+            self.open_failed = True
 
     def _handle_track_or_stream_info(self, message):
         # Detect new track, add previous one if changed
@@ -1125,8 +1133,17 @@ def get_track_info(index, job):
     .. note:: For help with MakeMKV codes:
     https://github.com/automatic-ripping-machine/automatic-ripping-machine/wiki/MakeMKV-Codes
     """
-    processor = TrackInfoProcessor(job, index)
-    processor.process_messages()
+    # MakeMKV sometimes fails to open a disc it opens fine a minute later, seen on the t620 for
+    # a UHD Blu-ray while another drive was ripping. With no titles the rip falls back to
+    # "all", which skips the duplicate title check and rips the main film twice, so try again.
+    for attempt in range(1, DISC_OPEN_ATTEMPTS + 1):
+        processor = TrackInfoProcessor(job, index)
+        processor.process_messages()
+        if not processor.open_failed or attempt == DISC_OPEN_ATTEMPTS:
+            return
+        logging.warning(f"MakeMKV could not open the disc (attempt {attempt} of {DISC_OPEN_ATTEMPTS}); "
+                        f"trying again in {DISC_OPEN_RETRY_WAIT}s")
+        sleep(DISC_OPEN_RETRY_WAIT)
 
 
 def _titles_match(kept, candidate):
