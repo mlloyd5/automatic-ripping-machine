@@ -38,8 +38,20 @@ class RipperException(Exception):
     pass
 
 
-class EmptyDriveException(RipperException):
-    """ARM was started for a drive that never had a disc loaded: nothing to rip, nothing to report."""
+class NothingToDoException(RipperException):
+    """This run has nothing to rip and nothing worth a notification: log a line and exit."""
+
+
+class EmptyDriveException(NothingToDoException):
+    """ARM was started for a drive that never had a disc loaded."""
+
+
+class UnlistedDriveException(NothingToDoException):
+    """ARM was started for a device that is not in its drive list (Settings > Drives)."""
+
+
+class DuplicateRunException(NothingToDoException):
+    """A second udev event for a disc that is already being ripped."""
 
 
 def notify(job, title: str, body: str):
@@ -808,7 +820,7 @@ def duplicate_run_check(dev_path):
     logging.info(f"Job was started {job_time}min ago.")
     if (job_time) < 3:
         logging.info("Job was started less than 3min ago.")
-    raise RipperException(f"Job already running on {dev_path}")
+    raise DuplicateRunException(f"Job already running on {dev_path}")
 
 
 def save_disc_poster(final_directory, job):
@@ -826,7 +838,7 @@ def save_disc_poster(final_directory, job):
         elif os.path.isfile(job.mountpoint + "/JACKET_P/J00___6L.MP2"):
             logging.info("Converting PAL Poster Image")
             os.system(f'ffmpeg -i "{job.mountpoint}/JACKET_P/J00___6L.MP2" "{final_directory}/poster.png"')
-        os.system(f"umount {job.devpath}")
+        os.system(f"umount {job.mountpoint or job.devpath}")
 
 
 def check_for_dupe_folder(have_dupes, hb_out_path, job):

@@ -78,6 +78,17 @@ def check_mount(job: Job) -> bool:
     return True
 
 
+def unmount_disc(job):
+    """
+    Unmount the disc so the drive is free (to eject, and so the next disc is not read through
+    this mount). By mountpoint, not device: where the device node is itself a bind-mount target
+    (Proxmox LXC passthrough) ``umount /dev/sr1`` tries to unmount that tmpfs instead and fails
+    with "must be superuser", leaving the mount in place for the next disc.
+    """
+    target = job.mountpoint if job.mountpoint and os.path.isdir(str(job.mountpoint)) else job.devpath
+    arm_subprocess(["umount", target])
+
+
 def identify(job):
     """Identify disc attributes"""
     logging.debug("Identify Entry point --- job ----")
@@ -109,8 +120,7 @@ def identify(job):
                          f"year:{job.year} video_type:{job.video_type} "
                          f"disctype: {job.disctype}")
             logging.debug(f"identify.job.end ---- \n\r{job.pretty_table()}")
-    # No need to warn if we cant unmount
-    arm_subprocess(["umount", job.devpath])
+    unmount_disc(job)
 
 
 def identify_bluray(job):

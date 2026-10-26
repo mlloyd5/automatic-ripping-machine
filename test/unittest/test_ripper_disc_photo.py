@@ -233,6 +233,18 @@ class TestUpcLookup(unittest.TestCase):
         {"title": "Inception - Widescreen", "category": ""},
     ]}
 
+    def test_software_category_and_format_in_title_count_as_video(self):
+        # upcitemdb files many discs under "Software"; the title usually names the format anyway
+        self.assertTrue(disc_photo.is_video_product(
+            {"title": "The Banger Sisters (DVD) GOLDIE HAWN", "category": "Software"}))
+        self.assertTrue(disc_photo.is_video_product({"title": "Some Film", "category": "Software"}))
+        self.assertTrue(disc_photo.is_video_product({"title": "Some Film Blu-ray", "category": "Toys & Games"}))
+        self.assertFalse(disc_photo.is_video_product({"title": "Some Toy Robot", "category": "Toys & Games > Robots"}))
+        results = disc_photo.parse_upc_response({"code": "OK", "items": [
+            {"title": "The Banger Sisters (DVD) GOLDIE HAWN", "category": "Software"}]})
+        self.assertEqual([r["title"] for r in results], ["The Banger Sisters", "The Banger Sisters GOLDIE HAWN"])
+        self.assertEqual(results[0]["raw"], "The Banger Sisters (DVD) GOLDIE HAWN")
+
     def test_parse_keeps_video_items_in_order(self):
         results = disc_photo.parse_upc_response(self.PAYLOAD)
         self.assertEqual([r["title"] for r in results], ["Inception", "Inception"])

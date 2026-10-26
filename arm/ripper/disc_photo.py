@@ -339,17 +339,25 @@ def _plausible_year(year: str) -> bool:
         return False
 
 
+_FORMAT_IN_TITLE_RE = re.compile(r"\b(dvd|blu-?ray|bd|hd-?dvd|4k|uhd|video)\b", re.IGNORECASE)
+_VIDEO_CATEGORY_RE = re.compile(r"(movie|tv|television|video|dvd|blu|media|software)", re.IGNORECASE)
+
+
 def is_video_product(item: dict) -> bool:
     """
     True unless the UPC database says the product is clearly not a film or TV release.
 
-    The category string looks like ``"Media > Movies & TV > DVDs"``; items without one are
-    given the benefit of the doubt.
+    The category string looks like ``"Media > Movies & TV > DVDs"``, but upcitemdb files plenty
+    of discs under ``"Software"`` (The Banger Sisters, Fox 2002, for one), so that counts too,
+    and a title that names the format ("The Banger Sisters (DVD) GOLDIE HAWN") is a disc whatever
+    the category says. Items without a category are given the benefit of the doubt.
     """
+    if _FORMAT_IN_TITLE_RE.search(str(item.get("title") or "")):
+        return True
     category = str(item.get("category") or "")
     if not category:
         return True
-    return bool(re.search(r"(movie|tv|television|video|dvd|blu|media)", category, re.IGNORECASE))
+    return bool(_VIDEO_CATEGORY_RE.search(category))
 
 
 def parse_upc_response(payload: dict) -> List[dict]:
@@ -364,10 +372,14 @@ def parse_upc_response(payload: dict) -> List[dict]:
     for item in payload.get("items") or []:
         if not isinstance(item, dict) or not is_video_product(item):
             continue
-        title, year = clean_upc_title(item.get("title"))
-        if not title:
-            continue
-        results.append({"title": title, "year": year, "raw": str(item.get("title") or "")})
+        raw = str(item.get("title") or "")
+        title, year = clean_upc_title(raw)
+        # Marketing text usually follows the format bracket ("The Banger Sisters (DVD) GOLDIE HAWN"),
+        # and a title search with it on finds nothing: offer the part before the bracket first.
+        head, _ = clean_upc_title(re.split(r"[(\[]", raw, maxsplit=1)[0])
+        for candidate in (head, title):
+            if candidate and candidate not in [r["title"] for r in results if r["raw"] == raw]:
+                results.append({"title": candidate, "year": year, "raw": raw})
     return results
 
 

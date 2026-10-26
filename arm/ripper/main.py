@@ -209,7 +209,10 @@ def setup():
     arm_log = logger.create_early_logger(syslog=args.syslog)
     # Make sure all directories are fully setup
     utils.arm_setup(arm_log)
-    drive = SystemDrives.query.filter_by(mount=devpath).one()  # unique mounts
+    drive = SystemDrives.query.filter_by(mount=devpath).one_or_none()  # unique mounts
+    if drive is None:
+        # A drive removed from Settings > Drives still raises udev events; nothing to do for it
+        raise utils.UnlistedDriveException(f"{devpath} is not in ARM's drive list (Settings > Drives)")
 
     # udev starts ARM when the tray closes, which is well before some drives can read the disc
     # (an LG SP80NB80 needs a moment, an HL-DT-ST DT80N ~16 s with a dual-layer DVD): wait for it.
@@ -291,7 +294,7 @@ if __name__ == "__main__":
     try:
         setup()
         main()
-    except utils.EmptyDriveException as error:
+    except utils.NothingToDoException as error:
         logging.info(f"Nothing to rip: {error}")
     except Exception as error:
         logging.critical("A fatal error has occurred and ARM is exiting.")
