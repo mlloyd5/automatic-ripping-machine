@@ -6,13 +6,15 @@ import os
 import logging
 from importlib.util import find_spec
 from pathlib import Path
+from types import SimpleNamespace
 
 # If the arm module can't be found, add the folder this file is in to PYTHONPATH
 # This is a bad workaround for non-existent packaging
 if find_spec("arm") is None:
     sys.path.append(str(Path(__file__).parents[2]))
 
-from arm.ripper import utils, makemkv, handbrake, ffmpeg  # noqa E402
+import arm.config.config as cfg  # noqa E402
+from arm.ripper import utils, makemkv, handbrake, ffmpeg, identify  # noqa E402
 from arm.ui import app, db, constants  # noqa E402
 from arm.models.job import JobState  # noqa E402
 
@@ -24,6 +26,10 @@ MAIN_FEATURE_MIN_FRACTION = 0.7
 # the runtime the metadata provider gives (PAL discs run 4% fast), and never closer than this many seconds.
 RUNTIME_TOLERANCE_FRACTION = 0.06
 RUNTIME_TOLERANCE_MIN = 180
+
+# When the identified film's runtime fits none of the disc's feature-length titles, the runtimes of
+# at most this many other films with the disc's title are looked up (one provider request each).
+RUNTIME_CHECK_MAX_CANDIDATES = 6
 
 
 def rip_visual_media(have_dupes, job, logfile, protection):
@@ -71,6 +77,12 @@ def rip_visual_media(have_dupes, job, logfile, protection):
         except Exception as mkv_error:  # noqa: E722
             raise utils.RipperException("Error while running MakeMKV") from mkv_error
 
+        # The titles' lengths are known now, so the identification can be checked against them.
+        # The rip is done by now: a failed check must not fail the job.
+        try:
+            check_runtime(job)
+        except Exception as error:
+            logging.error(f"Checking the runtime of {job.title} failed: {error}", exc_info=True)
         if job.config.NOTIFY_RIP:
             utils.notify(job, constants.NOTIFY_TITLE, f"{job.title} rip complete. Starting transcode. ")
         logging.info("************* Ripping with MakeMKV completed *************")
@@ -86,9 +98,9 @@ def rip_visual_media(have_dupes, job, logfile, protection):
         utils.delete_raw_files([transcode_out_path])
         transcode_out_path = transcode_in_path
 
-    # Update final path if user has set a custom/manual title
+    # Update final path if user has set a custom/manual title, or check_runtime found a better match
     logging.debug(f"Job title status: [{job.title_manual}]")
-    if job.title_manual:
+    if job.title_manual or utils.fix_job_title(job) != job_title:
         # Remove the old final dir
         utils.delete_raw_files([final_directory])
         job_title = utils.fix_job_title(job)
@@ -291,6 +303,97 @@ def match_tracks_to_films(tracks, films):
         logging.info(f"Title {track.track_number} ({track.filename}, {track.length}s) is {film.folder_name}: "
                      f"{difference}s off its {film.runtime}s runtime{pal}")
     return matched
+
+
+def feature_length_titles(job):
+    """
+    The disc's titles that are long enough to be the film: within MAIN_FEATURE_MIN_FRACTION of the
+    longest, so a theatrical and an extended cut both count but the extras do not\n
+    :return: list of tracks
+    """
+    tracks = [track for track in job.tracks if int(track.length or 0) > 0]
+    if not tracks:
+        return []
+    longest = max(int(track.length) for track in tracks)
+    return [track for track in tracks if int(track.length) >= longest * MAIN_FEATURE_MIN_FRACTION]
+
+
+def runtime_fit(runtime, tracks):
+    """
+    How close the nearest of these titles comes to a film's runtime as the disc plays it (see
+    expected_length), when it is within the tolerance match_tracks_to_films uses\n
+    :param runtime: the film's runtime in seconds
+    :return: the difference in seconds, or None when no title fits
+    """
+    best = None
+    for track in tracks:
+        expected = expected_length(SimpleNamespace(runtime=runtime), track)
+        tolerance = max(RUNTIME_TOLERANCE_MIN, expected * RUNTIME_TOLERANCE_FRACTION)
+        difference = abs(int(track.length) - expected)
+        if difference <= tolerance and (best is None or difference < best):
+            best = difference
+    return best
+
+
+def check_runtime(job):
+    """
+    Check the film the disc was identified as against the disc: its runtime has to fit one of the
+    feature-length titles. The year of a Blu-ray is when the release was authored, so a search can
+    find the wrong film of that title: RED in 2017 is a 15 minute short, not RED (2010), whose 111
+    minutes the disc's main title runs. When the runtime does not fit, the other films with the
+    disc's title are tried (identify.runtime_candidates) and the one whose runtime fits best is
+    taken; when none fits, the title is kept and the user is told it may be wrong.
+
+    A runtime more than RUNTIME_TOLERANCE_MIN off but within the tolerance only loosely fits: RED 2
+    (116 min) once became "High & Low The Red Rain" (110 min), which is 6 minutes short of the disc
+    and inside the 6%. Then the other films are tried too, and one is only taken when it fits
+    closely (within RUNTIME_TOLERANCE_MIN); otherwise the identification stands without a word.
+
+    Left alone: titles set by hand, series, double features (file_collection matches those by
+    runtime), and films the provider has no runtime for\n
+    :return: True when the job was given another film
+    """
+    if (not cfg.arm_config.get("GET_VIDEO_TITLE") or job.title_manual or job.video_type != "movie"
+            or not job.imdb_id or collection_films(job)):
+        return False
+    tracks = feature_length_titles(job)
+    runtime = identify.identified_runtime(job) if tracks else None
+    if not runtime:
+        logging.info(f"No runtime known for {job.title} ({job.year}) or no titles to compare; not checked")
+        return False
+    main_title = max(int(track.length) for track in tracks)
+    current = runtime_fit(runtime, tracks)
+    if current is not None and current <= RUNTIME_TOLERANCE_MIN:
+        logging.info(f"{job.title} ({job.year}) runs {runtime // 60} min, which fits the disc "
+                     f"(main title {main_title // 60} min)")
+        return False
+    if current is None:
+        logging.warning(f"{job.title} ({job.year}) runs {runtime // 60} min but the disc's main title runs "
+                        f"{main_title // 60} min; looking for a film of that title that fits")
+    else:
+        logging.info(f"{job.title} ({job.year}) runs {runtime // 60} min, {current}s off the disc's titles; "
+                     "looking for a film of that title that fits better")
+    fits = []
+    for candidate in identify.runtime_candidates(job)[:RUNTIME_CHECK_MAX_CANDIDATES]:
+        candidate_runtime = identify.film_runtime(candidate)
+        difference = runtime_fit(candidate_runtime, tracks) if candidate_runtime else None
+        if current is not None and difference is not None and difference > min(current, RUNTIME_TOLERANCE_MIN):
+            difference = None  # the identified film fits loosely; only a close fit replaces it
+        logging.info(f"  {candidate['Title']} ({candidate['Year']}): "
+                     f"{candidate_runtime // 60 if candidate_runtime else 'unknown'} min"
+                     f"{'' if difference is None else ', fits'}")
+        if difference is not None:
+            fits.append((difference, -identify.vote_count(candidate), candidate))
+    if not fits:
+        if current is None:
+            utils.notify(job, constants.NOTIFY_TITLE,
+                         f"{job.title} ({job.year}) runs {runtime // 60} min, but the disc's main title runs "
+                         f"{main_title // 60} min. The title may be wrong; check the completed folder.")
+        return False
+    best = min(fits, key=lambda fit: fit[:2])[2]
+    logging.info(f"Identifying the disc as {best['Title']} ({best['Year']}) instead of {job.title} ({job.year})")
+    identify.apply_search_result(job, best)
+    return True
 
 
 def file_film(out_path, filename, film, job):
