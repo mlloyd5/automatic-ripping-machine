@@ -133,6 +133,12 @@ beside it:
   shipped under a suffix (`<Title (Year)> - <disc label>`, because the media
   box already had that title), the extras go into the unsuffixed folder of the
   same title, which Plex shows as the same movie.
+* A second bonus disc with the same disc label (two copies of one disc, or a
+  re-rip) after the first one's extras have shipped collides: ARM
+  numbers a taken name (`-2`, `-3`) only against the local folder, so both
+  discs' extras are `<label>_title_tNN.mkv` and there is no fallback name.
+  Its holding folder stays on the ripper (run exits 1) until the extras are
+  renamed or moved by hand.
 
 ## Requirements
 

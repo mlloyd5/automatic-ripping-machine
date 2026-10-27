@@ -852,6 +852,24 @@ class BonusDisc(MediaBoxFixture):
         self.assertTrue(os.path.isdir(self._local("movies", "Movie A (2001)")))
         self.assertEqual(self._dest_folders("Movies"), [])
 
+    def test_bonus_disc_record_is_a_bonus_whatever_its_files_look_like(self):
+        cfg = shipper.load_config(self.conf)
+        holding = "Movie A (2001) - bonus job11"
+        # A top-level file named like the folder is what the record takes for a main feature
+        folder = self._folder("movies", holding, [f"{holding}.mkv", "extras/MOVIE_A_BONUS_title_t01.mkv"])
+        job = {"job_id": 11, "bonus_of_job_id": 1, "title": "Movie A", "year": "2001", "label": "MOVIE_A_BONUS",
+               "video_type": "movie", "disctype": "dvd", "stop_time": "2026-10-26 18:00:00"}
+        _, text = shipper.catalog_record(cfg, "movies", folder, job, remote_name="Movie A (2001)")
+        top, files = parse_record(text)
+        self.assertEqual((top["role"], top["bonus_of"]), ("bonus", 1))
+        self.assertTrue(any(f["main"] for f in files))
+        # The later film of a double feature, whose folder has no job but the bonus disc's: still that film
+        later = self._folder("movies", "Movie B (2003)", ["Movie B (2003).mkv", "extras/MOVIE_A_BONUS_title_t01.mkv"])
+        _, text = shipper.catalog_record(cfg, "movies", later, dict(job, title="Movie B", year="2003"))
+        top, _ = parse_record(text)
+        self.assertEqual(top["role"], "feature")
+        self.assertNotIn("bonus_of", top)
+
     def test_bonus_remote_name_needs_the_bonus_job_itself(self):
         folder = self._local("movies", "Movie A (2001) - bonus job11")
         self.assertEqual(shipper.bonus_remote_name(folder, {"job_id": 11, "bonus_of_job_id": 1}), "Movie A (2001)")

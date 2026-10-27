@@ -3,6 +3,7 @@ It would help clear up main and make things easier to find
 """
 import sys
 import os
+import shutil
 import logging
 from importlib.util import find_spec
 from pathlib import Path
@@ -112,7 +113,7 @@ def rip_visual_media(have_dupes, job, logfile, protection):
         if not bonus:
             logging.info(f"Job was marked as the bonus disc of job {job.bonus_of_job_id} during the rip; "
                          "filing its titles as extras")
-            remove_empty_dir(final_directory)
+            remove_unused_final_dir(final_directory, bonus_folder(job))
             bonus_transcode_path = transcode_folder
             bonus = True
         # The film's folder may have shipped (or the choice changed) since the rip started
@@ -291,6 +292,11 @@ def apply_bonus_settings(job):
     The job takes the film's title, year and metadata id, and its config (this job's only) rips every
     title of at least BONUS_MINLENGTH seconds in one MakeMKV pass: no maximum length, no duplicate-title
     skipping (which rips title by title, re-scanning the disc for every one) and no main feature\n
+    RIPMETHOD is "mkv" so a DVD is ripped by MakeMKV too (rip_with_mkv) and any transcode is
+    handbrake_mkv/ffmpeg_mkv of the ripped files: handbrake_all/ffmpeg_all (the other methods, or a DVD
+    under mkv with MAINFEATURE on) pick titles by arm.yaml's MINLENGTH/MAXLENGTH, not this job's, and
+    would skip every featurette; a "backup"/"backup_dvd" Blu-ray backup is a disc structure that
+    file_bonus has no video files to file from\n
     :param job: Current job
     :return: True when the job is a bonus disc
     """
@@ -302,8 +308,10 @@ def apply_bonus_settings(job):
     name = film.folder_name if film is not None else utils.fix_job_title(parent)
     logging.info(f"Bonus disc of job {parent.job_id} ({name}, disc {parent.label}): "
                  f"ripping every title of at least {minlength}s and filing them all as extras")
+    if job.config.RIPMETHOD != "mkv":
+        logging.info(f"Bonus disc: ripping with RIPMETHOD mkv instead of {job.config.RIPMETHOD}")
     utils.database_updater({'MINLENGTH': str(minlength), 'MAXLENGTH': "99999", 'SKIP_DUPLICATE_TITLES': False,
-                            'MAINFEATURE': False}, job.config)
+                            'MAINFEATURE': False, 'RIPMETHOD': "mkv"}, job.config)
     utils.database_updater({'title': source.title, 'year': source.year, 'imdb_id': source.imdb_id,
                             'poster_url': source.poster_url, 'video_type': "movie", 'hasnicetitle': True}, job)
     return True
@@ -363,6 +371,24 @@ def file_bonus(out_path, job, files):
     for name in videos:
         utils.move_files(out_path, name, job, False)
     return len(videos)
+
+
+def remove_unused_final_dir(path, bonus_path):
+    """
+    Remove the completed folder a job made for itself before it was marked as a bonus disc mid-rip.
+    check_for_dupe_folder made it (an existing folder gets a new ``_<stage>`` name, or stops the rip), so
+    it holds at most save_disc_poster's poster.png: left behind it would never ship (no job has it as its
+    path) and would stop the next rip of that title as a duplicate. Never the bonus disc's own folder.\n
+    :param path: the job's final directory from before the mark
+    :param bonus_path: where the bonus disc's extras go (bonus_folder)
+    :return: None
+    """
+    if os.path.realpath(path) == os.path.realpath(bonus_path):
+        return
+    if os.path.isdir(path):
+        logging.info(f"Removing {path} ({', '.join(sorted(os.listdir(path))) or 'empty'}): "
+                     "the job's titles are filed as extras instead")
+        shutil.rmtree(path, ignore_errors=True)
 
 
 def remove_empty_dir(path):

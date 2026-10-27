@@ -37,6 +37,7 @@ When the wait ends with the disc marked, the job's own config (not `arm.yaml`) i
 | `MAXLENGTH` | `99999` | One MakeMKV `mkv ... all` pass over the disc |
 | `SKIP_DUPLICATE_TITLES` | `false` | Skipping duplicates rips title by title, and MakeMKV re-scans the whole disc for every title (11 minutes per scan on a slow drive) |
 | `MAINFEATURE` | `false` | There is no main feature: everything is an extra |
+| `RIPMETHOD` | `mkv` | A DVD is ripped by MakeMKV too, and any transcode (`SKIP_TRANSCODE: false`) is HandBrake's or FFmpeg's pass over the ripped files, which keeps every title. The other paths pick titles from the disc by `arm.yaml`'s `MINLENGTH`/`MAXLENGTH`, not the job's, and would skip every featurette; a `backup`/`backup_dvd` Blu-ray backup leaves no title files to file |
 
 Every ripped title is then filed in the film's `EXTRAS_SUB` folder (`extras` when `EXTRAS_SUB` is
 `None`), named `<disc label>_<title file>`, for example
@@ -50,7 +51,8 @@ bonus disc. An empty leftover transcode folder of the film's name would make the
 film stop with "Duplicate rips are disabled".
 
 A disc marked after the wait (while it is ripping) is still filed as extras, but it is ripped with
-the usual settings, so short titles and duplicate titles are missing.
+the usual settings, so short titles and duplicate titles are missing. The completed folder made for
+it when the rip started (holding at most the disc's `poster.png`) is removed.
 
 ### Where the extras go
 
@@ -61,6 +63,11 @@ the usual settings, so short titles and duplicate titles are missing.
   for example): into `<film folder> - bonus job<id>/extras/` beside where it was. The shipper adds
   that folder's files to the film's folder on the media server, never replacing a file there. If
   you move rips by hand, move the extras into the film's folder yourself.
+
+The `-2`, `-3` names only see the local folder. Once the film has shipped, a second bonus disc with
+the same disc label (two copies of one disc, or a re-rip) has the same `<disc label>_title_tNN.mkv`
+names as the first one's extras on the media server, and there is no other name to fall back to: the
+shipper leaves its folder on the ripper. Rename or move those extras by hand.
 
 ## Settings
 

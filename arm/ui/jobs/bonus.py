@@ -9,6 +9,8 @@ from arm.models.film import Film
 
 BONUS_CANDIDATES = 20
 """How many recent successful movie jobs the bonus disc page offers"""
+CANDIDATE_DISCTYPES = ("dvd", "bluray")
+"""Disc types whose rips a disc can be the bonus disc of"""
 
 
 def film_label(title, year):
@@ -27,7 +29,7 @@ def bonus_candidates(job, limit=BONUS_CANDIDATES):
     :return: list of dicts with 'job' and 'films' (the job's films after the first, by position)
     """
     query = Job.query.filter(Job.status == JobState.SUCCESS.value, Job.video_type == "movie",
-                             Job.disctype.in_(("dvd", "bluray")), Job.job_id != job.job_id,
+                             Job.disctype.in_(CANDIDATE_DISCTYPES), Job.job_id != job.job_id,
                              Job.bonus_of_job_id.is_(None))
     jobs = query.order_by(Job.stop_time.desc(), Job.job_id.desc()).limit(limit).all()
     current = Job.query.get(job.bonus_of_job_id) if job.bonus_of_job_id else None
@@ -35,6 +37,15 @@ def bonus_candidates(job, limit=BONUS_CANDIDATES):
         jobs.append(current)
     return [{'job': candidate, 'films': [film for film in candidate.films if int(film.position or 1) > 1]}
             for candidate in jobs]
+
+
+def is_candidate(parent):
+    """
+    True when a job can be the film of a bonus disc: the bonus_candidates filter, checked on a posted choice
+    too (a stale form or a hand-made POST), since the ripper files the extras in the job's finished folder.
+    """
+    return (parent.status == JobState.SUCCESS.value and parent.video_type == "movie"
+            and parent.disctype in CANDIDATE_DISCTYPES)
 
 
 def parse_choice(choice):
@@ -83,6 +94,9 @@ def set_bonus_of(job, choice):
         return False, "That job cannot be the film of this bonus disc"
     if parent.bonus_of_job_id:
         return False, f"Job {parent.job_id} is a bonus disc itself"
+    if not is_candidate(parent):
+        return False, (f"Job {parent.job_id} is not a finished DVD or Blu-ray film rip "
+                       f"({parent.disctype} {parent.video_type}, {parent.status})")
     source = film if film is not None and int(film.position or 1) > 1 else parent
     job.bonus_of_job_id = parent.job_id
     job.bonus_of_film_id = film.film_id if film is not None else None

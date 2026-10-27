@@ -902,6 +902,15 @@ def catalog_record(cfg, sub_folder, local_folder, job, remote_name=None):
         rows.append(row)
     id_key, id_value = _metadata_id(job)
     title = _clean(job.get("title_manual")) or _clean(job.get("title")) or folder
+    # A bonus disc's own folder holds only extras of the film it ships into, whatever its files look like
+    # (a disc marked once its rip had started was ripped with MAINFEATURE on).  Not keyed on
+    # bonus_of_job_id alone: a folder with no job of its own but the bonus disc's (the later film of a
+    # double feature) still holds that film's feature.
+    bonus_of = int(job["bonus_of_job_id"]) if bonus_remote_name(local_folder, job) else None
+    if bonus_of is not None:
+        role = "bonus"
+    else:
+        role = "feature" if sub_folder == "tv" or any(row["main"] for row in rows) else "bonus"
     lines = ["# Catalog record written by the ARM completed-rip shipper for one shipped rip.",
              "# What the ripper knew about the disc, then every media file it delivered with what the",
              "# file's Matroska header says.  Consumed by the media catalog's import; safe to re-import."]
@@ -918,8 +927,8 @@ def catalog_record(cfg, sub_folder, local_folder, job, remote_name=None):
         ("source", library_path(sub_folder, folder)),
         ("label", _clean(job.get("label")) or ""),
         ("format", disc_format(job, rows)),
-        ("role", "feature" if sub_folder == "tv" or any(row["main"] for row in rows) else "bonus"),
-        ("bonus_of", int(job["bonus_of_job_id"]) if bonus_remote_name(local_folder, job) else None),
+        ("role", role),
+        ("bonus_of", bonus_of),
         ("sleeve", _clean(job.get("sleeve_id"))),
         ("box", _clean(job.get("box"))),
         ("barcode", _clean(job.get("disc_barcode"))),

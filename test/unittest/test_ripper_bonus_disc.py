@@ -117,9 +117,13 @@ class BonusFixture(unittest.TestCase):
                                tracks=_Tracks(tracks), films=[], path=path or self.film_path,
                                bonus_of_job_id=40 if parent else None, bonus_of=parent,
                                bonus_of_film_id=film.film_id if film else None, bonus_of_film=film,
+                               disctype="dvd", devpath="/dev/sr0", errors=[], disc_photo=None, disc_barcode=None,
                                config=SimpleNamespace(MAINFEATURE=True, EXTRAS_SUB=extras_sub, DEST_EXT="mkv",
                                                       COMPLETED_PATH=self.completed, MINLENGTH="600",
-                                                      MAXLENGTH="36000", SKIP_DUPLICATE_TITLES=True))
+                                                      MAXLENGTH="36000", SKIP_DUPLICATE_TITLES=True,
+                                                      RIPMETHOD="best", SKIP_TRANSCODE=False, USE_FFMPEG=False,
+                                                      TRANSCODE_PATH=os.path.join(self.root, "transcode"),
+                                                      NOTIFY_RIP=False, NOTIFY_TRANSCODE=False))
 
 
 class TestBonusParent(BonusFixture):
@@ -158,6 +162,29 @@ class TestBonusSettings(BonusFixture):
         self.assertFalse(job.config.MAINFEATURE)
         self.assertEqual((job.title, job.year, job.imdb_id, job.poster_url, job.video_type),
                          ("Monsters, Inc.", "2001", "tt0198781", "http://poster", "movie"))
+
+    def test_dvd_is_ripped_by_makemkv_and_transcoded_without_a_length_filter(self):
+        # handbrake_all/ffmpeg_all pick titles by arm.yaml's MINLENGTH (600s here), not the job's
+        for disctype in ("dvd", "bluray"):
+            for method in ("best", "mkv", "backup", "backup_dvd"):
+                for use_ffmpeg in (False, True):
+                    job = self._job()
+                    job.disctype, job.config.RIPMETHOD, job.config.USE_FFMPEG = disctype, method, use_ffmpeg
+                    self.assertTrue(arm_ripper.apply_bonus_settings(job))
+                    label = f"{disctype} {method} ffmpeg={use_ffmpeg}"
+                    self.assertEqual(job.config.RIPMETHOD, "mkv", label)
+                    self.assertTrue(arm_ripper.rip_with_mkv(job), label)
+                    with mock.patch.object(arm_ripper.handbrake, "handbrake_mkv") as hb_mkv, \
+                            mock.patch.object(arm_ripper.handbrake, "handbrake_all") as hb_all, \
+                            mock.patch.object(arm_ripper.handbrake, "handbrake_main_feature") as hb_main, \
+                            mock.patch.object(arm_ripper.ffmpeg, "ffmpeg_mkv") as ff_mkv, \
+                            mock.patch.object(arm_ripper.ffmpeg, "ffmpeg_all") as ff_all, \
+                            mock.patch.object(arm_ripper.ffmpeg, "ffmpeg_main_feature") as ff_main, \
+                            mock.patch.object(arm_ripper.db.session, "commit"):
+                        arm_ripper.start_transcode(job, "log", self.raw_path, self.root, 0)
+                    self.assertEqual((ff_mkv if use_ffmpeg else hb_mkv).call_count, 1, label)
+                    for other in (hb_all, hb_main, ff_all, ff_main, ff_mkv if not use_ffmpeg else hb_mkv):
+                        other.assert_not_called()
 
     def test_film_of_a_double_feature_gives_its_own_title(self):
         film = SimpleNamespace(film_id=7, job_id=40, position=2, title="Toy Story 2", year="1999",
@@ -267,6 +294,72 @@ class TestBonusPhoto(BonusFixture):
         self.assertEqual(copied, os.path.join(self.film_path, "disc-bonus-Monsters_Inc.jpg"))
         self.assertEqual(_read(copied), "jpeg\n")
         self.assertEqual(_read(os.path.join(self.film_path, "disc.jpg")), "the film disc\n")
+
+
+class TestMarkDuringRip(BonusFixture):
+    """rip_visual_media when the bonus disc choice is made, or cleared, in the ui while the disc rips."""
+
+    def _rip(self, job, mark):
+        """Rip ``job`` (one title, MakeMKV, no transcode); the ui's choice changes (``mark``) during the rip."""
+        def save_poster(final_directory, _job):
+            with open(os.path.join(final_directory, "poster.png"), "w") as handle:
+                handle.write("png\n")
+
+        job.config.SKIP_TRANSCODE = True
+        with mock.patch.object(arm_ripper.db.session, "refresh", side_effect=lambda _job: mark(job)), \
+                mock.patch.object(arm_ripper.db.session, "commit"), \
+                mock.patch.object(utils, "save_disc_poster", side_effect=save_poster) as poster, \
+                mock.patch.object(arm_ripper.makemkv, "makemkv", return_value=self.raw_path), \
+                mock.patch.object(utils, "scan_emby"), \
+                mock.patch.dict(cfg.arm_config, {"DELRAWFILES": False, "ALLOW_DUPLICATES": True,
+                                                 "DISC_PHOTO_COPY": False}):
+            arm_ripper.rip_visual_media(False, job, "log", 0)
+        return poster
+
+    def _mark(self, job):
+        job.bonus_of_job_id, job.bonus_of = 40, self.parent
+
+    def test_marked_after_the_rip_started(self):
+        job = self._job([_track(0, 600)], parent=False)
+        job.title, job.year = "MONSTERS_BONUS", ""
+        own = os.path.join(self.completed, "movies", "MONSTERS_BONUS")
+        poster = self._rip(job, self._mark)
+        poster.assert_called_once_with(own, job)
+        # The folder made for the job (holding only the disc's poster) is gone, not left to block a re-rip
+        self.assertFalse(os.path.exists(own))
+        self.assertEqual(sorted(os.listdir(os.path.join(self.completed, "movies"))), ["Monsters, Inc. (2001)"])
+        self.assertEqual(job.path, self.film_path)
+        self.assertEqual(sorted(os.listdir(os.path.join(self.film_path, "extras"))),
+                         ["Monsters_Inc_title_t00.mkv", "title_t03.mkv"])
+        self.assertEqual(_read(os.path.join(self.film_path, "Monsters, Inc. (2001).mkv")), "the film\n")
+        self.assertEqual(os.listdir(job.config.TRANSCODE_PATH + "/movies"), [])
+
+    def test_marked_after_the_rip_started_once_the_film_has_shipped(self):
+        shutil.rmtree(self.film_path)
+        job = self._job([_track(0, 600)], parent=False)
+        job.title, job.year = "MONSTERS_BONUS", ""
+        self._rip(job, self._mark)
+        holding = f"{self.film_path} - bonus job41"
+        self.assertEqual(sorted(os.listdir(os.path.join(self.completed, "movies"))), [os.path.basename(holding)])
+        self.assertEqual(os.listdir(os.path.join(holding, "extras")), ["Monsters_Inc_title_t00.mkv"])
+
+    def test_cleared_after_the_rip_started(self):
+        def clear(job):
+            job.bonus_of_job_id = job.bonus_of = None
+
+        job = self._job([_track(0, 600)])
+        poster = self._rip(job, clear)
+        poster.assert_not_called()
+        # Filed the usual way, beside the film's folder rather than in it
+        own = f"{self.film_path}_{job.stage}"
+        self.assertEqual(job.path, own)
+        self.assertEqual(os.listdir(own), ["Monsters, Inc. (2001).mkv"])
+        self.assertEqual(sorted(os.listdir(os.path.join(self.film_path, "extras"))), ["title_t03.mkv"])
+        self.assertEqual(os.listdir(job.config.TRANSCODE_PATH + "/movies"), [])
+
+    def test_unused_folder_is_never_the_bonus_folder(self):
+        arm_ripper.remove_unused_final_dir(self.film_path, self.film_path + os.sep)
+        self.assertTrue(os.path.isfile(os.path.join(self.film_path, "Monsters, Inc. (2001).mkv")))
 
 
 class TestManualWait(BonusFixture):

@@ -175,7 +175,22 @@ class TestBonusDiscPage(unittest.TestCase):
         self.assertIn("cannot be the film", post("job:9999"))
         self.assertIn("Film 9999 not found", post("film:9999"))
         self.assertIn("has finished", post(f"job:{self.toy_story.job_id}", job=self.monsters))
+        # Only what the page offers (a stale form or a hand-made POST): a failed, series, music or
+        # still-identifying job has no finished film folder for the extras
+        refused = [make_job(title="Heat", status="fail", label="HEAT2"),
+                   make_job(title="Show", video_type="series", label="SHOW_D2"),
+                   make_job(title="Album", disctype="music", label="ALBUM2"),
+                   make_job(title="Up", status="active", label="UP", stop_time=None, path=None)]
+        for parent in refused:
+            self.assertIn("is not a finished DVD or Blu-ray film rip", post(f"job:{parent.job_id}"), parent.title)
+        series = make_job(title="Show", video_type="series", label="SHOW_D3")
+        db.session.add(Film(series.job_id, 2, "Show 2", "2002", None))
+        db.session.commit()
+        film = Film.query.filter_by(job_id=series.job_id).one()
+        self.assertIn("is not a finished DVD or Blu-ray film rip", post(f"film:{film.film_id}"))
         self.assertIsNone(Job.query.get(self.disc.job_id).bonus_of_job_id)
+        ok, _ = bonus.set_bonus_of(self.disc, f"job:{self.monsters.job_id}")
+        self.assertTrue(ok)
         self.assertEqual(self.client.get("/bonusdisc?job_id=9999").status_code, 404)
         self.assertEqual(self.client.get("/bonusdisc?job_id=abc").status_code, 404)
 
