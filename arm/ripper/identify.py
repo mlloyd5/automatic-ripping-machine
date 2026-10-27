@@ -13,6 +13,7 @@ import tempfile
 from ast import literal_eval
 
 import pydvdid
+import requests
 import xmltodict
 import xml.parsers.expat
 import arm.config.config as cfg
@@ -784,26 +785,53 @@ def film_runtime(result):
     return None
 
 
+class RuntimeLookupError(Exception):
+    """The provider could not be asked for a film's runtime: network error, rate limit, bad API key"""
+
+
+def _lookup_json(url):
+    """GET a provider URL; any failure to get an answer is a RuntimeLookupError"""
+    try:
+        response = requests.get(url, timeout=30)
+        response.raise_for_status()
+        return response.json()
+    except (requests.RequestException, ValueError) as error:
+        raise RuntimeLookupError(str(error)) from error
+
+
 def identified_runtime(job):
     """
     The runtime, in seconds, of the film the job is identified as (looked up by its IMDb id).
 
+    "No runtime" and "could not ask" are kept apart: None means the provider answered and has no
+    runtime for a film with that id (or it is a series), while a failed lookup raises, so a
+    transient error is not taken for an unknown film (check_runtime then leaves the job alone).
+
     :return: seconds or None
+    :raises RuntimeLookupError: when the provider could not be asked
     """
     if not job.imdb_id:
         return None
     provider = str(cfg.arm_config.get('METADATA_PROVIDER', '')).lower()
+    if provider == "omdb":
+        found = _lookup_json(f"https://www.omdbapi.com/?i={urllib.parse.quote(str(job.imdb_id))}"
+                             f"&r=json&apikey={cfg.arm_config['OMDB_API_KEY']}")
+        if found.get('Response') == "False":
+            if "incorrect imdb id" in str(found.get('Error', '')).lower():
+                return None
+            raise RuntimeLookupError(found.get('Error') or "OMDb gave no answer")
+        return ui_metadata.parse_runtime(found.get('Runtime')) if found.get('Type') == "movie" else None
     if provider != "tmdb":
-        return film_runtime({'imdbID': job.imdb_id, 'Title': job.title})
-    try:
-        found = ui_metadata.tmdb_find(job.imdb_id)
-        if found.get('Type') != "movie":
-            return None
-        tmdb_id = found['results'][0]['id']
-    except Exception as error:
-        logging.debug(f"TMDB has no film with IMDb id {job.imdb_id}: {error}")
         return None
-    return film_runtime({'id': tmdb_id, 'Title': job.title})
+    api_key = cfg.arm_config['TMDB_API_KEY']
+    found = _lookup_json(f"https://api.themoviedb.org/3/find/{urllib.parse.quote(str(job.imdb_id))}"
+                         f"?api_key={api_key}&external_source=imdb_id")
+    movies = found.get('movie_results') or []
+    if not movies:
+        logging.debug(f"TMDB has no film with IMDb id {job.imdb_id}")
+        return None
+    details = _lookup_json(f"https://api.themoviedb.org/3/movie/{movies[0]['id']}?api_key={api_key}")
+    return int(details['runtime']) * 60 if details.get('runtime') else None
 
 
 def _names_title(result, query) -> bool:

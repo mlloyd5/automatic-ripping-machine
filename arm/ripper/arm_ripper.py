@@ -151,9 +151,9 @@ def remove_superseded_folder(old_directory, new_directory):
     :param new_directory: the job's folder now
     """
     poster = os.path.join(old_directory, "poster.png")
-    if os.path.isfile(poster) and not os.path.exists(os.path.join(new_directory, "poster.png")):
-        shutil.move(poster, os.path.join(new_directory, "poster.png"))
     try:
+        if os.path.isfile(poster) and not os.path.exists(os.path.join(new_directory, "poster.png")):
+            shutil.move(poster, os.path.join(new_directory, "poster.png"))
         os.rmdir(old_directory)
         logging.info(f"Removed the superseded folder {old_directory}")
     except FileNotFoundError:
@@ -386,7 +386,8 @@ def check_runtime(job):
     closely (within RUNTIME_TOLERANCE_MIN); otherwise the identification stands without a word.
     A film the provider has no runtime for is treated the same way: a typical wrong pick is a
     little-known film nobody entered a runtime for, but a right one without a runtime must not give
-    way to a film that only loosely fits.
+    way to a film that only loosely fits. When the runtime could not be looked up at all (network
+    error, rate limit), the identification is left alone.
 
     When another film is taken, the user is notified. Left alone: titles set by hand, series,
     double features (file_collection matches those by runtime), and rips without title lengths:
@@ -402,7 +403,11 @@ def check_runtime(job):
         logging.warning(f"MakeMKV listed no title lengths for {job.title} ({job.year}), as with RIPMETHOD backup; "
                         "the identification is not checked against the disc's runtime")
         return False
-    runtime = identify.identified_runtime(job)
+    try:
+        runtime = identify.identified_runtime(job)
+    except identify.RuntimeLookupError as error:
+        logging.warning(f"Could not look up the runtime of {job.title} ({job.year}): {error}; not checked")
+        return False
     main_title = max(int(track.length) for track in tracks)
     current = runtime_fit(runtime, tracks) if runtime else None
     if current is not None and current <= RUNTIME_TOLERANCE_MIN:
@@ -429,10 +434,13 @@ def check_runtime(job):
                          f"{main_title // 60} min. The title may be wrong; check the completed folder.")
         return False
     identified = f"{job.title} ({job.year})"
+    # A re-rip has the earlier job's title and year but not its IMDb id: then only the id changes
+    renamed = f"{utils.clean_for_filename(best['Title'])} ({best['Year']})" != identified
     logging.info(f"Identifying the disc as {best['Title']} ({best['Year']}) instead of {identified}")
     identify.apply_search_result(job, best)
-    utils.notify(job, constants.NOTIFY_TITLE,
-                 f"Identified as {best['Title']} ({best['Year']}) instead of {identified} by runtime")
+    if renamed:
+        utils.notify(job, constants.NOTIFY_TITLE,
+                     f"Identified as {best['Title']} ({best['Year']}) instead of {identified} by runtime")
     return True
 
 

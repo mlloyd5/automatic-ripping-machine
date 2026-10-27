@@ -13,7 +13,6 @@ throwaway arm.yaml is written first and pointed at with ARM_CONFIG_FILE. Needs t
 dependencies ARM itself needs (libdiscid, pyudev); skipped when they are missing.
 """
 import importlib
-import json
 import os
 import shutil
 import tempfile
@@ -236,6 +235,25 @@ class TestCheckRuntime(unittest.TestCase):
         self.assertTrue(arm_ripper.check_runtime(job))
         self.mocks["apply"].assert_called_once_with(job, RED_2010)
 
+    def test_failed_lookup_leaves_the_identification_alone(self):
+        # a network error or rate limit is no "unknown runtime": no candidate search, no switch
+        self.mocks["identified"].side_effect = identify.RuntimeLookupError("429 Too Many Requests")
+        self.mocks["candidates"].return_value = [RED_2010]
+        job = _job("RED", "Red", "2017", RED_2017_SHORT["imdbID"], self.RED_DISC)
+        with self.assertLogs(level="WARNING"):
+            self.assertFalse(arm_ripper.check_runtime(job))
+        self.mocks["candidates"].assert_not_called()
+        self.mocks["apply"].assert_not_called()
+        self.mocks["notify"].assert_not_called()
+
+    def test_rerip_with_the_same_title_is_not_announced(self):
+        # a re-rip copies the earlier job's title and year but not its IMDb id
+        self.mocks["candidates"].return_value = [RED_2010]
+        job = _job("RED", "RED", "2010", RED_2017_SHORT["imdbID"], self.RED_DISC)
+        self.assertTrue(arm_ripper.check_runtime(job))
+        self.mocks["apply"].assert_called_once_with(job, RED_2010)
+        self.mocks["notify"].assert_not_called()
+
     def test_unknown_runtime_stands_against_a_loose_fit(self):
         # RED 2 (116 min) is 5 minutes off the 111 minute title: inside the 6%, but not close, so a
         # correct film TMDB has no runtime for keeps its title, and nobody is told
@@ -285,38 +303,75 @@ class TestCheckRuntime(unittest.TestCase):
 
 @unittest.skipIf(IMPORT_ERROR is not None, f"ARM could not be imported here: {IMPORT_ERROR}")
 class TestIdentifiedRuntime(unittest.TestCase):
-    """identified_runtime with TMDB: /find by the IMDb id, then the film's details for the runtime."""
+    """identified_runtime: /find by the IMDb id, then the film's details (TMDB) or OMDb's lookup by id."""
+
+    RED = {"id": 39514, "title": "RED", "release_date": "2010-10-13"}
 
     def setUp(self):
-        for patch in (mock.patch.dict(identify.cfg.arm_config, {"METADATA_PROVIDER": "tmdb", "TMDB_API_KEY": "x"}),
-                      mock.patch.object(identify.ui_metadata, "tmdb_runtime", return_value=111 * 60)):
-            patch.start()
-            self.addCleanup(patch.stop)
+        patch = mock.patch.dict(identify.cfg.arm_config, {"METADATA_PROVIDER": "tmdb", "TMDB_API_KEY": "x",
+                                                          "OMDB_API_KEY": "y"})
+        patch.start()
+        self.addCleanup(patch.stop)
 
-    def _find(self, movie_results=(), tv_results=()):
-        response = SimpleNamespace(text=json.dumps({"movie_results": list(movie_results),
-                                                    "tv_results": list(tv_results)}))
-        return mock.patch.object(identify.ui_metadata.requests, "get", return_value=response)
+    @staticmethod
+    def _response(payload, status=200):
+        response = mock.Mock(status_code=status)
+        response.json.return_value = payload
+        if status >= 400:
+            response.raise_for_status.side_effect = identify.requests.HTTPError(f"{status} error")
+        return response
+
+    def _get(self, *responses):
+        return mock.patch.object(identify.requests, "get", side_effect=list(responses))
+
+    def _job(self, imdb_id="tt1245526"):
+        return _job("RED", "RED", "2010", imdb_id, [])
 
     def test_film(self):
-        movie = {"id": 39514, "title": "RED", "release_date": "2010-10-13", "poster_path": "/red.jpg",
-                 "overview": "", "backdrop_path": ""}
-        with self._find(movie_results=[movie]):
-            self.assertEqual(identify.identified_runtime(_job("RED", "RED", "2010", "tt1245526", [])), 111 * 60)
-        identify.ui_metadata.tmdb_runtime.assert_called_once_with(39514)
+        with self._get(self._response({"movie_results": [self.RED], "tv_results": []}),
+                       self._response({"id": 39514, "runtime": 111})) as get:
+            self.assertEqual(identify.identified_runtime(self._job()), 111 * 60)
+        self.assertIn("/movie/39514?", get.call_args_list[1].args[0])
+
+    def test_film_without_a_runtime(self):
+        with self._get(self._response({"movie_results": [self.RED], "tv_results": []}),
+                       self._response({"id": 39514, "runtime": 0})):
+            self.assertIsNone(identify.identified_runtime(self._job()))
 
     def test_series(self):
-        show = {"id": 1399, "name": "Red", "first_air_date": "2019-01-01", "poster_path": "", "overview": "",
-                "backdrop_path": ""}
-        with self._find(tv_results=[show]):
-            self.assertIsNone(identify.identified_runtime(_job("RED", "Red", "2019", "tt9999001", [])))
-        identify.ui_metadata.tmdb_runtime.assert_not_called()
+        with self._get(self._response({"movie_results": [], "tv_results": [{"id": 1399, "name": "Red"}]})) as get:
+            self.assertIsNone(identify.identified_runtime(self._job("tt9999001")))
+        get.assert_called_once()
 
     def test_unknown_to_tmdb(self):
-        # tmdb_find indexes the empty tv_results and raises IndexError, which is swallowed
-        with self._find():
-            self.assertIsNone(identify.identified_runtime(_job("RED", "Red", "2017", "tt0000000", [])))
-        identify.ui_metadata.tmdb_runtime.assert_not_called()
+        with self._get(self._response({"movie_results": [], "tv_results": []})) as get:
+            self.assertIsNone(identify.identified_runtime(self._job("tt0000000")))
+        get.assert_called_once()
+
+    def test_failed_lookups_raise(self):
+        failures = {
+            "network error on /find": [identify.requests.ConnectionError("no route")],
+            "rate limited on /find": [self._response({"status_code": 25}, status=429)],
+            "network error on the details": [self._response({"movie_results": [self.RED]}),
+                                             identify.requests.Timeout("timed out")],
+            "not JSON": [mock.Mock(**{"json.side_effect": ValueError("bad json")})],
+        }
+        for name, responses in failures.items():
+            with self.subTest(name), self._get(*responses):
+                with self.assertRaises(identify.RuntimeLookupError):
+                    identify.identified_runtime(self._job())
+
+    def test_omdb(self):
+        with mock.patch.dict(identify.cfg.arm_config, {"METADATA_PROVIDER": "omdb"}):
+            with self._get(self._response({"Response": "True", "Type": "movie", "Runtime": "111 min"})):
+                self.assertEqual(identify.identified_runtime(self._job()), 111 * 60)
+            with self._get(self._response({"Response": "True", "Type": "series", "Runtime": "90 min"})):
+                self.assertIsNone(identify.identified_runtime(self._job()))
+            with self._get(self._response({"Response": "False", "Error": "Incorrect IMDb ID."})):
+                self.assertIsNone(identify.identified_runtime(self._job()))
+            with self._get(self._response({"Response": "False", "Error": "Request limit reached!"})):
+                with self.assertRaises(identify.RuntimeLookupError):
+                    identify.identified_runtime(self._job())
 
 
 @unittest.skipIf(IMPORT_ERROR is not None, f"ARM could not be imported here: {IMPORT_ERROR}")
@@ -391,6 +446,15 @@ class TestRetitleFinalDirectory(unittest.TestCase):
         with self.assertLogs(level="WARNING"):
             arm_ripper.retitle_final_directory(False, job, folder, "movies", "Red (2017)")
         self.assertEqual(os.listdir(folder), ["something.mkv"])
+
+    def test_failed_poster_move_leaves_the_first_folder(self):
+        job, folder = self._job(), self._first_folder()
+        job.title, job.year = "RED", "2010"
+        with mock.patch.object(arm_ripper.shutil, "move", side_effect=OSError("read-only file system")), \
+                self.assertLogs(level="WARNING"):
+            new = arm_ripper.retitle_final_directory(False, job, folder, "movies", "Red (2017)")
+        self.assertEqual(new, os.path.join(self.movies, "RED (2010)"))
+        self.assertTrue(os.path.isfile(os.path.join(folder, "poster.png")))
 
     def test_rip_visual_media_files_the_switched_film_in_its_own_folder(self):
         # RED (2010) was ripped before; this disc is taken for Red (2017) until check_runtime runs
