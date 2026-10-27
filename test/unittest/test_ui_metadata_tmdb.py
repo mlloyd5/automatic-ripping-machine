@@ -90,6 +90,54 @@ class TestTmdbSearchRequest(unittest.TestCase):
                          ["https://api.themoviedb.org/3/search/movie", "https://api.themoviedb.org/3/search/tv"])
         self.assertEqual(get.call_args_list[1][1]["params"], {"api_key": "testkey", "query": "Tom & Jerry Kids"})
 
+    def test_poster_tv_fallback_is_encoded_the_same_way(self):
+        """The job detail page looks posters up through get_tmdb_poster, which has its own tv fallback."""
+        with mock.patch.object(metadata.requests, "get",
+                               side_effect=[_response(NOTHING), _response(NOTHING)]) as get:
+            self.assertIsNone(metadata.get_tmdb_poster("Tom & Jerry", "2021"))
+        self.assertEqual([call[0][0] for call in get.call_args_list],
+                         ["https://api.themoviedb.org/3/search/movie", "https://api.themoviedb.org/3/search/tv"])
+        self.assertEqual(get.call_args_list[0][1]["params"],
+                         {"api_key": "testkey", "query": "Tom & Jerry", "year": "2021"})
+        self.assertEqual(get.call_args_list[1][1]["params"], {"api_key": "testkey", "query": "Tom & Jerry"})
+
+    def test_requests_carry_a_timeout(self):
+        with mock.patch.object(metadata.requests, "get", return_value=_response(NOTHING)) as get:
+            metadata.tmdb_search_request("movie", "Tom & Jerry", None, "testkey")
+        self.assertEqual(get.call_args[1]["timeout"], 30)
+
+    def test_unreachable_tmdb_is_an_error_payload_not_an_exception(self):
+        for error in (metadata.requests.Timeout("read timed out"),
+                      metadata.requests.ConnectionError("connection refused")):
+            with self.subTest(error=type(error).__name__):
+                with mock.patch.object(metadata.requests, "get", side_effect=error):
+                    payload, response = metadata.tmdb_search_request("movie", "Tom & Jerry", None, "testkey")
+                self.assertEqual(payload, {"status_code": -1, "status_message": str(error)})
+                self.assertIsNone(response)
+
+    def test_non_json_answer_is_an_error_payload(self):
+        page = SimpleNamespace(text="<html>502 Bad Gateway</html>", status_code=502)
+        with mock.patch.object(metadata.requests, "get", return_value=page):
+            payload, _ = metadata.tmdb_search_request("movie", "Tom & Jerry", None, "testkey")
+        self.assertEqual(payload["status_code"], -1)
+
+    def test_search_and_poster_give_no_results_when_tmdb_times_out(self):
+        """jobs.list_titles and job_detail call these bare; a slow TMDB must not become a 500."""
+        timeout = metadata.requests.Timeout("read timed out")
+        for lookup in (metadata.tmdb_search, metadata.get_tmdb_poster):
+            with self.subTest(lookup=lookup.__name__):
+                with mock.patch.object(metadata.requests, "get", side_effect=timeout) as get:
+                    self.assertIsNone(lookup("Tom & Jerry", "2021"))
+                get.assert_called_once()
+
+    def test_tv_fallback_failure_gives_no_results(self):
+        timeout = metadata.requests.Timeout("read timed out")
+        for lookup in (metadata.tmdb_search, metadata.get_tmdb_poster):
+            with self.subTest(lookup=lookup.__name__):
+                with mock.patch.object(metadata.requests, "get", side_effect=[_response(NOTHING), timeout]) as get:
+                    self.assertIsNone(lookup("Tom & Jerry", "2021"))
+                self.assertEqual(get.call_count, 2)
+
     def test_tmdb_search_returns_the_arm_shape(self):
         with mock.patch.object(metadata.requests, "get", return_value=_response(GORDON)), \
                 mock.patch.object(metadata, "tmdb_get_imdb", return_value="tt0000001"):
