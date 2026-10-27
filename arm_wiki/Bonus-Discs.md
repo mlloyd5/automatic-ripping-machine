@@ -82,3 +82,4 @@ gives each film its own job: point the supplemental disc at the film it belongs 
 carries several films (a double feature) has one job and a row per film. The bonus disc page lists
 those films under the job, so a supplemental disc can be filed with the second film rather than the
 first.
+See [Double Features](Double-Features) for how such a disc is found, or marked by hand.

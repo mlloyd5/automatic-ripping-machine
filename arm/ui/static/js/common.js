@@ -84,6 +84,7 @@ function musicCheck(job, idsplit) {
         x = `<a href="titlesearch?job_id=${idsplit[1]}" class="btn btn-primary">Title Search</a>
              <a href="customTitle?job_id=${idsplit[1]}" class="btn btn-primary">Custom Title</a>
              <a href="bonusdisc?job_id=${idsplit[1]}" class="btn btn-primary">Bonus Disc</a>
+             <a href="doublefeature?job_id=${idsplit[1]}" class="btn btn-primary">Double Feature</a>
              <a href="changeparams?config_id=${idsplit[1]}" class="btn btn-primary">Edit Settings</a>`;
     }
     return x;
