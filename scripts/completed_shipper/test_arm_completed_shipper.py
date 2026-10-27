@@ -229,13 +229,14 @@ class ShipperEndToEnd(ShipperFixture):
             self.assertIn("--partial-dir=.rsync-partial", call)
         for call in transfers[2:]:
             self.assertIn("--bwlimit=500", call)
-        # Every transfer was preceded by its two collision probes: itemized dry runs, one of them
-        # with --ignore-existing, that remove nothing and are not throttled.
+        # Every transfer was preceded by one collision probe: an itemized --ignore-existing dry run that
+        # removes nothing and is not throttled.  The destination held none of the files, so the two
+        # --checksum probes, each a read of the whole folder, never ran.
         probes = [c for c in calls if "--dry-run" in c]
-        self.assertEqual(len(probes), 8)
+        self.assertEqual(len(probes), 4)
         self.assertEqual([c for c in calls if "--dry-run" not in c], transfers)
-        self.assertEqual(calls.index(transfers[0]), 2)
-        self.assertEqual(sum("--ignore-existing" in c for c in probes), 4)
+        self.assertEqual(calls.index(transfers[0]), 1)
+        self.assertTrue(all("--ignore-existing" in c and "--checksum" not in c for c in probes))
         for probe in probes:
             self.assertIn("--itemize-changes", probe)
             for flag in ("--remove-source-files", "--partial-dir", "--bwlimit"):
@@ -245,6 +246,31 @@ class ShipperEndToEnd(ShipperFixture):
             hooks = handle.read().splitlines()
         self.assertEqual(hooks[:2], ["movies Movie A (2001)", "tv Show A (2010)"])
         self.assertCountEqual(hooks[2:], ["unidentified UNKNOWN_DISC", "unidentified UNKNOWN_2"])
+
+    def test_excluded_files_still_get_the_checksum_probes(self):
+        # With an --exclude the quick probe cannot list every file in the folder, so the names do not compare
+        # and the two --checksum probes run as the safety net, even though the destination is empty.
+        with open(self.conf, "a") as handle:
+            handle.write("rsync_extra_args = --exclude=extras/*\n")
+        # The excluded trailer never leaves, so the folder is not empty afterwards and the run exits 1.
+        self.assertEqual(self._run(), 1)
+        probes = [c for c in self._calls() if "--dry-run" in c and "Movie A (2001)" in c]
+        self.assertEqual(len(probes), 3)
+        self.assertNotIn("--checksum", probes[0])
+        self.assertIn("--ignore-existing", probes[0])
+        for probe in probes[1:]:
+            self.assertIn("--checksum", probe)
+            self.assertIn("--exclude=extras/*", probe)
+        self.assertNotIn("--ignore-existing", probes[1])
+        self.assertIn("--ignore-existing", probes[2])
+        # The folder still ships, under its own name, less the excluded extras, which stay on the ripper.
+        movie_a = self._shipped("Movies", "Movie A (2001)")
+        self.assertTrue(os.path.isfile(os.path.join(movie_a, "Movie A (2001).mkv")))
+        self.assertFalse(os.path.exists(os.path.join(movie_a, "extras", "trailer.mkv")))
+        self.assertEqual(len([c for c in self._transfers() if "Movie A (2001)" in c]), 1)
+        local = self._local("movies", "Movie A (2001)")
+        self.assertFalse(os.path.exists(os.path.join(local, "Movie A (2001).mkv")))
+        self.assertTrue(os.path.isfile(os.path.join(local, "extras", "trailer.mkv")))
 
     def test_second_run_is_a_noop(self):
         self.assertEqual(self._run(), 0)
@@ -295,7 +321,7 @@ class ShipperEndToEnd(ShipperFixture):
         self.assertTrue(os.path.isdir(self._local("movies", "Movie A (2001)")))
         self.assertFalse(os.path.exists(self._shipped("Movies", "Movie A (2001)")))
         calls = self._calls()
-        self.assertEqual(len(calls), 12)
+        self.assertEqual(len(calls), 8)
         self.assertTrue(all("--dry-run" in c for c in calls))
         self.assertEqual(sum("--remove-source-files" in c for c in calls), 4)
 
@@ -405,6 +431,12 @@ class RsyncCommandShape(unittest.TestCase):
         plain = shipper.build_probe_rsync_command(cfg, "movies", "/c/movies/Film (1999)", "Film (1999)")
         self.assertNotIn("--ignore-existing", plain)
         self.assertEqual(plain[-1], "root@t620:/tank/media/movies/Film (1999)/")
+        # The quick probe that comes first: no --checksum, which would read every file of the folder.
+        quick = shipper.build_probe_rsync_command(cfg, "movies", "/c/movies/Film (1999)", "Film (1999)",
+                                                  ignore_existing=True, checksum=False)
+        self.assertEqual(quick[:6], ["rsync", "-a", "--dry-run", "--itemize-changes", "--timeout=300",
+                                     "--ignore-existing"])
+        self.assertEqual(quick[-2:], cmd[-2:-1] + ["root@t620:/tank/media/movies/Film (1999)/"])
         self.assertEqual(shipper.destination(cfg, "movies", "/c/movies/Film (1999)"),
                          "root@t620:/tank/media/movies/Film (1999)/")
         # The transfer keeps rsync's quick check.
@@ -463,13 +495,34 @@ class CollisionProbe(unittest.TestCase):
         names = shipper.remote_folder_names("/c/movies/X", {"job_id": 1, "label": long_label})
         self.assertEqual(names[1], "X - " + "L" * shipper.SUFFIX_MAX_LENGTH)
 
+    def test_stage_suffixed_job_folder_ships_under_its_plain_name(self):
+        # A failed rip left "Movie A (2001)" behind, so ARM filed the re-rip in "Movie A (2001)_<stage>".
+        job = {"job_id": 19, "title": "Movie A", "year": "2001", "label": "MOVIE_A"}
+        self.assertEqual(shipper.remote_folder_names("/c/movies/Movie A (2001)_179306308839", job),
+                         ["Movie A (2001)", "Movie A (2001) - MOVIE_A", "Movie A (2001) - job19"])
+        manual = dict(job, title_manual="Movie A Redux")
+        self.assertEqual(shipper.arm_folder_name("/c/movies/Movie A Redux (2001)_17930630", manual),
+                         "Movie A Redux (2001)")
+        self.assertEqual(shipper.arm_folder_name("/c/movies/Movie A_17930630", dict(job, year="0000")), "Movie A")
+        # Only ARM's own suffix on the job's own name is dropped.
+        for folder in ("Movie A (2001)_beta", "Movie A (2001)_", "Movie B (2001)_17930630", "Movie A (2001)"):
+            self.assertEqual(shipper.arm_folder_name(f"/c/movies/{folder}", job), folder)
+        self.assertEqual(shipper.arm_folder_name("/c/movies/Movie A (2001)_17930630", None), "Movie A (2001)_17930630")
+
     def test_unidentified_and_label_named_folders_skip_the_label(self):
         # ARM names an unidentified folder after the disc label: "DVD_VIDEO - DVD_VIDEO" would say nothing.
-        job = {"job_id": 5, "label": "DVD_VIDEO"}
+        # It stores the label as the job's title too (identify.py), as here.
+        job = {"job_id": 5, "title": "DVD_VIDEO", "year": None, "label": "DVD_VIDEO"}
         self.assertEqual(shipper.remote_folder_names("/c/unidentified/DVD_VIDEO", job, "unidentified"),
                          ["DVD_VIDEO", "DVD_VIDEO - job5"])
         self.assertEqual(shipper.remote_folder_names("/c/unidentified/DVD_VIDEO_1", job, "unidentified"),
                          ["DVD_VIDEO_1", "DVD_VIDEO_1 - job5"])
+        # A second disc with the same label, filed as DVD_VIDEO_<stage> (or _<random_time> for a data disc),
+        # is another disc, not a re-rip: it keeps its own folder rather than merging into the first one's.
+        self.assertEqual(shipper.remote_folder_names("/c/unidentified/DVD_VIDEO_179306308839", job, "unidentified"),
+                         ["DVD_VIDEO_179306308839", "DVD_VIDEO_179306308839 - job5"])
+        self.assertEqual(shipper.arm_folder_name("/c/unidentified/DVD_VIDEO_179306308839", job, "unidentified"),
+                         "DVD_VIDEO_179306308839")
         self.assertEqual(shipper.remote_folder_names("/c/movies/DVD_VIDEO", job, "movies"),
                          ["DVD_VIDEO", "DVD_VIDEO - job5"])
         self.assertEqual(shipper.remote_folder_names("/c/movies/X", job, "movies"),
@@ -529,10 +582,13 @@ class NoOverwrite(MediaBoxFixture):
                           "movies/Movie A (2001) - MOVIE_A_BD/extras/trailer.mkv"])
         self.assertEqual([f["main"] for f in files], [True, False])
         self.assertEqual(top["role"], "feature")
-        # Two probes against ARM's name, two against the label name, then the one transfer, to the label name.
+        # Against ARM's name the quick probe finds the feature there, so the two --checksum probes run and
+        # find it differs; the label name is free after the quick probe alone; then the one transfer.
         movie_calls = [c for c in self._calls() if "/completed/movies/Movie A (2001)/" in c]
-        self.assertEqual([("--dry-run" in c, c.endswith("/Movie A (2001) - MOVIE_A_BD/")) for c in movie_calls],
-                         [(True, False), (True, False), (True, True), (True, True), (False, True)])
+        self.assertEqual([("--dry-run" in c, "--checksum" in c, c.endswith("/Movie A (2001) - MOVIE_A_BD/"))
+                          for c in movie_calls],
+                         [(True, False, False), (True, True, False), (True, True, False), (True, False, True),
+                          (False, False, True)])
         # Other folders shipped as usual.
         self.assertTrue(os.path.isfile(os.path.join(self._shipped("TV", "Show A (2010)"), "S01E02.mkv")))
         self.assertFalse(os.path.exists(self._local("unidentified", "UNKNOWN_DISC")))
@@ -1177,6 +1233,31 @@ class CatalogRecords(ShipperFixture):
         self.assertEqual([f["main"] for f in files], [False, False])
         # Unidentified rips shipped as before and left no record.
         self.assertFalse(os.path.exists(self._local("unidentified", "UNKNOWN_DISC")))
+
+    def test_stage_suffixed_rerip_ships_and_records_under_the_plain_name(self):
+        # A failed job left its empty folder; the successful re-rip went to "<name>_<stage>" with the
+        # feature still named after the plain name, as ARM files it.
+        os.makedirs(self._job("movies", "Movie F (2006)", "fail", files=()))
+        rerip = self._job("movies", "Movie F (2006)_179306308839", "success",
+                          files=["Movie F (2006).mkv", "extras/featurette.mkv"])
+        self._set_job("Movie F (2006)_179306308839", title="Movie F", year="2006", label="MOVIE_F",
+                      stop_time="2026-10-26 20:20:29")
+        self.assertEqual(self._run(), 0)
+        shipped = self._shipped("Movies", "Movie F (2006)")
+        self.assertTrue(os.path.isfile(os.path.join(shipped, "Movie F (2006).mkv")))
+        self.assertTrue(os.path.isfile(os.path.join(shipped, "extras", "featurette.mkv")))
+        self.assertFalse(os.path.exists(rerip))
+        self.assertEqual([n for n in os.listdir(self._shipped("Movies", "")) if "179306308839" in n], [])
+        # The failed job's empty folder is not this job's to ship.
+        self.assertTrue(os.path.isdir(self._local("movies", "Movie F (2006)")))
+        record = next(n for n in self._records() if f"-job{self._job_id('Movie F (2006)_')}" in n)
+        with open(os.path.join(self.records, record)) as handle:
+            top, files = parse_record(handle.read())
+        self.assertEqual((top["library"], top["source"], top["role"]),
+                         ("movies/Movie F (2006)", "movies/Movie F (2006)_179306308839", "feature"))
+        self.assertEqual([(f["path"], f["main"]) for f in files],
+                         [("movies/Movie F (2006)/Movie F (2006).mkv", True),
+                          ("movies/Movie F (2006)/extras/featurette.mkv", False)])
 
     def test_record_failure_keeps_it_spooled_and_ships_it_next_run(self):
         os.environ["SHIPPER_TEST_FAIL_FOR"] = "media-box/catalog/"
