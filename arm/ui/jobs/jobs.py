@@ -231,7 +231,7 @@ def customtitle():
                                      f'{request.args.get("title")} ({request.args.get("year")})')
         db.session.add(notification)
         ui_utils.database_updater(args, job)
-        flash(f'Custom title changed. Title={job.title}, Year={job.year}.', "success")
+        flash(f'Custom title changed. Title={escape(job.title)}, Year={escape(job.year)}.', "success")
         if double_feature.clear_for_title_fix(job, title=ui_utils.clean_for_filename(job.title)):
             flash(f"Job {job.job_id} is no longer a double feature", "info")
         return redirect(url_for('home'))
@@ -372,8 +372,8 @@ def updatetitle():
                                  f'{request.args.get("title")} ({request.args.get("year")})')
     db.session.add(notification)
     db.session.commit()
-    flash(f'Title: {old_title} ({old_year}) was updated to '
-          f'{request.args.get("title")} ({request.args.get("year")})', "success")
+    flash(f'Title: {escape(old_title)} ({escape(old_year)}) was updated to '
+          f'{escape(request.args.get("title"))} ({escape(request.args.get("year"))})', "success")
     return redirect("/")
 
 

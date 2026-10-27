@@ -253,6 +253,23 @@ class TestDoubleFeaturePage(unittest.TestCase):
         self.assertEqual(response.status_code, 302)
         self.assertEqual(self._films(), [])
 
+    def test_title_fixes_escape_what_was_typed(self):
+        # both title fixes redirect home, where base.html renders the flashed message with |safe
+        script = "<script>alert(1)</script>"
+        escaped = "&lt;script&gt;alert(1)&lt;/script&gt;"
+        with self.client.session_transaction() as session:
+            session.pop("_flashes", None)  # the client keeps one session, so drop what earlier tests left unread
+        self.client.get("/customTitle", query_string={"job_id": self.disc.job_id, "title": script, "year": "1999"})
+        with self.client.session_transaction() as session:
+            message = session.pop("_flashes")[-1][1]
+        self.assertEqual(message, f"Custom title changed. Title={escaped}, Year=1999.")
+        # the old title now holds the script too, and comes back in the next fix's message
+        self.client.get("/updatetitle", query_string={"job_id": self.disc.job_id, "title": script, "year": "2002",
+                                                      "imdbID": "tt0243585", "type": "movie", "poster": "http://x"})
+        with self.client.session_transaction() as session:
+            message = session.pop("_flashes")[-1][1]
+        self.assertEqual(message, f"Title: {escaped} (1999) was updated to {escaped} (2002)")
+
     def test_same_title_ignores_the_ripper_hyphens(self):
         self.assertTrue(double_feature.same_title("Stuart-Little-2", "Stuart Little 2"))
         self.assertFalse(double_feature.same_title("Stuart-Little", "Stuart Little 2"))
