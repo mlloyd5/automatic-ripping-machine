@@ -583,9 +583,15 @@ def check_runtime(job):
     When another film is taken, the user is notified. Left alone: titles set by hand, series,
     double features (file_collection matches those by runtime), and rips without title lengths:
     only the mkv rip method lists the titles (makemkv.get_track_info); a Blu-ray ripped with
-    RIPMETHOD backup is not checked, which is logged as a warning\n
+    RIPMETHOD backup is not checked, which is logged as a warning. Nor is a bonus disc: it carries the
+    film's IMDb id but its titles are the extras, so the runtime never fits and the search for another
+    film could rename the job\n
     :return: True when the job was given another film
     """
+    if utils.is_bonus_disc(job):
+        logging.info(f"Bonus disc of job {job.bonus_of_job_id}: its titles are extras, so the runtime of "
+                     f"{job.title} ({job.year}) is not checked against them")
+        return False
     if (not job.config.GET_VIDEO_TITLE or job.title_manual or job.video_type != "movie"
             or not job.imdb_id or collection_films(job)):
         return False

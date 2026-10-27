@@ -123,7 +123,8 @@ class BonusFixture(unittest.TestCase):
                                                       MAXLENGTH="36000", SKIP_DUPLICATE_TITLES=True,
                                                       RIPMETHOD="best", SKIP_TRANSCODE=False, USE_FFMPEG=False,
                                                       TRANSCODE_PATH=os.path.join(self.root, "transcode"),
-                                                      NOTIFY_RIP=False, NOTIFY_TRANSCODE=False))
+                                                      NOTIFY_RIP=False, NOTIFY_TRANSCODE=False,
+                                                      GET_VIDEO_TITLE=False))
 
 
 class TestBonusParent(BonusFixture):
@@ -323,6 +324,36 @@ class TestMarkDuringRip(BonusFixture):
     def _mark(self, job):
         job.bonus_of_job_id, job.bonus_of = 40, self.parent
 
+    def _rip_watching_retitle(self, job, mark):
+        with mock.patch.object(arm_ripper, "retitle_final_directory",
+                               side_effect=lambda _dupes, _job, folder, _sub, _title: folder) as retitle:
+            self._rip(job, mark)
+        return retitle
+
+    def test_bonus_disc_is_never_retitled(self):
+        # Not even with a title set by hand: the extras go to the film's folder whatever the job is called
+        job = self._job([_track(0, 600)])
+        job.title_manual = "Monsters, Inc. Bonus"
+        self._rip_watching_retitle(job, lambda _job: None).assert_not_called()
+        self.assertEqual(job.path, self.film_path)
+        self.assertEqual(sorted(os.listdir(os.path.join(self.film_path, "extras"))),
+                         ["Monsters_Inc_title_t00.mkv", "title_t03.mkv"])
+
+    def test_disc_marked_during_the_rip_is_not_retitled(self):
+        job = self._job([_track(0, 600)], parent=False)
+        job.title, job.year = "MONSTERS_BONUS", ""
+        self._rip_watching_retitle(job, self._mark).assert_not_called()
+        self.assertEqual(job.path, self.film_path)
+
+    def test_disc_cleared_during_the_rip_is_retitled_as_usual(self):
+        def clear(job):
+            job.bonus_of_job_id = job.bonus_of = None
+
+        job = self._job([_track(0, 600)])
+        retitle = self._rip_watching_retitle(job, clear)
+        retitle.assert_called_once()
+        self.assertEqual(retitle.call_args.args[2], f"{self.film_path}_{job.stage}")
+
     def test_marked_after_the_rip_started(self):
         job = self._job([_track(0, 600)], parent=False)
         job.title, job.year = "MONSTERS_BONUS", ""
@@ -386,6 +417,44 @@ class TestMarkDuringRip(BonusFixture):
         self.assertFalse(os.path.exists(self.film_path))
         self.assertEqual(arm_ripper.bonus_folder(job), f"{self.film_path} - bonus job41")
         arm_ripper.remove_unused_final_dir(self.film_path)  # gone already: nothing to do
+
+
+class TestCheckRuntime(BonusFixture):
+    """
+    arm_ripper.check_runtime leaves a bonus disc alone: it carries the film's IMDb id, but its titles are the
+    extras, so the film's runtime never fits them and the search for a film that does could rename the job.
+    """
+
+    def _check(self, job):
+        identify = arm_ripper.identify
+        for track in job.tracks:
+            track.fps = 23.976
+        job.imdb_id = self.parent.imdb_id
+        job.config.GET_VIDEO_TITLE = True
+        with mock.patch.object(identify, "identified_runtime", return_value=92 * 60) as runtime, \
+                mock.patch.object(identify, "runtime_candidates", return_value=[]) as candidates, \
+                mock.patch.object(identify, "_provider_search") as search, \
+                mock.patch.object(identify, "apply_search_result") as apply, \
+                mock.patch.object(utils, "notify") as notify:
+            before = dict(vars(job))
+            result = arm_ripper.check_runtime(job)
+        return result, before, (runtime, candidates, search, apply, notify)
+
+    def test_bonus_disc_is_not_checked(self):
+        # Featurettes of 5 to 20 minutes: Monsters, Inc. (92 min) fits none of them
+        job = self._job([_track(0, 300), _track(1, 1200), _track(2, 900)])
+        result, before, calls = self._check(job)
+        self.assertFalse(result)
+        for call in calls:
+            call.assert_not_called()
+        self.assertEqual(vars(job), before)
+
+    def test_same_disc_not_marked_is_checked(self):
+        job = self._job([_track(0, 300), _track(1, 1200), _track(2, 900)], parent=False)
+        _result, _before, (runtime, candidates, _search, apply, _notify) = self._check(job)
+        runtime.assert_called_once_with(job)
+        candidates.assert_called_once_with(job)
+        apply.assert_not_called()
 
 
 class TestManualWait(BonusFixture):
