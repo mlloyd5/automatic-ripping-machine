@@ -988,6 +988,15 @@ def job_dupe_check(job):
         return False
     else:
         previous_rips = Job.query.filter_by(label=job.label, status=JobState.SUCCESS.value)
+        # A generic label like DVD_VIDEO is shared by unrelated discs: on the t620 an Anger Management
+        # DVD took the title of a Fools Rush In DVD ripped earlier with the same label. Only a previous
+        # rip of the same disc (same CRC64) can lend its title then. identify imports this module.
+        from arm.ripper.identify import is_placeholder_title
+        if is_placeholder_title(job.label):
+            if not job.crc_id:
+                logging.info(f"Generic disc label {job.label!r} and no disc hash, not searched in database")
+                return False
+            previous_rips = previous_rips.filter_by(crc_id=job.crc_id)
         results = {}
         i = 0
         for j in previous_rips:
