@@ -24,9 +24,22 @@ _spec = importlib.util.spec_from_file_location("disc_vision", REPO_ROOT / "arm" 
 disc_vision = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(disc_vision)
 
-GOOD = {"title": "Toon Time", "subtitle": "Ultimate Cartoon Collection", "year": "2011",
+GOOD = {"scene": "disc_label", "title": "Toon Time", "subtitle": "Ultimate Cartoon Collection", "year": "2011",
         "studio": "Echo Bridge Home Entertainment", "disc_number": None, "catalog_number": "73619",
-        "format": "DVD", "other_text": ["59 cartoons", "Casper"], "confidence": 0.95}
+        "format": "DVD", "legible_text": ["TOON", "TIME", "Ultimate", "Cartoon", "Collection", "Echo", "Bridge"],
+        "other_text": ["59 cartoons", "Casper"], "confidence": 0.95}
+
+# What qwen2.5vl:7b answered for photos of an empty tray (jobs 86 and 87) and of a blurred hand
+# (job 80) when the prompt told it the photo showed a disc: the same film, sure of it, every time
+MATRIX = {"title": "The Matrix", "subtitle": "Reloaded", "year": "2003", "studio": "Warner Bros.",
+          "disc_number": "Disc 2", "catalog_number": "1902956", "format": "DVD",
+          "other_text": ["Special Edition", "10th Anniversary"], "confidence": 0.95}
+
+
+def _label(title, confidence, **fields):
+    """A model answer read off a disc label: the title's words are among the legible ones."""
+    return json.dumps(dict({"scene": "disc_label", "legible_text": str(title).split(), "title": title,
+                            "confidence": confidence}, **fields))
 
 
 def _response(status=200, response_text=None, body=None):
@@ -134,7 +147,10 @@ class TestReadDiscPhoto(unittest.TestCase):
         self.assertEqual(post.call_args.args[0], "http://host:11434/api/generate")
         self.assertEqual(post.call_args.kwargs["timeout"], (disc_vision.CONNECT_TIMEOUT, 60))
         self.assertEqual((body["model"], body["stream"], body["format"], body["options"]),
-                         ("qwen2.5vl:7b", False, "json", {"temperature": 0}))
+                         ("qwen2.5vl:7b", False, disc_vision.SCHEMA,
+                          {"temperature": 0, "num_predict": disc_vision.MAX_TOKENS}))
+        self.assertEqual(body["format"]["properties"]["legible_text"]["maxItems"], disc_vision.MAX_LEGIBLE_WORDS)
+        self.assertIn("empty_tray", body["format"]["properties"]["scene"]["enum"])
         self.assertEqual(_image_of(post.call_args), b"\xff\xd8 not really a jpeg")
         self.assertIn("JSON only", body["prompt"])
 
@@ -143,10 +159,10 @@ class TestReadDiscPhoto(unittest.TestCase):
         def answer_for(url, json=None, timeout=None):
             image = base64.b64decode(json["images"][0])
             if image.startswith(b"rot90:"):
-                return _response(response_text='{"title": "Peanuts", "confidence": 0.5}')
+                return _response(response_text=_label("Peanuts", 0.5))
             if image.startswith(b"rot270:"):
-                return _response(response_text='{"title": "The Peanuts Movie", "year": "2015", "confidence": 0.92}')
-            return _response(response_text='{"title": "Snoopy", "confidence": 0.4}')
+                return _response(response_text=_label("The Peanuts Movie", 0.92, year="2015"))
+            return _response(response_text=_label("Snoopy", 0.4))
 
         with mock.patch.object(disc_vision.requests, "post", side_effect=answer_for) as post:
             answer = disc_vision.read_disc_photo(self.photo, "http://host:11434")
@@ -157,8 +173,8 @@ class TestReadDiscPhoto(unittest.TestCase):
         def answer_for(url, json=None, timeout=None):
             image = base64.b64decode(json["images"][0])
             if image.startswith(b"rot90:"):
-                return _response(response_text='{"title": "Room on the Broom", "confidence": 0.95}')
-            return _response(response_text='{"title": "Broom", "confidence": 0.3}')
+                return _response(response_text=_label("Room on the Broom", 0.95))
+            return _response(response_text=_label("Broom", 0.3))
 
         with mock.patch.object(disc_vision.requests, "post", side_effect=answer_for) as post:
             answer = disc_vision.read_disc_photo(self.photo, "http://host:11434")
@@ -169,8 +185,8 @@ class TestReadDiscPhoto(unittest.TestCase):
         def answer_for(url, json=None, timeout=None):
             image = base64.b64decode(json["images"][0])
             if image.startswith(b"rot"):
-                return _response(response_text='{"title": "Tarzan", "confidence": 0.7}')
-            return _response(response_text='{"title": "Tarzan", "confidence": 0.98}')
+                return _response(response_text=_label("Tarzan", 0.7))
+            return _response(response_text=_label("Tarzan", 0.98))
 
         with mock.patch.object(disc_vision.requests, "post", side_effect=answer_for) as post:
             answer = disc_vision.read_disc_photo(self.photo, "http://host:11434")
@@ -209,7 +225,7 @@ class TestReadDiscPhoto(unittest.TestCase):
             image = base64.b64decode(json["images"][0])
             if image.startswith(b"rot"):
                 raise requests.Timeout("too slow")
-            return _response(response_text='{"title": "WALL-E", "year": 2008, "confidence": 0.8}')
+            return _response(response_text=_label("WALL-E", 0.8, year=2008))
 
         with mock.patch.object(disc_vision.requests, "post", side_effect=answer_for) as post:
             answer = disc_vision.read_disc_photo(self.photo, "http://host:11434")
@@ -221,7 +237,7 @@ class TestReadDiscPhoto(unittest.TestCase):
         def answer_for(url, json=None, timeout=None):
             image = base64.b64decode(json["images"][0])
             if image.startswith(b"rot270:"):
-                return _response(response_text='{"title": "WALL-E", "year": 2008, "confidence": 0.8}')
+                return _response(response_text=_label("WALL-E", 0.8, year=2008))
             return _response(response_text='{"title": null, "other_text": ["DISNEY", "PIXAR"]}')
 
         with mock.patch.object(disc_vision.requests, "post", side_effect=answer_for) as post:
@@ -253,7 +269,7 @@ class TestReadDiscPhoto(unittest.TestCase):
         with mock.patch.object(disc_vision, "rotate_jpeg", return_value=None), \
                 mock.patch.object(disc_vision.requests, "post",
                                   return_value=_response(
-                                      response_text='{"title": "Tarzan", "confidence": 0.5}')) as post:
+                                      response_text=_label("Tarzan", 0.5))) as post:
             answer = disc_vision.read_disc_photo(self.photo, "http://host:11434")
         self.rotate.start()
         self.assertEqual(post.call_count, 1)
@@ -262,6 +278,109 @@ class TestReadDiscPhoto(unittest.TestCase):
     def test_unexpected_error_gives_none(self):
         with mock.patch.object(disc_vision.requests, "post", side_effect=RuntimeError("boom")):
             self.assertIsNone(disc_vision.read_disc_photo(self.photo, "http://host:11434"))
+
+    def test_no_label_in_view_ends_the_read_without_rotating(self):
+        """An empty tray, a hand or a blur: the answers qwen2.5vl gave for jobs 86, 87 and 80 with this prompt."""
+        for scene in ("empty_tray", "obscured", "blurry", "Empty_Tray"):
+            text = json.dumps({"scene": scene, "legible_text": [], "title": None, "confidence": 0.0})
+            with mock.patch.object(disc_vision.requests, "post", return_value=_response(response_text=text)) as post:
+                self.assertIsNone(disc_vision.read_disc_photo(self.photo, "http://host:11434"))
+            self.assertEqual(post.call_count, 1, scene)
+        # a title alongside a no-label scene is the guess the scene gives away
+        text = json.dumps(dict(MATRIX, scene="empty_tray", legible_text=[]))
+        with mock.patch.object(disc_vision.requests, "post", return_value=_response(response_text=text)) as post:
+            self.assertIsNone(disc_vision.read_disc_photo(self.photo, "http://host:11434"))
+        self.assertEqual(post.call_count, 1)
+
+    def test_title_not_among_the_legible_words_is_not_taken(self):
+        """The Matrix with nothing legible, or with words that are not its title, is a guess."""
+        for text in (json.dumps(MATRIX),  # the old answer: no scene, no legible words
+                     json.dumps(dict(MATRIX, scene="disc_label")),
+                     json.dumps(dict(MATRIX, scene="disc_label", legible_text=[])),
+                     json.dumps(dict(MATRIX, scene="disc_label", legible_text=["ANNE", "OF", "AVONLEA", "BBC"])),
+                     json.dumps(dict(MATRIX, scene="other", legible_text=["THE", "MATRIX"]))):
+            with mock.patch.object(disc_vision.requests, "post", return_value=_response(response_text=text)) as post:
+                self.assertIsNone(disc_vision.read_disc_photo(self.photo, "http://host:11434"), text)
+            self.assertEqual(post.call_count, 3, text)  # a scene with a label in it is worth turning
+
+    def test_title_read_off_the_label_is_taken(self):
+        """Almost Famous and Jimmy Neutron, as qwen2.5vl read them from real photos with this prompt."""
+        almost = json.dumps({"scene": "disc_label",
+                             "legible_text": ["Almost", "Famous", "DVD", "HOME", "ENTERTAINMENT"],
+                             "title": "Almost Famous", "year": None, "confidence": 0.9})
+        neutron = json.dumps({"scene": "disc_label", "legible_text": ["JIMMY", "NEUTRON", "BOY", "GENIUS", "DVD"],
+                              "title": "Jimmy Neutron: Boy Genius", "confidence": 0.95})
+        for text, title in ((almost, "Almost Famous"), (neutron, "Jimmy Neutron: Boy Genius")):
+            with mock.patch.object(disc_vision.requests, "post", return_value=_response(response_text=text)):
+                answer = disc_vision.read_disc_photo(self.photo, "http://host:11434")
+            self.assertEqual((answer["title"], answer["scene"]), (title, "disc_label"))
+
+    def test_minor_words_need_not_be_legible_but_a_subtitle_must_be(self):
+        text = json.dumps({"scene": "disc_label", "legible_text": ["PEANUTS", "MOVIE", "2015"],
+                           "title": "The Peanuts Movie", "subtitle": "Snoopy's Grand Adventure",
+                           "year": "2015", "confidence": 0.93})
+        with mock.patch.object(disc_vision.requests, "post", return_value=_response(response_text=text)):
+            answer = disc_vision.read_disc_photo(self.photo, "http://host:11434")
+        self.assertEqual((answer["title"], answer["subtitle"]), ("The Peanuts Movie", None))
+        kept = _label("Toon Time", 0.95, subtitle="Ultimate Cartoon Collection",
+                      legible_text=["TOON", "TIME", "ULTIMATE", "CARTOON", "COLLECTION"])
+        with mock.patch.object(disc_vision.requests, "post", return_value=_response(response_text=kept)):
+            answer = disc_vision.read_disc_photo(self.photo, "http://host:11434")
+        self.assertEqual(answer["subtitle"], "Ultimate Cartoon Collection")
+
+    def test_no_label_on_a_turned_photo_keeps_the_earlier_answer(self):
+        def answer_for(url, json=None, timeout=None):
+            image = base64.b64decode(json["images"][0])
+            if image.startswith(b"rot"):
+                return _response(response_text='{"scene": "blurry", "legible_text": [], "title": null}')
+            return _response(response_text=_label("WALL-E", 0.8))
+
+        with mock.patch.object(disc_vision.requests, "post", side_effect=answer_for) as post:
+            answer = disc_vision.read_disc_photo(self.photo, "http://host:11434")
+        self.assertEqual(post.call_count, 2)
+        self.assertEqual((answer["title"], answer["rotation"]), ("WALL-E", 0))
+
+    def test_ask_model_gives_none_for_an_empty_tray(self):
+        text = '{"scene": "empty_tray", "legible_text": [], "title": null}'
+        with mock.patch.object(disc_vision.requests, "post", return_value=_response(response_text=text)):
+            self.assertIsNone(disc_vision.ask_model(b"jpeg", "http://host:11434"))
+
+
+class TestReadOffLabel(unittest.TestCase):
+    def test_scene_and_legible_words(self):
+        self.assertTrue(disc_vision.read_off_label(disc_vision.parse_answer(GOOD)))
+        self.assertFalse(disc_vision.read_off_label(disc_vision.parse_answer(MATRIX)))
+        self.assertFalse(disc_vision.read_off_label(None))
+        wall_e = disc_vision.parse_answer(_label("WALL-E", 0.8, legible_text=["WALL", "E", "Disney"]))
+        self.assertTrue(disc_vision.read_off_label(wall_e))
+        # a title of nothing but minor words still has to be legible
+        self.assertFalse(disc_vision.read_off_label(disc_vision.parse_answer(_label("The", 0.9, legible_text=["X"]))))
+        self.assertTrue(disc_vision.read_off_label(disc_vision.parse_answer(_label("The", 0.9))))
+        # Men in Black's logo read as "M" (job 79's photo): too short to be a title worth searching
+        men_in_black = _label("M", 0.8, subtitle="DVD", legible_text=["M", "DVD", "R", "R"])
+        self.assertFalse(disc_vision.read_off_label(disc_vision.parse_answer(men_in_black)))
+        self.assertTrue(disc_vision.read_off_label(disc_vision.parse_answer(_label("Up", 0.9))))
+
+    def test_scene_of(self):
+        self.assertEqual(disc_vision.scene_of('{"scene": " Empty_Tray "}'), "empty_tray")
+        self.assertEqual(disc_vision.scene_of({"scene": "blurry"}), "blurry")
+        self.assertIsNone(disc_vision.scene_of(json.dumps(MATRIX)))
+        self.assertIsNone(disc_vision.scene_of("not json"))
+        self.assertIsNone(disc_vision.scene_of("[1]"))
+        self.assertIsNone(disc_vision.scene_of(None))
+
+    def test_answers_stored_before_the_scene_still_parse(self):
+        """Jobs keep the old prompt's answers: the title fix pages and naming still read them."""
+        stored = disc_vision.parse_answer(json.dumps(dict(MATRIX, rotation=0)))
+        self.assertEqual((stored["title"], stored["scene"], stored["legible_text"]), ("The Matrix", None, None))
+        self.assertEqual(disc_vision.parse_answer(GOOD)["scene"], "disc_label")
+        self.assertEqual(disc_vision.parse_answer(GOOD)["legible_text"],
+                         "TOON TIME Ultimate Cartoon Collection Echo Bridge")
+
+    def test_prompt_asks_what_the_photo_shows(self):
+        for words in ("scene", "empty_tray", "obscured", "blurry", "legible_text", "never guess", "JSON only"):
+            self.assertIn(words, disc_vision.PROMPT)
+        self.assertNotIn("This is a photo of a DVD", disc_vision.PROMPT)
 
 
 class TestRotateJpeg(unittest.TestCase):
