@@ -69,25 +69,30 @@ avoided a clash in completed (and steps aside to `<Title (Year)> - <label>` as
 usual if the media box already has that name); the catalog record's `library`
 and `destination` name the plain folder, its `source` the suffixed one.  The
 plain folder that was already there is someone else's: the shipper claims a
-plain film folder only if it changed after the job started, so it never takes
-over that older folder, even once the suffixed one has shipped.
+plain film folder for a job only if the folder last changed while that job ran,
+after its start and no later than 15 minutes after its `stop_time`.  So it
+never takes over that older folder, even once the suffixed one has shipped, and
+an earlier rip of the same disc (the DVD before the Blu-ray, a redone rip) does
+not claim the new rip's folder.  A job with no `stop_time` (still running, or
+killed) keeps claiming.
 
 ARM's web UI overwrites `job.stage` with rip progress text (`Track 2/2<br>...`)
 on most jobs: anything that polls its job list, the UI included, writes it to
 the database.  The suffix is then unknown, so a suffixed folder is not found
 and stays for you to move by hand.  The plain folder is still judged by when
-the job started, read from `job.start_time`, which nothing overwrites: an older
-plain folder is left alone, and one ARM filed during the job ships as usual.
-`start_time` is ARM's local time, read in the shipper's own timezone, so run
-both in the same timezone (`TZ` in the container).  A job with neither a
+the job ran, read from `job.start_time` and `job.stop_time`, which nothing
+overwrites: an older plain folder is left alone, and one ARM filed during the
+job ships as usual.  Those are ARM's local time, read in the shipper's own
+timezone, so run both in the same timezone (`TZ` in the container).  A job with neither a
 numeric stage nor a start time has none of its further films claimed, with a
 warning.
 
 A film folder that is also some job's own `job.path` (that film ripped on its
 own earlier and still in completed) ships as that job, never as the film.  A
-film folder that films of more than one job claim (the same double feature
-ripped on two drives, one job's stage overwritten) ships with none of them: the
-run logs a warning naming the folder and the jobs, and you move it by hand.
+film folder claimed by jobs whose runs overlapped (the same double feature
+ripped on two drives at once, one job's stage overwritten) ships with none of
+them: the run logs a warning naming the folder and the jobs, and you move it
+by hand.
 
 ### Never overwriting what the media box holds
 
@@ -495,7 +500,8 @@ another job on that path does, a database without a `film` table, an unfiled
 film ignored, the `_<stage>` folder shipped under the plain name without taking
 over the older plain one, a progress-text stage judged by `start_time`, no
 stage or start time, a folder that is another successful job's path, a folder
-claimed by films of two jobs, the film's
+claimed by two jobs whose runs overlapped, a re-rip of the same disc shipping
+as the new job, the film's
 own record and destination state); and the itemized output of both
 rsync and openrsync (the one on macOS), which the test runs under whichever
 `rsync` is on `PATH`:

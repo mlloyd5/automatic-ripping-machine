@@ -119,6 +119,8 @@ JOB_COLUMNS = ("job_id", "status", "path", "title", "title_manual", "year", "yea
 FILM_COLUMNS = ("job_id", "position", "title", "year", "imdb_id", "track_number")
 """Columns read from the fork's film table (the 2nd+ films of a double-feature disc); a stock ARM has no such table."""
 FILM_SUB_FOLDER = "movies"
+FILM_FILED_SLACK = 15 * 60
+"""Seconds after a job's stop_time that a film folder it filed may still have changed (see :func:`film_folder_for`)."""
 """ARM files a double feature's further films beside the job folder, under COMPLETED_PATH/movies."""
 
 DEFAULTS = {
@@ -276,9 +278,12 @@ def film_folder_for(job, film, completed_path):
     folder already existed, in ``<Title (Year)>_<job.stage>``, with the stage
     as it was at filing time: the job's start stamp (``time() * 100``), unique
     to it, so a suffixed folder of that name is the film's whenever it exists.
-    The plain folder is the film's only if it changed after the job started:
-    one older than that is the folder that made ARM add the suffix, someone
-    else's rip, and is never claimed, even once the suffixed one has shipped.
+    The plain folder is the film's only if it last changed while the job ran:
+    one older than the job's start is the folder that made ARM add the suffix,
+    someone else's rip, and is never claimed, even once the suffixed one has
+    shipped; one newer than the job's ``stop_time`` (plus
+    :data:`FILM_FILED_SLACK`) was filed by a later rip of the same disc.  A
+    job without a ``stop_time`` (still running, or killed) keeps claiming.
 
     ARM's web UI (anything that polls its job list) overwrites ``job.stage``
     with rip progress text on most jobs, so the suffix is often unknown.  The
@@ -286,8 +291,8 @@ def film_folder_for(job, film, completed_path):
     folder older than it is still left alone, and the suffixed folder, which
     cannot be named, stays for a hand transfer.  A numeric stage is preferred
     for the comparison: it is an epoch, while ``start_time`` is ARM's local
-    time, read here in the shipper's own timezone.  With neither, nothing is
-    claimed.
+    time, read here in the shipper's own timezone (see :func:`_run_window`).
+    With neither, nothing is claimed.
     """
     name = film_folder_name(film)
     plain = os.path.realpath(os.path.join(completed_path, FILM_SUB_FOLDER, name))
@@ -296,9 +301,7 @@ def film_folder_for(job, film, completed_path):
         suffixed = os.path.realpath(os.path.join(completed_path, FILM_SUB_FOLDER, f"{name}_{stage}"))
         if os.path.isdir(suffixed):
             return suffixed
-        started = int(stage) / 100
-    else:
-        started = _epoch(job.get("start_time"))
+    started, stopped = _run_window(job)
     if started is None:
         warn_once("not claiming %s for film %s of job %s: the job has neither a numeric stage nor a start time "
                   "to tell its folder from an older one; move it by hand", plain, film.get("position"),
@@ -312,17 +315,52 @@ def film_folder_for(job, film, completed_path):
         log.debug("not claiming %s for film %s of job %s: it predates the job", plain, film.get("position"),
                   job.get("job_id"))
         return None
+    if stopped is not None and changed > stopped + FILM_FILED_SLACK:
+        log.debug("not claiming %s for film %s of job %s: it changed after the job finished", plain,
+                  film.get("position"), job.get("job_id"))
+        return None
     return plain
 
 
-def _epoch(value):
-    """Seconds since the epoch for a database timestamp (ARM's local time, read as this host's), or None."""
+def _run_window(job):
+    """
+    ``(start, stop)`` of a job's run in seconds since the epoch; either is None when unknown.
+
+    With a numeric ``stage`` (the start stamp, an epoch) the stop is that plus
+    ``stop_time - start_time``, both ARM's local time, so the window does not
+    depend on the shipper's timezone; without ``start_time`` the stop is
+    ``stop_time`` read in it.  With progress text in ``stage`` both ends come
+    from ``start_time`` and ``stop_time``, read in the shipper's timezone.
+    """
+    stage = _clean(job.get("stage"))
+    start_time, stop_time = _datetime(job.get("start_time")), _datetime(job.get("stop_time"))
+    if stage and stage.isdigit():
+        started = int(stage) / 100
+        if start_time and stop_time:
+            return started, started + (stop_time - start_time).total_seconds()
+        return started, _epoch(job.get("stop_time"))
+    return _epoch(job.get("start_time")), _epoch(job.get("stop_time"))
+
+
+def _datetime(value):
+    """A database timestamp as a naive datetime, or None."""
     text = _clean(value)
     if not text:
         return None
     try:
-        return datetime.datetime.fromisoformat(text).timestamp()
-    except (ValueError, OverflowError, OSError):
+        return datetime.datetime.fromisoformat(text)
+    except ValueError:
+        return None
+
+
+def _epoch(value):
+    """Seconds since the epoch for a database timestamp (ARM's local time, read as this host's), or None."""
+    when = _datetime(value)
+    if when is None:
+        return None
+    try:
+        return when.timestamp()
+    except (OverflowError, OSError, ValueError):
         return None
 
 
@@ -371,7 +409,9 @@ def finished_jobs(db_path, completed_path, arm_completed_path=None):
     never represents a folder that is some job's own path: that folder ships
     with the newest successful such job, or not at all.  A folder that is no
     job's own and that films of more than one job claim ships with none of
-    them (a warning names the jobs).
+    them (a warning names the jobs): :func:`film_folder_for` only lets a job
+    claim a folder that changed while it ran, so those are jobs whose runs
+    overlapped, the same double feature ripped on two drives.
     """
     by_folder = {}
     for job in read_jobs(db_path):
@@ -397,9 +437,9 @@ def finished_jobs(db_path, completed_path, arm_completed_path=None):
             continue
         claimants = sorted({job.get("job_id") or 0 for job in jobs if job.get("film")})
         if len(claimants) > 1:
-            # Two rips of one double feature (two drives): which job's film this is cannot be told apart.
-            warn_once("not shipping %s: it is no job's own folder and films of jobs %s all claim it; move it by hand",
-                      path, ", ".join(str(job_id) for job_id in claimants))
+            # Two rips of one double feature at once (two drives): whose film this is cannot be told apart.
+            warn_once("not shipping %s: it is no job's own folder and films of jobs %s, whose runs overlapped, all "
+                      "claim it; move it by hand", path, ", ".join(str(job_id) for job_id in claimants))
             continue
         successes = [job for job in jobs if job["status"] == SUCCESS_STATUS]
         shippable[path] = max(successes, key=lambda job: job.get("job_id") or 0)

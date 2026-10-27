@@ -1311,7 +1311,12 @@ class DoubleFeature(ShipperFixture):
         # No ripped title matched film 3's runtime, so ARM never filed it; a folder of that name is someone else's.
         self._film(3, "Land Before Time X", "2003", "tt0000010", None)
         self._folder("movies", self.FILM_2, files=[f"{self.FILM_2}.mkv"])
+        self._filed(self.FILM_2, int(self.STAGE) / 100 + 600)
         self._folder("movies", self.FILM_3, files=[f"{self.FILM_3}.mkv"])
+
+    def _filed(self, name, when):
+        """Give ``movies/<name>`` the mtime ARM's filing would: ``when``, an epoch inside the filing job's run."""
+        os.utime(self._local("movies", name), (when, when))
 
     def _film(self, position, title, year, imdb_id, track_number, job_id=None):
         conn = sqlite3.connect(self.db)
@@ -1430,6 +1435,51 @@ class DoubleFeature(ShipperFixture):
         # Both jobs' own folders still ship.
         self.assertFalse(os.path.exists(other))
         self.assertFalse(os.path.exists(self._local("movies", "Land Before Time VIII (2001)")))
+
+    def _earlier_rip(self, status="success", finished=True):
+        """The same double feature ripped a week before this job, its folders long shipped; returns its job id."""
+        started = int(self.STAGE) / 100 - 7 * 86400
+        stop = datetime.datetime.fromtimestamp(started + 3600).isoformat(" ") if finished else None
+        self._job("movies", "Land Before Time VIII (2001) earlier rip", status, make_folder=False)
+        self._set_job("earlier rip", title="Land Before Time VIII", year="2001", label="LBT_8_9_DVD",
+                      stage=str(round(started * 100)),
+                      start_time=datetime.datetime.fromtimestamp(started + 5).isoformat(" "), stop_time=stop)
+        earlier = self._job_id("earlier rip")
+        self._film(1, "Land Before Time VIII", "2001", "tt0000008", "1", job_id=earlier)
+        self._film(2, "Land Before Time IX", "2002", "tt0000009", "3", job_id=earlier)
+        return earlier
+
+    def test_rerip_of_a_double_feature_ships_as_the_new_job(self):
+        # A week-old rip of the same disc finished long before this job filed "IX (2002)": it claims nothing.
+        earlier = self._earlier_rip()
+        row = shipper.finished_jobs(self.db, self.completed)[os.path.realpath(self._local("movies", self.FILM_2))]
+        self.assertEqual((row["job_id"], row["film"]), (self.job_id, 2))
+        self.assertNotEqual(row["job_id"], earlier)
+        self.assertEqual(self._run(), 0)
+        self.assertFalse(os.path.exists(self._local("movies", self.FILM_2)))
+        self.assertTrue(os.path.isfile(os.path.join(self._shipped("Movies", self.FILM_2), f"{self.FILM_2}.mkv")))
+
+    def test_rerip_with_the_text_stage_ships_as_the_new_job(self):
+        self._earlier_rip()
+        self._set_job("Land Before Time VIII (2001)", stage="Track 2/2<br>Saving to MKV file")
+        row = shipper.finished_jobs(self.db, self.completed)[os.path.realpath(self._local("movies", self.FILM_2))]
+        self.assertEqual((row["job_id"], row["film"]), (self.job_id, 2))
+
+    def test_earlier_rip_without_a_stop_time_still_contests_the_folder(self):
+        # Killed or still running: with no stop_time its run has no end, so it may have filed the folder too.
+        earlier = self._earlier_rip(status="fail", finished=False)
+        with self.assertLogs("arm-completed-shipper", "WARNING") as logs:
+            self.assertEqual(self._run(), 0)
+        warned = [line for line in logs.output if "claim it" in line]
+        self.assertEqual(len(warned), 1, logs.output)
+        self.assertIn(f"{min(self.job_id, earlier)}, {max(self.job_id, earlier)}", warned[0])
+        self.assertTrue(os.path.isdir(self._local("movies", self.FILM_2)))
+        self.assertNotIn(self.FILM_2, "\n".join(self._calls()))
+        # Still ripping: the folder waits for it.
+        self._set_job("earlier rip", status="ripping")
+        self.assertEqual(self._run(), 0)
+        self.assertTrue(os.path.isdir(self._local("movies", self.FILM_2)))
+        self.assertNotIn(self.FILM_2, "\n".join(self._calls()))
 
     def test_film_filed_beside_an_existing_folder_ships_from_the_stage_suffixed_one(self):
         # ARM found "IX (2002)" already there (an older rip nobody tracks) and filed into "IX (2002)_<stage>".
