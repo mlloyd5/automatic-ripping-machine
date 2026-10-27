@@ -462,22 +462,62 @@ def metadata_selector(job, title=None, year=None):
     if title is None or str(title).strip().lower() in ("", "not identified"):
         logging.info(f"Not searching for placeholder title: {title!r}")
         return None
-    search_results = None
-    if cfg.arm_config['METADATA_PROVIDER'].lower() == "tmdb":
-        logging.debug("provider tmdb")
-        # An unreachable TMDB raises, ending identify_loop's fallback searches at the first one
-        search_results = ui_utils.tmdb_search(title, year, raise_unreachable=True)
-        if search_results is not None:
-            update_job(job, search_results, title, year)
-    elif cfg.arm_config['METADATA_PROVIDER'].lower() == "omdb":
-        logging.debug("provider omdb")
-        search_results = ui_utils.call_omdb_api(str(title), str(year))
-        if search_results is not None:
-            update_job(job, search_results, title, year)
-    else:
+    provider = cfg.arm_config['METADATA_PROVIDER'].lower()
+    if provider not in ("tmdb", "omdb"):
         logging.debug(cfg.arm_config['METADATA_PROVIDER'])
         logging.debug("unknown provider - doing nothing, saying nothing. Getting Kryten")
+        return None
+    logging.debug(f"provider {provider}")
+    search_results = provider_search(provider, title, year)
+    # The year can be wrong. A Blu-ray's comes from the date of its bdmt_eng.xml, which is when
+    # that release was authored: 2016 for a pressing of RED 2 (2013), and TMDB filtered to 2016
+    # has no RED 2, so its first result "High & Low The Red Rain" was taken. When the year
+    # search returns films but none whose title even starts with the query, and the same search
+    # without the year finds the exact title, drop the year. A label is often the start of the
+    # title: "Stagecoach" in 2017 finds "Stagecoach: The Texas Jack Story", the film on the disc,
+    # where the yearless search would take the 1939 "Stagecoach". An empty year search is left
+    # to identify_loop, which tries the year before next.
+    if year and has_results(search_results) and not has_title_starting_with(search_results, title):
+        without_year = provider_search(provider, title, None)
+        if has_exact_match(without_year, title):
+            logging.info(f"Search for '{title}' in {year} has no exact title match; "
+                         "searching without the year found one")
+            search_results, year = without_year, None
+    if search_results is not None:
+        update_job(job, search_results, title, year)
     return search_results
+
+
+def provider_search(provider, title, year):
+    """
+    Search the metadata provider ("tmdb" or "omdb"); the results are in OMDB format, or None.
+
+    An unreachable TMDB raises MetadataUnavailable rather than looking like "no results", so
+    identify_loop's fallback searches stop at the first one instead of each waiting out the timeout.
+    """
+    if provider == "tmdb":
+        return ui_utils.tmdb_search(title, year, raise_unreachable=True)
+    return ui_utils.call_omdb_api(str(title), str(year))
+
+
+def has_results(search_results) -> bool:
+    """Whether a search returned anything at all."""
+    return bool(search_results and search_results.get('Search'))
+
+
+def has_title_starting_with(search_results, title) -> bool:
+    """Whether a search returned a result whose title starts with ``title`` (compared as in best_search_result)."""
+    wanted = _normalise_title(title)
+    return has_results(search_results) and any(
+        _normalise_title(result.get("Title") or result.get("title")).startswith(wanted)
+        for result in search_results['Search'])
+
+
+def has_exact_match(search_results, title) -> bool:
+    """Whether a search returned a result titled exactly ``title`` (see best_search_result)."""
+    if not search_results or not search_results.get('Search'):
+        return False
+    return best_search_result(search_results['Search'], title, exact_only=True) is not None
 
 
 def identify_loop(job, response, title, year):
@@ -660,6 +700,9 @@ def identify_from_photo(job):
         try:
             response = try_with_year(job, None, candidate, year)
             response = try_without_year(job, response, candidate)
+        except ui_metadata.MetadataUnavailable as error:
+            logging.info(f"Metadata provider unreachable, not trying the other OCR candidates: {error}")
+            return False
         except Exception as error:
             logging.debug(f"Metadata lookup for OCR candidate '{candidate}' failed: {error}")
             response = None

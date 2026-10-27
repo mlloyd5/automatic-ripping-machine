@@ -5,6 +5,7 @@ Importing ``arm.ripper.makemkv`` pulls in the whole of ARM (config, Flask app, d
 throwaway arm.yaml is written first and pointed at with ARM_CONFIG_FILE. Needs the Linux
 dependencies ARM itself needs (libdiscid, pyudev); skipped when they are missing.
 """
+import fcntl
 import importlib
 import os
 import shutil
@@ -260,6 +261,121 @@ class TestMakemkvMkvRouting(unittest.TestCase):
             makemkv.makemkv_mkv(job, "/raw")
         commands = [call.args[0] for call in self.run_mock.call_args_list]
         self.assertEqual([cmd[cmd.index("dev:/dev/sr0") + 1] for cmd in commands], ["0", "2"])
+
+    def test_no_titles_fails_instead_of_ripping_all(self):
+        # A blind "all" rip has no track rows to move the files by, so it would be deleted with the raw folder
+        job = _job([])
+        with self.assertRaises(makemkv.utils.RipperException):
+            makemkv.makemkv_mkv(job, "/raw")
+        self.run_mock.assert_not_called()
+
+    def test_track_flags_are_committed_before_ripping(self):
+        # Left uncommitted, the flags were autoflushed and held SQLite's write lock for the whole
+        # rip (RED 2 on the t620), so the other drives' jobs failed with "database is locked".
+        job = _job([self.main, self.extra])
+        order = mock.Mock()
+        order.attach_mock(self.mocks[4], "commit")
+        order.attach_mock(self.run_mock, "run")
+        with mock.patch("builtins.open", mock.mock_open()):
+            makemkv.process_single_tracks(job, "/raw", "auto")
+        self.assertEqual([call[0] for call in order.mock_calls], ["commit", "run", "run"])
+
+
+@unittest.skipIf(IMPORT_ERROR is not None, f"ARM could not be imported here: {IMPORT_ERROR}")
+class TestGetTrackInfoRetry(unittest.TestCase):
+    """A disc MakeMKV fails to open is scanned again (RED 2 on the t620 opened on a later try)."""
+
+    OPEN_FAILED = ['MSG:5010,0,0,"Failed to open disc","Failed to open disc"', "TCOUNT:0"]
+    OPENED = ["TCOUNT:1", 'TINFO:0,9,0,"1:55:49"']
+
+    def _scan(self, *outputs):
+        scans = iter(outputs)
+
+        def info(job, select, index, options):
+            for line in next(scans):
+                msg_type, data = makemkv.parse_line(line)
+                if msg_type in select:
+                    yield data
+
+        with mock.patch.object(makemkv, "makemkv_info", side_effect=info) as scan, \
+                mock.patch.object(makemkv, "sleep") as pause, \
+                mock.patch.object(makemkv.utils, "database_updater"), \
+                mock.patch.object(makemkv.utils, "put_track") as put_track:
+            makemkv.get_track_info(0, _job([]))
+        return scan.call_count, pause.call_count, put_track.call_count
+
+    def test_opens_on_the_second_try(self):
+        self.assertEqual(self._scan(self.OPEN_FAILED, self.OPENED), (2, 1, 1))
+
+    def test_gives_up_after_the_last_attempt(self):
+        self.assertEqual(self._scan(*[self.OPEN_FAILED] * makemkv.DISC_OPEN_ATTEMPTS),
+                         (makemkv.DISC_OPEN_ATTEMPTS, makemkv.DISC_OPEN_ATTEMPTS - 1, 0))
+
+    def test_disc_without_long_titles_is_not_retried(self):
+        self.assertEqual(self._scan(["TCOUNT:0"]), (1, 0, 0))
+
+
+@unittest.skipIf(IMPORT_ERROR is not None, f"ARM could not be imported here: {IMPORT_ERROR}")
+class TestInfoScanLock(unittest.TestCase):
+    """Only one makemkvcon info scan runs at a time (two at once failed to open RED 2 on the t620)."""
+
+    def setUp(self):
+        self.lock_path = os.path.join(_TMP, "makemkv-info.lock")
+        patch = mock.patch.object(makemkv, "MAKEMKV_INFO_LOCK", self.lock_path)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def _is_locked(self):
+        with open(self.lock_path, "a") as other:
+            try:
+                fcntl.flock(other, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return True
+            return False
+
+    def _hold_lock(self):
+        holder = open(self.lock_path, "a")
+        self.addCleanup(holder.close)
+        fcntl.flock(holder, fcntl.LOCK_EX)
+        return holder
+
+    def test_lock_is_held_during_the_scan_and_released_after(self):
+        with makemkv.info_scan_lock():
+            self.assertTrue(self._is_locked())
+        self.assertFalse(self._is_locked())
+
+    def test_waits_for_the_other_drives_scan(self):
+        holder = self._hold_lock()
+        with mock.patch.object(makemkv, "sleep", side_effect=lambda _: holder.close()) as pause:
+            with makemkv.info_scan_lock():
+                self.assertTrue(self._is_locked())
+        pause.assert_called_once_with(makemkv.MAKEMKV_INFO_LOCK_POLL)
+
+    def test_stops_waiting_for_a_scan_that_hangs(self):
+        self._hold_lock()
+        clock = iter([0, 10, makemkv.MAKEMKV_INFO_LOCK_TIMEOUT + 1])
+        with mock.patch.object(makemkv, "time", side_effect=lambda: next(clock)), \
+                mock.patch.object(makemkv, "sleep") as pause, \
+                self.assertLogs(level="WARNING"):
+            with makemkv.info_scan_lock():
+                pass
+        self.assertEqual(pause.call_count, 1)
+
+    def test_makemkv_info_runs_makemkvcon_inside_the_lock(self):
+        locked_while_running = []
+
+        def run(options, select):
+            locked_while_running.append(self._is_locked())
+            yield from ()
+
+        job = SimpleNamespace(status="", config=SimpleNamespace(MINLENGTH="600", MANUAL_WAIT_TIME=60))
+        with mock.patch.object(makemkv, "run", side_effect=run), \
+                mock.patch.object(makemkv.db.session, "commit"), \
+                mock.patch.object(makemkv.utils, "sleep_check_process"), \
+                mock.patch.dict(makemkv.cfg.arm_config, {"MAX_CONCURRENT_MAKEMKVINFO": 0}):
+            list(makemkv.makemkv_info(job, index=0))
+        self.assertEqual(locked_while_running, [True])
+        self.assertFalse(self._is_locked())
 
 
 if __name__ == '__main__':

@@ -87,6 +87,34 @@ class TestIdentifyLoopWithTmdbDown(unittest.TestCase):
             identify.identify_loop(_job(), None, "THOMAS+GETS+ALONG", "")
         self.assertGreater(get.call_count, 1)
 
+    def test_without_year_research_also_stops(self):
+        """main's re-search without the year (a year search with no title starting 'RED 2') must not swallow it."""
+        red_rain = SimpleNamespace(text=json.dumps({"page": 1, "total_results": 1, "results": [
+            {"id": 1, "title": "High & Low The Red Rain", "release_date": "2016-10-08", "overview": "",
+             "poster_path": "/r.jpg", "backdrop_path": None}]}), status_code=200)
+        with mock.patch.object(metadata.requests, "get",
+                               side_effect=[red_rain, metadata.requests.Timeout("timed out")]) as get, \
+                mock.patch.object(metadata, "tmdb_get_imdb", return_value="tt0000001"), \
+                mock.patch.object(identify, "update_job") as update_job:
+            with self.assertRaises(metadata.MetadataUnavailable):
+                identify.identify_loop(_job(), None, "RED+2", "2016")
+        self.assertEqual(get.call_count, 2)
+        update_job.assert_not_called()
+
+    def test_ocr_candidates_stop_at_the_first_unreachable_search(self):
+        photo = os.path.join(_TMP, "disc.jpg")
+        Path(photo).write_bytes(b"")
+        job = _job(disctype="dvd", disc_photo="disc.jpg", hasnicetitle=False)
+        with mock.patch.dict(cfg.arm_config, {"DISC_PHOTO_OCR": True, "DISC_PHOTO_PATH": _TMP}), \
+                mock.patch.object(identify, "ocr_disc_photo", return_value="SOME TEXT"), \
+                mock.patch.object(identify.disc_photo, "clean_ocr_text",
+                                  return_value=(["FIRST+GUESS", "SECOND+GUESS", "THIRD+GUESS"], "2001")), \
+                mock.patch.object(identify.utils, "database_updater"), \
+                mock.patch.object(metadata.requests, "get",
+                                  side_effect=metadata.requests.Timeout("timed out")) as get:
+            self.assertFalse(identify.identify_from_photo(job))
+        self.assertEqual(get.call_count, 1)
+
     def test_ui_search_still_gives_no_results(self):
         with mock.patch.object(metadata.requests, "get", side_effect=metadata.requests.Timeout("timed out")):
             self.assertIsNone(metadata.tmdb_search("THE LORD OF THE RINGS", "2001"))

@@ -119,6 +119,64 @@ class TestBestSearchResult(unittest.TestCase):
         self.assertIsNone(identify.update_job(job, {"Search": []}, "Home Alone"))
 
 
+# What TMDB returns for the RED 2 Blu-ray's title: its bdmt_eng.xml is dated 2016, and the 2016
+# results have no RED 2 (job 4 on the t620 was filed as High & Low The Red Rain).
+RED_2_IN_2016 = [_result("Kunoichi Ninja Scroll 2 – Red Murder", "2016", 0),
+                 _result("High & Low The Red Rain", "2016", 18), _result("Red Dog: True Blue", "2016", 105)]
+RED_2_ANY_YEAR = [_result("RED 2", "2013", 4475), _result("Legally Blonde 2: Red, White & Blonde", "2003", 1826)]
+# The Trace Adkins Stagecoach Blu-ray (label "Stagecoach", bdmt_eng.xml dated 2018): TMDB has nothing
+# in 2018, the 2016 film in 2017, and the 1939 John Wayne film first without a year (job 8 on the t620).
+STAGECOACH_IN_2017 = [_result("Stagecoach: The Texas Jack Story", "2016", 40)]
+STAGECOACH_ANY_YEAR = [_result("Stagecoach", "1939", 1100), _result("Stagecoach", "1966", 60),
+                       _result("Stagecoach: The Texas Jack Story", "2016", 40)]
+
+
+@unittest.skipIf(IMPORT_ERROR is not None, f"ARM could not be imported here: {IMPORT_ERROR}")
+class TestMetadataSelectorYear(unittest.TestCase):
+    """A year that filters out the exact title is dropped."""
+
+    def _select(self, pages, title, year, search_loop=False):
+        job = _job(title=title, year=year)
+
+        def search(query, search_year=None, **_options):
+            return {"Search": pages[search_year]} if pages.get(search_year) else None
+
+        with mock.patch.object(identify.ui_utils, "tmdb_search", side_effect=search) as tmdb, \
+                mock.patch.object(identify.utils, "database_updater", side_effect=_fake_updater):
+            if search_loop:
+                identify.identify_loop(job, None, title, year)
+            else:
+                identify.metadata_selector(job, title, year)
+        return job, [call.args[1] for call in tmdb.call_args_list]
+
+    def test_label_that_starts_the_title_keeps_the_year(self):
+        pages = {"2017": STAGECOACH_IN_2017, None: STAGECOACH_ANY_YEAR}
+        job, years = self._select(pages, "Stagecoach", "2017")
+        self.assertEqual((job.title, job.year), ("Stagecoach--The-Texas-Jack-Story", "2016"))
+        self.assertEqual(years, ["2017"])
+
+    def test_empty_year_search_is_left_to_the_year_before(self):
+        pages = {"2017": STAGECOACH_IN_2017, None: STAGECOACH_ANY_YEAR}
+        job, years = self._select(pages, "Stagecoach", "2018", search_loop=True)
+        self.assertEqual((job.title, job.year), ("Stagecoach--The-Texas-Jack-Story", "2016"))
+        self.assertEqual(years, ["2018", "2017"])
+
+    def test_wrong_year_falls_back_to_the_exact_title(self):
+        job, years = self._select({"2016": RED_2_IN_2016, None: RED_2_ANY_YEAR}, "RED+2", "2016")
+        self.assertEqual((job.title, job.year), ("RED-2", "2013"))
+        self.assertEqual(years, ["2016", None])
+
+    def test_year_with_an_exact_match_is_kept(self):
+        job, years = self._select({"1990": HOME_ALONE}, "Home+Alone", "1990")
+        self.assertEqual((job.title, job.year), ("Home-Alone", "1990"))
+        self.assertEqual(years, ["1990"])
+
+    def test_no_exact_match_either_way_keeps_the_year_search(self):
+        job, years = self._select({"2016": RED_2_IN_2016, None: RED_2_IN_2016}, "Red+Rain", "2016")
+        self.assertEqual(job.title, identify.utils.clean_for_filename(RED_2_IN_2016[0]["Title"]))
+        self.assertEqual(years, ["2016", None])
+
+
 @unittest.skipIf(IMPORT_ERROR is not None, f"ARM could not be imported here: {IMPORT_ERROR}")
 class TestBarcodeComesFirst(unittest.TestCase):
     """identify() asks the case barcode before the CRC database and the label search."""
