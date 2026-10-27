@@ -489,9 +489,14 @@ def metadata_selector(job, title=None, year=None):
 
 
 def provider_search(provider, title, year):
-    """Search the metadata provider ("tmdb" or "omdb"); the results are in OMDB format, or None."""
+    """
+    Search the metadata provider ("tmdb" or "omdb"); the results are in OMDB format, or None.
+
+    An unreachable TMDB raises MetadataUnavailable rather than looking like "no results", so
+    identify_loop's fallback searches stop at the first one instead of each waiting out the timeout.
+    """
     if provider == "tmdb":
-        return ui_utils.tmdb_search(title, year)
+        return ui_utils.tmdb_search(title, year, raise_unreachable=True)
     return ui_utils.call_omdb_api(str(title), str(year))
 
 
@@ -695,6 +700,9 @@ def identify_from_photo(job):
         try:
             response = try_with_year(job, None, candidate, year)
             response = try_without_year(job, response, candidate)
+        except ui_metadata.MetadataUnavailable as error:
+            logging.info(f"Metadata provider unreachable, not trying the other OCR candidates: {error}")
+            return False
         except Exception as error:
             logging.debug(f"Metadata lookup for OCR candidate '{candidate}' failed: {error}")
             response = None

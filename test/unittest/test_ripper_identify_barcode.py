@@ -138,7 +138,7 @@ class TestMetadataSelectorYear(unittest.TestCase):
     def _select(self, pages, title, year, search_loop=False):
         job = _job(title=title, year=year)
 
-        def search(query, search_year=None):
+        def search(query, search_year=None, **_options):
             return {"Search": pages[search_year]} if pages.get(search_year) else None
 
         with mock.patch.object(identify.ui_utils, "tmdb_search", side_effect=search) as tmdb, \
