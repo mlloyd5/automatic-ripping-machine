@@ -321,7 +321,7 @@ def move_files_post(transcode_out_path, job, main_features_only=False):
     :param transcode_out_path: This should either be the RAW_PATH from MakeMKV, /dev/srX or TRANSCODE_PATH
     :param job: current job
     :param main_features_only: a double feature whose MAINFEATURE apply_collection_settings lifted: file
-        the films only, no extras
+        the films only, no extras (and with MAINFEATURE back on when it is no longer a double feature)
     :return: None
     """
     tracks = job.tracks.filter_by(ripped=True)  # .order_by(job.tracks.length.desc())
@@ -333,6 +333,11 @@ def move_files_post(transcode_out_path, job, main_features_only=False):
     elif file_collection(transcode_out_path, job, os.listdir(transcode_out_path), main_features_only):
         pass  # a double feature: each film went to its own folder
     else:
+        if main_features_only:
+            # No longer a double feature (cleared, or down to one film, during the rip): file it with the
+            # MAINFEATURE the job started with, which apply_collection_settings lifted for the rip
+            logging.info("Not a double feature any more: filing with MAINFEATURE on again")
+            utils.database_updater({'MAINFEATURE': True}, job.config)
         for track in tracks:
             if tracks.count() == 1:
                 utils.move_files(transcode_out_path, track.filename, job, True)

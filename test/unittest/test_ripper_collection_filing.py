@@ -235,6 +235,23 @@ class TestApplyCollectionSettings(unittest.TestCase):
             arm_ripper.move_files_post("/raw", job, True)
         filing.assert_called_once_with("/raw", job, [], True)
 
+    def test_move_files_post_restores_mainfeature_when_no_longer_a_double_feature(self):
+        for films in ([], _films()[:1]):
+            job = self._job(films, mainfeature=False)
+            job.tracks = _Tracks([])
+            with mock.patch.object(arm_ripper.utils, "is_bonus_disc", return_value=False), \
+                    mock.patch.object(arm_ripper.os, "listdir", return_value=[]):
+                arm_ripper.move_files_post("/raw", job, True)
+            self.assertTrue(job.config.MAINFEATURE, films)
+
+    def test_move_files_post_leaves_mainfeature_alone_when_it_was_not_lifted(self):
+        job = self._job(_films()[:1], mainfeature=False)
+        job.tracks = _Tracks([])
+        with mock.patch.object(arm_ripper.utils, "is_bonus_disc", return_value=False), \
+                mock.patch.object(arm_ripper.os, "listdir", return_value=[]):
+            arm_ripper.move_files_post("/raw", job, False)
+        self.assertFalse(job.config.MAINFEATURE)
+
 
 if __name__ == "__main__":
     unittest.main()

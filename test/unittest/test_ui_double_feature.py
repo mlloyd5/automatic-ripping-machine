@@ -248,6 +248,16 @@ class TestDoubleFeaturePage(unittest.TestCase):
         self.assertIn("is film 1 of this disc already", self._post(dict(as_form(STUART), imdb_id="")))
         self.assertEqual(double_feature.clear_for_title_fix(Job.query.get(self.disc.job_id), title="Stuart Little"), 0)
 
+    def test_title_fix_compares_titles_when_the_first_film_has_no_imdb_id(self):
+        db.session.add(Film(self.disc.job_id, 1, "Stuart-Little", "1999", None))
+        db.session.add(Film(self.disc.job_id, 2, "Stuart-Little-2", "2002", "tt0243585"))
+        db.session.commit()
+        job = Job.query.get(self.disc.job_id)
+        self.assertEqual(double_feature.clear_for_title_fix(job, imdb_id="tt0164912", title="Stuart Little"), 0)
+        self.assertEqual(len(self._films()), 2)
+        self.assertEqual(double_feature.clear_for_title_fix(job, imdb_id="tt0243585", title="Stuart Little 2"), 2)
+        self.assertEqual(self._films(), [])
+
     def test_finished_job_keeps_its_films(self):
         self._mark()
         job = Job.query.get(self.disc.job_id)

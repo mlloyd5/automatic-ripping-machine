@@ -216,8 +216,11 @@ def clear_for_title_fix(job, imdb_id=None, title=None):
     if not films:
         return 0
     first = films[0]
-    if (imdb_id and imdb_id == first.imdb_id) or (not imdb_id and same_title(title, first.title)):
-        return 0
+    if imdb_id and first.imdb_id:
+        if imdb_id == first.imdb_id:
+            return 0
+    elif same_title(title, first.title):
+        return 0  # no IMDb id on one side (TMDB may have none): compare the titles
     app.logger.info(f"Title fix of job {job.job_id}: it is no longer a double feature of "
                     + ", ".join(film.folder_name for film in films))
     count = Film.query.filter_by(job_id=job.job_id).delete()
