@@ -40,7 +40,9 @@ def ocr_suggestion(job):
 
     What the vision model read off the disc label comes first (the disc names its release most
     precisely), then the product title the case barcode looked up to, then what OCR read from
-    the disc photo.
+    the disc photo. Of the vision read only the full title ("Toon Time: Ultimate Cartoon
+    Collection") is a candidate: it is the name the ripper gave the disc and the one the "Disc
+    label" link offers, so the title box is pre-filled with it rather than the bare "Toon Time".
 
     :return: dict with 'candidates' (list of str), 'year' (str or None), 'barcode' (dict or None) and
              'vision' (dict or None), or None
@@ -51,7 +53,7 @@ def ocr_suggestion(job):
     vision = disc_vision.parse_answer(getattr(job, 'disc_photo_vision', None))
     if vision:
         vision['titles'] = disc_vision.search_titles(vision)
-        candidates.extend(vision['titles'])
+        candidates.append(vision['titles'][-1])
         year = vision['year']
     if job.disc_barcode:
         barcode = {'code': job.disc_barcode, 'raw': job.disc_barcode_title, 'title': None}

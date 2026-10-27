@@ -68,6 +68,10 @@ class TestParseAnswer(unittest.TestCase):
         self.assertEqual(disc_vision.parse_answer('{"title": "X", "confidence": 95}')["confidence"], 0.95)
         self.assertEqual(disc_vision.parse_answer('{"title": "X", "confidence": 700}')["confidence"], 1.0)
         self.assertEqual(disc_vision.parse_answer('{"title": "X", "confidence": -2}')["confidence"], 0.0)
+        self.assertEqual(disc_vision.parse_answer('{"title": "X", "confidence": "95%"}')["confidence"], 0.95)
+        self.assertEqual(disc_vision.parse_answer('{"title": "X", "confidence": " 80 % "}')["confidence"], 0.8)
+        self.assertEqual(disc_vision.parse_answer('{"title": "X", "confidence": "0.5%"}')["confidence"], 0.005)
+        self.assertEqual(disc_vision.parse_answer('{"title": "X", "confidence": "%"}')["confidence"], 0.0)
         self.assertIsNone(disc_vision.parse_answer('{"title": "X", "year": "the 90s"}')["year"])
         self.assertIsNone(disc_vision.parse_answer('{"title": "X", "subtitle": "null"}')["subtitle"])
 
@@ -128,7 +132,7 @@ class TestReadDiscPhoto(unittest.TestCase):
         self.assertEqual(post.call_count, 1)
         body = post.call_args.kwargs["json"]
         self.assertEqual(post.call_args.args[0], "http://host:11434/api/generate")
-        self.assertEqual(post.call_args.kwargs["timeout"], 60)
+        self.assertEqual(post.call_args.kwargs["timeout"], (disc_vision.CONNECT_TIMEOUT, 60))
         self.assertEqual((body["model"], body["stream"], body["format"], body["options"]),
                          ("qwen2.5vl:7b", False, "json", {"temperature": 0}))
         self.assertEqual(_image_of(post.call_args), b"\xff\xd8 not really a jpeg")
@@ -177,34 +181,68 @@ class TestReadDiscPhoto(unittest.TestCase):
         with mock.patch.object(disc_vision.requests, "post",
                                return_value=_response(response_text="I think this is WALL-E.")) as post:
             self.assertIsNone(disc_vision.read_disc_photo(self.photo, "http://host:11434"))
-        self.assertEqual(post.call_count, 3)  # every rotation was tried
-        with mock.patch.object(disc_vision.requests, "post", return_value=_response(body="not an object")):
+        self.assertEqual(post.call_count, 3)  # the model answered, just not usefully: every rotation was tried
+        # an envelope that is not Ollama's JSON object is the server's failure, not the model's
+        with mock.patch.object(disc_vision.requests, "post", return_value=_response(body="not an object")) as post:
             self.assertIsNone(disc_vision.read_disc_photo(self.photo, "http://host:11434"))
+        self.assertEqual(post.call_count, 1)
         broken = _response()
         broken.json.side_effect = ValueError("no json")
-        with mock.patch.object(disc_vision.requests, "post", return_value=broken):
+        with mock.patch.object(disc_vision.requests, "post", return_value=broken) as post:
             self.assertIsNone(disc_vision.read_disc_photo(self.photo, "http://host:11434"))
+        self.assertEqual(post.call_count, 1)
 
-    def test_timeout_and_http_errors_give_none(self):
-        with mock.patch.object(disc_vision.requests, "post", side_effect=requests.Timeout("too slow")) as post:
-            self.assertIsNone(disc_vision.read_disc_photo(self.photo, "http://host:11434", timeout=5))
-        self.assertEqual(post.call_count, 3)
-        with mock.patch.object(disc_vision.requests, "post", side_effect=requests.ConnectionError("down")):
-            self.assertIsNone(disc_vision.read_disc_photo(self.photo, "http://host:11434"))
-        with mock.patch.object(disc_vision.requests, "post",
-                               return_value=_response(status=404, body={"error": "no model"})):
-            self.assertIsNone(disc_vision.read_disc_photo(self.photo, "http://host:11434"))
+    def test_timeout_and_http_errors_give_none_without_retrying(self):
+        """A failed request is not an unsure read: the rotations would only multiply the wait."""
+        for failure in (dict(side_effect=requests.Timeout("too slow")),
+                        dict(side_effect=requests.ConnectionError("down")),
+                        dict(return_value=_response(status=404, body={"error": "model not found"})),
+                        dict(return_value=_response(status=500, body={"error": "out of memory"}))):
+            with mock.patch.object(disc_vision.requests, "post", **failure) as post:
+                self.assertIsNone(disc_vision.read_disc_photo(self.photo, "http://host:11434", timeout=5))
+            self.assertEqual(post.call_count, 1, failure)
+            self.assertEqual(post.call_args.kwargs["timeout"], (disc_vision.CONNECT_TIMEOUT, 5))
 
-    def test_one_good_answer_among_failures(self):
+    def test_a_failure_after_an_unsure_answer_keeps_that_answer(self):
+        """The server went away while the rotated photo was being read: what it said first still counts."""
+        def answer_for(url, json=None, timeout=None):
+            image = base64.b64decode(json["images"][0])
+            if image.startswith(b"rot"):
+                raise requests.Timeout("too slow")
+            return _response(response_text='{"title": "WALL-E", "year": 2008, "confidence": 0.8}')
+
+        with mock.patch.object(disc_vision.requests, "post", side_effect=answer_for) as post:
+            answer = disc_vision.read_disc_photo(self.photo, "http://host:11434")
+        self.assertEqual(post.call_count, 2)  # as it is, then 90 degrees, which timed out: no 270
+        self.assertEqual((answer["title"], answer["year"], answer["rotation"]), ("WALL-E", "2008", 0))
+
+    def test_one_good_answer_among_unusable_ones(self):
+        """Sideways the label reads as nothing the model can name; the right way up it is clear."""
         def answer_for(url, json=None, timeout=None):
             image = base64.b64decode(json["images"][0])
             if image.startswith(b"rot270:"):
                 return _response(response_text='{"title": "WALL-E", "year": 2008, "confidence": 0.8}')
-            raise requests.Timeout("too slow")
+            return _response(response_text='{"title": null, "other_text": ["DISNEY", "PIXAR"]}')
 
-        with mock.patch.object(disc_vision.requests, "post", side_effect=answer_for):
+        with mock.patch.object(disc_vision.requests, "post", side_effect=answer_for) as post:
             answer = disc_vision.read_disc_photo(self.photo, "http://host:11434")
+        self.assertEqual(post.call_count, 3)
         self.assertEqual((answer["title"], answer["year"], answer["rotation"]), ("WALL-E", "2008", 270))
+
+    def test_envelope_without_a_duration_is_still_read(self):
+        """Ollama may send "total_duration": null (or leave it out): only the log line uses it."""
+        for envelope in ({"response": json.dumps(GOOD), "total_duration": None, "eval_count": None},
+                         {"response": json.dumps(GOOD)},
+                         {"response": json.dumps(GOOD), "total_duration": "6s"}):
+            with mock.patch.object(disc_vision.requests, "post", return_value=_response(body=envelope)):
+                answer = disc_vision.read_disc_photo(self.photo, "http://host:11434")
+            self.assertEqual((answer["title"], answer["confidence"]), ("Toon Time", 0.95), envelope)
+
+    def test_ask_model_gives_none_on_a_failed_request(self):
+        with mock.patch.object(disc_vision.requests, "post", side_effect=requests.ConnectionError("down")):
+            self.assertIsNone(disc_vision.ask_model(b"jpeg", "http://host:11434"))
+        with mock.patch.object(disc_vision.requests, "post", return_value=_response(response_text=json.dumps(GOOD))):
+            self.assertEqual(disc_vision.ask_model(b"jpeg", "http://host:11434")["title"], "Toon Time")
 
     def test_missing_photo_or_rotation_gives_none_without_raising(self):
         with mock.patch.object(disc_vision.requests, "post") as post:

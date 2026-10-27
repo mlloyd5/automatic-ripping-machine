@@ -92,7 +92,15 @@ def unmount_disc(job):
 
 
 def identify(job):
-    """Identify disc attributes"""
+    """
+    Identify disc attributes
+
+    Video discs are tried, cheapest and most precise first: the case barcode, a volume label that
+    names a collection of films, the disc's own metadata (a DVD's CRC64 record, a Blu-ray's
+    bdmt_eng.xml title), the vision model's reading of the disc photo (only when that metadata
+    gave no title: it costs a model round trip), then the label search. A disc still not
+    identified is named after the label the model read, else the barcode's product title.
+    """
     logging.debug("Identify Entry point --- job ----")
 
     mounted = check_mount(job)
@@ -115,18 +123,17 @@ def identify(job):
             except Exception as error:
                 logging.error(f"Barcode lookup failed: {error}", exc_info=True)
             if not res:
-                # The disc's own label, read by a vision model, names the release more precisely
-                # than the case does, and is more reliable than a label search on "CARTOONS_D3".
-                try:
-                    res = identify_from_photo_vision(job)
-                except Exception as error:
-                    logging.error(f"Disc photo vision lookup failed: {error}", exc_info=True)
-            if not res:
                 res = identify_collection_from_label(job)
+            # The disc's own metadata (a DVD's CRC64 record, a Blu-ray's bdmt_eng.xml) is free and
+            # comes next; only when it has no title is the photo sent to the vision model
+            # (identify_vision_step), ahead of the label search on "CARTOONS_D3".
             if job.disctype == "dvd":
                 res = identify_dvd(job, title_known=res) or res
             if job.disctype == "bluray" and not res:
                 res = identify_bluray(job)
+                if not job.hasnicetitle and (not res or str(job.title) in _label_titles(job)):
+                    # no bdmt_eng.xml title, only the label: get_video_details would search that
+                    res = identify_vision_step(job) or res
             if res:
                 get_video_details(job)
             else:
@@ -241,9 +248,13 @@ def identify_dvd(job, title_known=False):
     """ Manipulates the DVD title and calls OMDB to try and
     lookup the title
 
-    :param title_known: the title was already found (from the case barcode): still compute the
-                        CRC and check for track 99, but do not replace it from the CRC database
-                        or the label search
+    :param title_known: the title was already found (from the case barcode, or the label naming
+                        a collection): still compute the CRC and check for track 99, but do not
+                        replace it from the CRC database or the label search
+
+    When the CRC64 database does not know the disc either, the vision model reads the disc photo
+    (:func:`identify_vision_step`) before the label search: a title it finds online is kept like
+    one from the barcode.
     """
 
     logging.debug(f"\n\r{job.pretty_table()}")
@@ -296,9 +307,12 @@ def identify_dvd(job, title_known=False):
     dvd_title = re.sub(r"SKU\b", "", dvd_title)
     logging.debug(f"dvd_title SKU$: {dvd_title}")
 
+    if not title_known and not job.hasnicetitle:
+        title_known = identify_vision_step(job)
+
     # Do we really need metaselector if we have got from ARM online db?
     if title_known:
-        logging.info(f"Title already identified from the case barcode: {job.title} ({job.year})")
+        logging.info(f"Title already identified: {job.title} ({job.year}), skipping the label search")
     else:
         try:
             dvd_info_xml = metadata_selector(job, dvd_title, year)
@@ -658,13 +672,19 @@ def identify_from_photo(job):
     when no online match is found. Once the case barcode has named the product the OCR
     candidates are held to the same rule as the label search (see update_job): only a result
     titled exactly like a candidate is taken, so a misread photo cannot replace the product
-    title the disc was named after.
+    title the disc was named after. When the vision model already read the label well enough to
+    name the disc (:func:`title_from_disc_photo`) OCR does not run at all: tesseract reads far
+    less off the same photo, and its first fuzzy match would replace the better name.
 
     :return: True when a title was found from the photo
     """
     if not cfg.arm_config.get("DISC_PHOTO_OCR", False):
         return False
     if job.disctype not in ["dvd", "bluray"] or not job.disc_photo or job.hasnicetitle:
+        return False
+    vision_title, _ = disc_vision.label_title(disc_vision.parse_answer(getattr(job, 'disc_photo_vision', None)))
+    if vision_title:
+        logging.info(f"The vision model read the disc label as '{vision_title}'; not running OCR on the photo")
         return False
     photo_path = os.path.join(cfg.arm_config.get("DISC_PHOTO_PATH", ""), job.disc_photo)
     if not os.path.isfile(photo_path):
@@ -695,13 +715,28 @@ def identify_from_photo(job):
     return False
 
 
+def identify_vision_step(job):
+    """
+    :func:`identify_from_photo_vision`, which must never stop identification.
+
+    :return: True when a title was found from the photo
+    """
+    try:
+        return identify_from_photo_vision(job)
+    except Exception as error:
+        logging.error(f"Disc photo vision lookup failed: {error}", exc_info=True)
+        return False
+
+
 def identify_from_photo_vision(job):
     """
     Identify the disc from what a vision model reads on its label in the webcam photo.
 
     Runs for video discs not yet identified (``hasnicetitle`` is False) that have a photo, when
-    DISC_PHOTO_VISION_URL is set: after the case barcode and before the CRC64 database and the
-    label search, since the printed label names the release better than its volume label does.
+    DISC_PHOTO_VISION_URL is set: after the case barcode, and after the disc's own metadata (a
+    DVD's CRC64 record, a Blu-ray's bdmt_eng.xml title) has found nothing, since those cost no
+    model round trip. It comes before the label search, since the printed label names the release
+    better than its volume label does.
     What the model read is kept on the job (JSON) so the title fix pages can offer it and
     :func:`title_from_disc_photo` can name the disc when nothing online matches. The title (and
     the title with its subtitle) is searched online with the year read, exact matches only.
@@ -752,24 +787,24 @@ def title_from_disc_photo(job):
     :func:`title_from_barcode_product`: the disc names itself more precisely than its case does
     (job 34's case said "59 Cartoon Classics", the disc "Toon Time: Ultimate Cartoon Collection").
     A title the disc itself supplied (a Blu-ray's bdmt_eng.xml) is kept, and a read the model was
-    not reasonably sure of is ignored. ``hasnicetitle`` stays False: this is a name, not an
-    identification.
+    not reasonably sure of is ignored. As with the product title the year goes with the title:
+    the one read, or none, never the date of a Blu-ray's metadata file. ``hasnicetitle`` stays
+    False: this is a name, not an identification.
 
     :return: True when the title was set from the photo
     """
     if job.hasnicetitle or not getattr(job, 'disc_photo_vision', None):
         return False
-    if job.title not in (None, "", "not identified") and str(job.title) != str(job.label):
+    if job.title not in (None, "", "not identified") and str(job.title) not in _label_titles(job):
         return False
     title, year = disc_vision.label_title(disc_vision.parse_answer(job.disc_photo_vision))
     if not title:
         return False
     title = utils.clean_for_filename(title)
-    args = {'title': title, 'title_auto': title}
-    if year:
-        args.update({'year': year, 'year_auto': year})
+    year = year or ""
+    args = {'title': title, 'title_auto': title, 'year': year, 'year_auto': year}
     logging.info(f"Nothing online matched the disc; naming it after its label as read from the photo: "
-                 f"'{title}' ({year})")
+                 f"'{title}' ({year or 'no year'})")
     utils.database_updater(args, job)
     return True
 

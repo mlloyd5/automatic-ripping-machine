@@ -452,7 +452,8 @@ DISC_PHOTO_VISION_URL: ""
 DISC_PHOTO_VISION_MODEL: "qwen2.5vl:7b"
 
 # Seconds to wait for one answer from the vision model (the first request after an idle
-# period also loads the model into the GPU).
+# period also loads the model into the GPU). Connecting gives up after 5 seconds, and a
+# request that fails or times out is not retried with the photo rotated.
 DISC_PHOTO_VISION_TIMEOUT: 120
 
 # Copy the disc photo into the completed rip folder as disc.jpg, and the barcode scanned

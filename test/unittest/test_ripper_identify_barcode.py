@@ -172,6 +172,7 @@ class TestBarcodeComesFirst(unittest.TestCase):
         cfg.arm_config["GET_VIDEO_TITLE"] = True
         self.calls = []
         self.vision_result = False
+        self.bluray_title = None  # a bdmt_eng.xml title; None: the disc has none, the label is used
         self.patches = [
             mock.patch.object(identify, "identify_from_photo_vision",
                               side_effect=lambda job: self.calls.append("vision") or self.vision_result),
@@ -180,8 +181,7 @@ class TestBarcodeComesFirst(unittest.TestCase):
             mock.patch.object(identify, "get_video_details"),
             mock.patch.object(identify.utils, "find_file", return_value=False),
             mock.patch.object(identify.db.session, "commit"),
-            mock.patch.object(identify, "identify_bluray",
-                              side_effect=lambda job: self.calls.append("bluray") or True),
+            mock.patch.object(identify, "identify_bluray", side_effect=self._bluray),
             mock.patch.object(identify, "identify_dvd", side_effect=self._dvd),
         ]
         for patch in self.patches:
@@ -193,8 +193,18 @@ class TestBarcodeComesFirst(unittest.TestCase):
 
     def _dvd(self, job, title_known=False):
         self.calls.append(("dvd", title_known))
+        # the real identify_dvd asks the vision model after a CRC64 miss, before the label search
+        # (TestIdentifyEndToEnd runs it); this stand-in's CRC64 lookup always misses
+        if not title_known and not job.hasnicetitle:
+            title_known = identify.identify_vision_step(job)
         if not title_known and job.title in (None, "", "not identified"):
             job.title = str(job.label)  # identify_dvd's failsafe when no search found anything
+        return True
+
+    def _bluray(self, job):
+        self.calls.append("bluray")
+        # identify_bluray title-cases the label when bdmt_eng.xml has no title
+        job.title = self.bluray_title or str(job.label).replace("_", " ").title()
         return True
 
     def _video_job(self, disctype):
@@ -213,25 +223,25 @@ class TestBarcodeComesFirst(unittest.TestCase):
         with mock.patch.object(identify, "identify_from_barcode",
                                side_effect=lambda job: self.calls.append("barcode") or False):
             identify.identify(self._video_job("dvd"))
-        self.assertEqual(self.calls, ["barcode", "vision", ("dvd", False)])
+        self.assertEqual(self.calls, ["barcode", ("dvd", False), "vision"])
 
-    def test_vision_runs_after_the_barcode_and_before_the_label(self):
-        """A vision hit, like a barcode hit, only leaves identify_dvd the CRC64 record to submit."""
-        self.vision_result = True
-        with mock.patch.object(identify, "identify_from_barcode",
-                               side_effect=lambda job: self.calls.append("barcode") or False), \
-                mock.patch.object(identify, "identify_collection_from_label",
-                                  side_effect=lambda job: self.calls.append("label") or False):
-            identify.identify(self._video_job("dvd"))
-        self.assertEqual(self.calls, ["barcode", "vision", ("dvd", True)])
+    def test_vision_runs_after_the_barcode_and_the_disc_itself(self):
+        """The model is only asked once the barcode, a collection label and the disc's metadata missed."""
+        for vision_result in (True, False):
+            self.calls.clear()
+            self.vision_result = vision_result
+            with mock.patch.object(identify, "identify_from_barcode",
+                                   side_effect=lambda job: self.calls.append("barcode") or False), \
+                    mock.patch.object(identify, "identify_collection_from_label",
+                                      side_effect=lambda job: self.calls.append("label") or False):
+                identify.identify(self._video_job("dvd"))
+            self.assertEqual(self.calls, ["barcode", "label", ("dvd", False), "vision"])
+        # a collection named by the label is an identification: no model round trip
         self.calls.clear()
-        self.vision_result = False
-        with mock.patch.object(identify, "identify_from_barcode",
-                               side_effect=lambda job: self.calls.append("barcode") or False), \
-                mock.patch.object(identify, "identify_collection_from_label",
-                                  side_effect=lambda job: self.calls.append("label") or False):
+        with mock.patch.object(identify, "identify_from_barcode", return_value=False), \
+                mock.patch.object(identify, "identify_collection_from_label", return_value=True):
             identify.identify(self._video_job("dvd"))
-        self.assertEqual(self.calls, ["barcode", "vision", "label", ("dvd", False)])
+        self.assertEqual(self.calls, [("dvd", True)])
 
     def test_vision_failure_never_stops_identification(self):
         with mock.patch.object(identify, "identify_from_barcode", return_value=False), \
@@ -240,12 +250,18 @@ class TestBarcodeComesFirst(unittest.TestCase):
         self.assertEqual(self.calls, [("dvd", False)])
 
     def test_bluray_is_only_read_when_the_barcode_missed(self):
+        """The model is asked only when the Blu-ray's bdmt_eng.xml gave no title, just the label."""
         with mock.patch.object(identify, "identify_from_barcode", return_value=True):
             identify.identify(self._video_job("bluray"))
         self.assertEqual(self.calls, [])
         with mock.patch.object(identify, "identify_from_barcode", return_value=False):
             identify.identify(self._video_job("bluray"))
-        self.assertEqual(self.calls, ["vision", "bluray"])
+        self.assertEqual(self.calls, ["bluray", "vision"])
+        self.calls.clear()
+        self.bluray_title = "The-Real-Title"
+        with mock.patch.object(identify, "identify_from_barcode", return_value=False):
+            identify.identify(self._video_job("bluray"))
+        self.assertEqual(self.calls, ["bluray"])
 
     def test_disc_label_read_from_the_photo_names_a_disc_over_the_case(self):
         """Job 34 again: the vision model read the disc, nothing online matched, the case title is a worse name."""
@@ -287,7 +303,7 @@ class TestBarcodeComesFirst(unittest.TestCase):
     def test_disc_label_does_not_replace_a_title_the_disc_gave(self):
         job = self._video_job("bluray")
         job.disc_photo_vision = json.dumps(TOON_TIME)
-        job.title = "The-Real-Title"
+        self.bluray_title = "The-Real-Title"
         with mock.patch.object(identify, "identify_from_barcode", return_value=False), \
                 mock.patch.object(identify.utils, "database_updater", side_effect=_fake_updater):
             identify.identify(job)
@@ -307,7 +323,7 @@ class TestBarcodeComesFirst(unittest.TestCase):
         with mock.patch.object(identify, "identify_from_barcode", side_effect=barcode_miss), \
                 mock.patch.object(identify.utils, "database_updater", side_effect=_fake_updater):
             identify.identify(job)
-        self.assertEqual(self.calls, ["vision", ("dvd", False)])
+        self.assertEqual(self.calls, [("dvd", False), "vision"])
         self.assertEqual((job.title, job.title_auto, job.year, job.hasnicetitle),
                          ("59-Cartoon-Classics", "59-Cartoon-Classics", "", False))
 
@@ -332,7 +348,7 @@ class TestBarcodeComesFirst(unittest.TestCase):
         """A Blu-ray's bdmt_eng.xml title, or one the CRC64 database set, is kept."""
         job = self._video_job("bluray")
         job.disc_barcode_title = "Some Boxed Set (Blu-ray)"
-        job.title = "The-Real-Title"
+        self.bluray_title = "The-Real-Title"
         with mock.patch.object(identify, "identify_from_barcode", return_value=False), \
                 mock.patch.object(identify.utils, "database_updater", side_effect=_fake_updater):
             identify.identify(job)
@@ -344,7 +360,7 @@ class TestBarcodeComesFirst(unittest.TestCase):
     def test_barcode_failure_never_stops_identification(self):
         with mock.patch.object(identify, "identify_from_barcode", side_effect=RuntimeError("upcitemdb down")):
             identify.identify(self._video_job("dvd"))
-        self.assertEqual(self.calls, ["vision", ("dvd", False)])
+        self.assertEqual(self.calls, [("dvd", False), "vision"])
 
 
 @unittest.skipIf(IMPORT_ERROR is not None, f"ARM could not be imported here: {IMPORT_ERROR}")
@@ -528,6 +544,58 @@ class TestIdentifyEndToEnd(unittest.TestCase):
         self.assertEqual((job.title, job.year, job.hasnicetitle),
                          ("Greatest-Cartoons-of-the-Golden-Era-Vol.-3", "2024", True))
 
+    def _vision(self, answer=None):
+        """identify_from_photo_vision stand-in: logs its turn among the searches, finds nothing online."""
+        def vision(job):
+            self.searched.append("vision")
+            if answer:
+                job.disc_photo_vision = json.dumps(answer)
+            return False
+        return mock.patch.object(identify, "identify_from_photo_vision", side_effect=vision)
+
+    def test_dvd_vision_runs_after_the_crc64_miss_and_before_the_label_search(self):
+        job = self._job("dvd")
+        with self._vision(TOON_TIME):
+            identify.identify(job)
+        self.assertEqual(self.searched, [("59 Cartoon Classics", None), "vision", ("CARTOONS_D3", None),
+                                         ("CARTOONS+D3", None)])
+        self.assertEqual((job.title, job.year, job.hasnicetitle), ("Toon-Time--Ultimate-Cartoon-Collection", "2011",
+                                                                   False))
+
+    def test_dvd_the_crc64_database_knows_is_not_sent_to_the_model(self):
+        crc_hit = _Response(json.dumps({"success": True, "results": {"0": {
+            "title": "Toon Time", "year": "2011", "imdb_id": "tt0000001", "video_type": "movie",
+            "poster_img": None}}}).encode())
+        job = self._job("dvd")
+        with self._vision(TOON_TIME), mock.patch.object(identify.urllib.request, "urlopen", return_value=crc_hit):
+            identify.identify(job)
+        self.assertNotIn("vision", self.searched)
+
+    def test_bluray_metadata_title_is_not_sent_to_the_model(self):
+        self._bdmt(BDMT_XML)
+        job = self._job("bluray")
+        with self._vision(TOON_TIME):
+            identify.identify(job)
+        self.assertNotIn("vision", self.searched)
+        self.assertEqual(job.title, "Cartoon-Classics-Collection")
+
+    def test_bluray_without_metadata_is_sent_to_the_model_before_the_label_search(self):
+        """No bdmt_eng.xml title, only the label: the read names the disc, its year replaces the file's."""
+        self._bdmt(BDMT_BROKEN)
+        job = self._job("bluray")
+        with self._vision(TOON_TIME):
+            identify.identify(job)
+        # then get_video_details searches the cleaned label (with the metadata file's year)
+        self.assertEqual(self.searched[:2], [("59 Cartoon Classics", None), "vision"])
+        self.assertEqual([title for title, year in self.searched[2:]], ["CARTOONS+D3"])
+        self.assertEqual((job.title, job.year, job.year_auto, job.hasnicetitle),
+                         ("Toon-Time--Ultimate-Cartoon-Collection", "2011", "2011", False))
+        self.searched.clear()
+        job = self._job("bluray")
+        with self._vision(dict(TOON_TIME, year=None)):
+            identify.identify(job)
+        self.assertEqual((job.title, job.year, job.year_auto), ("Toon-Time--Ultimate-Cartoon-Collection", "", ""))
+
 
 @unittest.skipIf(IMPORT_ERROR is not None, f"ARM could not be imported here: {IMPORT_ERROR}")
 class TestIdentifyFromPhoto(unittest.TestCase):
@@ -571,6 +639,20 @@ class TestIdentifyFromPhoto(unittest.TestCase):
         with mock.patch.object(identify.ui_utils, "tmdb_search", return_value={"Search": exact}):
             self.assertTrue(identify.identify_from_photo(job))
         self.assertEqual((job.title, job.year, job.hasnicetitle), ("Greatest-Cartoons", "1999", True))
+
+    def test_a_confident_vision_read_is_not_replaced_by_ocr(self):
+        """The model read "Toon Time: Ultimate Cartoon Collection" at 0.95: OCR's "CARTOON" must not retitle it."""
+        job = self._job(title="Toon-Time--Ultimate-Cartoon-Collection", disc_photo_vision=json.dumps(TOON_TIME))
+        with mock.patch.object(identify.ui_utils, "tmdb_search", return_value={"Search": CARTOONS_D3}) as search:
+            self.assertFalse(identify.identify_from_photo(job))
+        search.assert_not_called()
+        identify.ocr_disc_photo.assert_not_called()
+        self.assertEqual((job.title, job.hasnicetitle), ("Toon-Time--Ultimate-Cartoon-Collection", False))
+        # a read too unsure to name the disc leaves OCR to try, as before
+        job = self._job(disc_photo_vision=json.dumps(dict(TOON_TIME, confidence=0.3)))
+        with mock.patch.object(identify.ui_utils, "tmdb_search", return_value={"Search": CARTOONS_D3}):
+            self.assertTrue(identify.identify_from_photo(job))
+        self.assertEqual(job.title, "Greatest-Cartoons-of-the-Golden-Era-Vol.-3")
 
     def test_without_a_barcode_the_first_result_is_taken(self):
         job = self._job()

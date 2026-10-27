@@ -9,7 +9,9 @@ from the same photo in a few seconds. This module is the client: it sends the JP
 
 Everything here is defensive. The model may answer with half the keys, with prose, or not at
 all; the server may be down or slow. :func:`read_disc_photo` returns None on any failure and
-never raises, so the ripper can call it without guarding every step.
+never raises, so the ripper can call it without guarding every step. A request that fails (no
+connection, a timeout, an HTTP error such as 404 for a model that is not pulled) ends the read
+at once: only an answer the model gave but was unsure of is worth asking again rotated.
 """
 import base64
 import io
@@ -21,6 +23,9 @@ import requests
 
 DEFAULT_MODEL = "qwen2.5vl:7b"
 DEFAULT_TIMEOUT = 120
+#: seconds to wait for the connection to the server: an unreachable host should fail fast, not
+#: after DISC_PHOTO_VISION_TIMEOUT, which is how long the model may take to answer
+CONNECT_TIMEOUT = 5
 #: a lower confidence than this, or a one-word title, makes us try the photo rotated
 RETRY_CONFIDENCE = 0.9
 #: labels are often printed sideways in the tray: try these rotations (degrees, counter-clockwise)
@@ -100,13 +105,18 @@ def _clean_year(value) -> Optional[str]:
 
 
 def _clean_confidence(value) -> float:
+    percent = isinstance(value, str) and value.strip().endswith("%")
+    if percent:  # "95%"
+        value = value.strip()[:-1]
     try:
         confidence = float(value)
     except (TypeError, ValueError):
         return 0.0
     if confidence != confidence:  # NaN
         return 0.0
-    if confidence > 1:  # "95" rather than 0.95
+    if percent:
+        confidence = confidence / 100
+    elif confidence > 1:  # "95" rather than 0.95
         confidence = confidence / 100 if confidence <= 100 else 1.0
     return max(0.0, min(1.0, confidence))
 
@@ -141,31 +151,49 @@ def parse_answer(text) -> Optional[dict]:
     return answer
 
 
+class RequestFailed(Exception):
+    """The request to the vision model failed: the server never gave the model's answer."""
+
+
+def _ask(image: bytes, url: str, model: str, timeout: int) -> Optional[dict]:
+    """
+    Send one JPEG to the model.
+
+    :return: the parsed answer (see :func:`parse_answer`), or None when the model answered with
+             nothing usable (prose, no title)
+    :raises RequestFailed: no connection, a timeout, an HTTP error or an envelope that is not
+                           Ollama's JSON object: asking again will not help
+    """
+    body = {"model": model, "prompt": PROMPT, "images": [base64.b64encode(image).decode()],
+            "stream": False, "format": "json", "options": {"temperature": 0}}
+    try:
+        response = requests.post(generate_url(url), json=body, timeout=(CONNECT_TIMEOUT, timeout))
+    except requests.RequestException as error:
+        raise RequestFailed(f"request to {url} failed: {error}") from error
+    if response.status_code != 200:
+        raise RequestFailed(f"{url} returned HTTP {response.status_code}: {response.text[:200]!r}")
+    try:
+        payload = response.json()
+    except ValueError as error:
+        raise RequestFailed(f"{url} returned something that is not JSON") from error
+    if not isinstance(payload, dict):
+        raise RequestFailed(f"{url} returned JSON that is not an object: {str(payload)[:200]!r}")
+    duration = payload.get("total_duration")
+    took = f"{duration / 1e9:.1f}s" if isinstance(duration, (int, float)) and not isinstance(duration, bool) else "?"
+    logging.debug(f"Vision model took {took} ({payload.get('eval_count')} tokens)")
+    return parse_answer(payload.get("response"))
+
+
 def ask_model(image: bytes, url: str, model: str = DEFAULT_MODEL, timeout: int = DEFAULT_TIMEOUT) -> Optional[dict]:
     """
     Send one JPEG to the model and return its parsed answer (see :func:`parse_answer`), or None
     on any HTTP, timeout or parsing failure.
     """
-    body = {"model": model, "prompt": PROMPT, "images": [base64.b64encode(image).decode()],
-            "stream": False, "format": "json", "options": {"temperature": 0}}
     try:
-        response = requests.post(generate_url(url), json=body, timeout=timeout)
-    except requests.RequestException as error:
-        logging.warning(f"Vision model request to {url} failed: {error}")
+        return _ask(image, url, model, timeout)
+    except RequestFailed as error:
+        logging.warning(f"Vision model {error}")
         return None
-    if response.status_code != 200:
-        logging.warning(f"Vision model at {url} returned HTTP {response.status_code}: {response.text[:200]!r}")
-        return None
-    try:
-        payload = response.json()
-    except ValueError:
-        logging.warning(f"Vision model at {url} returned something that is not JSON")
-        return None
-    if not isinstance(payload, dict):
-        return None
-    logging.debug(f"Vision model took {payload.get('total_duration', 0) / 1e9:.1f}s "
-                  f"({payload.get('eval_count')} tokens)")
-    return parse_answer(payload.get("response"))
 
 
 def needs_retry(answer: Optional[dict]) -> bool:
@@ -182,7 +210,10 @@ def read_disc_photo(photo_path, url: str, model: str = DEFAULT_MODEL,
 
     The photo is sent as it is first. Labels are often printed sideways in the tray, so when the
     answer is doubtful (see :func:`needs_retry`) it is sent again rotated 90 and 270 degrees and
-    the answer with the highest confidence wins; a confident answer stops the retries early.
+    the answer with the highest confidence wins; a confident answer stops the retries early. A
+    failed request (see :class:`RequestFailed`) stops them too: a server that is down, too slow or
+    without the model will not do better with the photo turned, and each retry would hold up the
+    ripper for up to ``timeout`` seconds more.
 
     :return: the best answer (see :func:`parse_answer`) with a ``rotation`` key (degrees), or
              None when the photo cannot be read or the model never answered usefully
@@ -206,7 +237,11 @@ def _read_rotations(image: bytes, url: str, model: str, timeout: int) -> Optiona
         rotated = image if degrees == 0 else rotate_jpeg(image, degrees)
         if rotated is None:
             continue
-        answer = ask_model(rotated, url, model, timeout)
+        try:
+            answer = _ask(rotated, url, model, timeout)
+        except RequestFailed as error:
+            logging.warning(f"Vision model {error}; not trying the photo rotated")
+            break
         if answer:
             answer["rotation"] = degrees
             answers.append(answer)
