@@ -21,8 +21,9 @@ for you to rename by hand, at lower priority and with a bandwidth cap.
    further films count too (see **Double features** below).
 2. Ships every eligible folder in `movies/`, then `tv/`, with
    `rsync -a -s --partial-dir=.rsync-partial --remove-source-files`.  First,
-   though, two rsync dry runs ask the media box whether the destination folder
-   already holds a file the transfer would replace (see **Never overwriting**
+   though, rsync dry runs ask the media box whether the destination folder
+   already holds a file the transfer would replace: a quick probe, then two
+   checksum probes when a name is already there (see **Never overwriting**
    below); if it does, the folder ships as `Title (Year) - <disc label>`
    beside the original instead.  The name is kept in the spool until the
    folder has shipped, so an interrupted transfer finishes in the same folder.
@@ -297,14 +298,18 @@ The media box can confine that key to receiving rsync transfers with an
 `arm-shipper-rsync`, that accepts `rsync --server` plus one cluster of short
 flags and refuses everything else, including `rsync --sender`): the shipper
 only ever pushes and never lists the media box.  The collision check before
-each folder is two `rsync --dry-run` pushes with the same ssh, `-s` and extra
-arguments as the transfer, so a forced command that accepts the transfer's
-command line accepts them too: on the remote side they differ from the
-transfer only by two letters in the short-flag cluster, `n` (`--dry-run`) and
-`c` (`--checksum`).  With rsync 3.x and `-s` the transfer arrives as
-`rsync --server -slogDtpre.iLsfxCIvu` and each probe as
-`rsync --server -snlogDtprce.iLsfxCIvu`; `--ignore-existing`, `--timeout` and
-the paths travel inside the protocol.  Stock `rrsync -wo` does **not** work here:
+each folder is a quick probe, then two checksum probes when a name is already
+there (see **Never overwriting**), all `rsync --dry-run` pushes with the same
+ssh, `-s` and extra arguments as the transfer, so a forced command that
+accepts the transfer's command line accepts them too: on the remote side they
+differ from the transfer only in the short-flag cluster, the quick probe by
+`n` (`--dry-run`) alone and each checksum probe by `n` and `c`
+(`--checksum`).  With rsync 3.x and `-s` the transfer arrives as
+`rsync --server -slogDtpre.iLsfxCIvu`, the quick probe as
+`rsync --server -snlogDtpre.iLsfxCIvu` and each checksum probe as
+`rsync --server -snlogDtprce.iLsfxCIvu`; `arm-shipper-rsync`'s
+`^rsync --server -[A-Za-z0-9.]+$` accepts all three.  `--ignore-existing`,
+`--timeout` and the paths travel inside the protocol.  Stock `rrsync -wo` does **not** work here:
 it refuses `-s`, which the shipper relies on to keep paths with spaces and
 parentheses off the remote command line.
 
@@ -313,7 +318,8 @@ parentheses off the remote command line.
 When ARM runs on the box that holds the library (the t620 rips too), leave
 `remote_host` empty and point the three destination paths at the library and
 staging folders on the same box.  rsync then copies locally, with no ssh and
-no key, under every rule above: only finished jobs, the two collision probes,
+no key, under every rule above: only finished jobs, the collision check (a
+quick probe, then two checksum probes when a name is already there),
 `--partial-dir`, the source removed file by file once copied.  It is a copy,
 not a rename, even on one ZFS pool when `completed` and the library are
 different datasets, so a 70 GB feature takes minutes rather than seconds, and

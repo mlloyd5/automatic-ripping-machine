@@ -31,13 +31,14 @@ Safety rules:
   feature ``<Title (Year)>.mkv``, so a second disc of a title the pool holds
   (the Blu-ray after the UHD, a re-rip) would otherwise replace the feature
   Plex serves, and ``--remove-source-files`` would then delete the only other
-  copy.  Before a folder moves, two rsync dry runs find out which of its files
+  copy.  Before a folder moves, rsync dry runs (a quick probe, then two
+  checksum probes when a name is already there) find out which of its files
   the transfer would replace; if any, the folder ships as
   ``<Title (Year)> - <disc label>`` (or ``- job<id>``) beside the original,
   and if that collides too it stays on the ripper and the run exits 1.  The
   dry runs need no listing rights: a write-only destination key allows them.
-  They compare checksums, so a different file that merely has the same size
-  and time is a collision too, never mistaken for a resumed one.
+  The checksum probes compare contents, so a different file that merely has
+  the same size and time is a collision too, never mistaken for a resumed one.
 * The destination name is decided once, before the transfer starts, and kept
   in ``catalog_spool_path`` as ``job<id>.destination`` until the folder has
   shipped, so a run that is interrupted part-way finishes in the same folder
@@ -611,7 +612,8 @@ def colliding_files(cfg, sub_folder, local_folder, remote_name):
     """
     Files in the job folder that the real transfer into ``remote_name`` would replace on the media box.
 
-    Two dry runs: without ``--ignore-existing`` rsync lists every file it would
+    A quick probe, then two checksum dry runs when a name is already there (see
+    below).  The checksum pair: without ``--ignore-existing`` rsync lists every file it would
     send (new ones and existing ones that differ); with it, only the files the
     destination lacks.  The difference is exactly what would be overwritten.
     Both probes run with ``--checksum``: rsync's usual quick check (size and
@@ -680,7 +682,7 @@ def bonus_remote_name(local_folder, job):
     return match.group("target")
 
 
-def arm_folder_name(local_folder, job=None):
+def arm_folder_name(local_folder, job=None, sub_folder=None):
     """
     The name the media box should know a job folder by: its own, less a suffix that only avoided a local clash.
 
@@ -690,20 +692,26 @@ def arm_folder_name(local_folder, job=None):
     or a job folder whose name an earlier job of the same disc took (a failed
     rip leaves its empty folder behind).  It ships as the plain
     ``<Title (Year)>``, the name ARM gave the main feature inside it.
+
+    An unidentified folder (``sub_folder`` :data:`UNIDENTIFIED`) always keeps
+    its own name: ARM names it after the disc label and stores the label as
+    the job's title too, so a second ``DVD_VIDEO`` disc's ``DVD_VIDEO_<stage>``
+    is a different disc, not a re-rip of the first.
     """
     folder = os.path.basename(local_folder.rstrip(os.sep))
-    for plain in job_folder_titles(job):
+    for plain in job_folder_titles(job, sub_folder):
         if folder.startswith(plain + "_") and folder[len(plain) + 1:].isdigit():
             return plain
     return folder
 
 
-def job_folder_titles(job):
+def job_folder_titles(job, sub_folder=None):
     """
     The plain folder names ARM may have filed a job folder under: ARM's ``fix_job_title`` for the manual
     title and the identified one, or :func:`film_folder_name` for a double feature's further film.
+    None for an unidentified folder, whose "title" is only the disc label (see :func:`arm_folder_name`).
     """
-    if not job:
+    if not job or sub_folder == UNIDENTIFIED:
         return []
     if job.get("film"):
         return [film_folder_name(job)] if _clean(job.get("title")) else []
@@ -733,7 +741,7 @@ def remote_folder_names(local_folder, job, sub_folder=None):
     target = bonus_remote_name(local_folder, job)
     if target:
         return [target]
-    folder = arm_folder_name(local_folder, job)
+    folder = arm_folder_name(local_folder, job, sub_folder)
     names = [folder]
     label = _clean(job.get("label")) if job and sub_folder != UNIDENTIFIED else None
     if label:
@@ -909,7 +917,7 @@ def resolve_remote_name(cfg, sub_folder, local_folder, job, dry_run=False, stats
     if remote_name is None or dry_run or job is None:
         return remote_name
     if not save_destination_state(cfg, job, source, remote_name):
-        if remote_name != (bonus_remote_name(local_folder, job) or arm_folder_name(local_folder, job)):
+        if remote_name != (bonus_remote_name(local_folder, job) or arm_folder_name(local_folder, job, sub_folder)):
             log.error("not shipping %s as %s without a record of that name; leaving it for the next run",
                       local_folder, remote_name)
             return None
@@ -970,7 +978,7 @@ def ship_folder(cfg, sub_folder, local_folder, dry_run=False, verbose=False, job
     if remote_name is None:
         return False
     target = bonus_remote_name(local_folder, job)
-    renamed = remote_name != (target or arm_folder_name(local_folder, job))
+    renamed = remote_name != (target or arm_folder_name(local_folder, job, sub_folder))
     if renamed:
         log.warning("shipping %s as %s instead", local_folder, remote_name)
     elif target:
@@ -1152,11 +1160,11 @@ def catalog_record(cfg, sub_folder, local_folder, job, remote_name=None):
         log.warning("no media file in %s; no catalog record written", local_folder)
         return None
     folder = os.path.basename(local_folder.rstrip(os.sep))
-    remote_name = remote_name or arm_folder_name(local_folder, job)
+    remote_name = remote_name or arm_folder_name(local_folder, job, sub_folder)
     library = library_path(sub_folder, remote_name)
     # ARM names the main feature after its own folder, whatever the destination is called, and after
     # the plain name in a folder that carries a _<stage> suffix.
-    feature = arm_folder_name(local_folder, job)
+    feature = arm_folder_name(local_folder, job, sub_folder)
     rows = []
     for relative in files:
         row = mkvheader.probe_row(os.path.join(local_folder, relative))
@@ -1373,7 +1381,7 @@ def prepare_record(cfg, sub_folder, local_folder, job, remote_name=None, dry_run
     existing = pending_record_path(cfg, job, library_path(sub_folder, local_folder))
     if existing:
         log.info("reusing catalog record %s from an earlier, unfinished transfer", existing)
-        remote_name = remote_name or arm_folder_name(local_folder, job)
+        remote_name = remote_name or arm_folder_name(local_folder, job, sub_folder)
         if read_record_key(existing, "library") != library_path(sub_folder, remote_name):
             if dry_run:
                 log.info("dry run: would point catalog record %s at %s", existing, remote_name)

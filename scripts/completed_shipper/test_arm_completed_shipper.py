@@ -247,6 +247,31 @@ class ShipperEndToEnd(ShipperFixture):
         self.assertEqual(hooks[:2], ["movies Movie A (2001)", "tv Show A (2010)"])
         self.assertCountEqual(hooks[2:], ["unidentified UNKNOWN_DISC", "unidentified UNKNOWN_2"])
 
+    def test_excluded_files_still_get_the_checksum_probes(self):
+        # With an --exclude the quick probe cannot list every file in the folder, so the names do not compare
+        # and the two --checksum probes run as the safety net, even though the destination is empty.
+        with open(self.conf, "a") as handle:
+            handle.write("rsync_extra_args = --exclude=extras/*\n")
+        # The excluded trailer never leaves, so the folder is not empty afterwards and the run exits 1.
+        self.assertEqual(self._run(), 1)
+        probes = [c for c in self._calls() if "--dry-run" in c and "Movie A (2001)" in c]
+        self.assertEqual(len(probes), 3)
+        self.assertNotIn("--checksum", probes[0])
+        self.assertIn("--ignore-existing", probes[0])
+        for probe in probes[1:]:
+            self.assertIn("--checksum", probe)
+            self.assertIn("--exclude=extras/*", probe)
+        self.assertNotIn("--ignore-existing", probes[1])
+        self.assertIn("--ignore-existing", probes[2])
+        # The folder still ships, under its own name, less the excluded extras, which stay on the ripper.
+        movie_a = self._shipped("Movies", "Movie A (2001)")
+        self.assertTrue(os.path.isfile(os.path.join(movie_a, "Movie A (2001).mkv")))
+        self.assertFalse(os.path.exists(os.path.join(movie_a, "extras", "trailer.mkv")))
+        self.assertEqual(len([c for c in self._transfers() if "Movie A (2001)" in c]), 1)
+        local = self._local("movies", "Movie A (2001)")
+        self.assertFalse(os.path.exists(os.path.join(local, "Movie A (2001).mkv")))
+        self.assertTrue(os.path.isfile(os.path.join(local, "extras", "trailer.mkv")))
+
     def test_second_run_is_a_noop(self):
         self.assertEqual(self._run(), 0)
         os.remove(self.log)
@@ -486,11 +511,18 @@ class CollisionProbe(unittest.TestCase):
 
     def test_unidentified_and_label_named_folders_skip_the_label(self):
         # ARM names an unidentified folder after the disc label: "DVD_VIDEO - DVD_VIDEO" would say nothing.
-        job = {"job_id": 5, "label": "DVD_VIDEO"}
+        # It stores the label as the job's title too (identify.py), as here.
+        job = {"job_id": 5, "title": "DVD_VIDEO", "year": None, "label": "DVD_VIDEO"}
         self.assertEqual(shipper.remote_folder_names("/c/unidentified/DVD_VIDEO", job, "unidentified"),
                          ["DVD_VIDEO", "DVD_VIDEO - job5"])
         self.assertEqual(shipper.remote_folder_names("/c/unidentified/DVD_VIDEO_1", job, "unidentified"),
                          ["DVD_VIDEO_1", "DVD_VIDEO_1 - job5"])
+        # A second disc with the same label, filed as DVD_VIDEO_<stage> (or _<random_time> for a data disc),
+        # is another disc, not a re-rip: it keeps its own folder rather than merging into the first one's.
+        self.assertEqual(shipper.remote_folder_names("/c/unidentified/DVD_VIDEO_179306308839", job, "unidentified"),
+                         ["DVD_VIDEO_179306308839", "DVD_VIDEO_179306308839 - job5"])
+        self.assertEqual(shipper.arm_folder_name("/c/unidentified/DVD_VIDEO_179306308839", job, "unidentified"),
+                         "DVD_VIDEO_179306308839")
         self.assertEqual(shipper.remote_folder_names("/c/movies/DVD_VIDEO", job, "movies"),
                          ["DVD_VIDEO", "DVD_VIDEO - job5"])
         self.assertEqual(shipper.remote_folder_names("/c/movies/X", job, "movies"),
