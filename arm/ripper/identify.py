@@ -124,6 +124,8 @@ def identify(job):
             else:
                 job.hasnicetitle = False
                 db.session.commit()
+            if not job.hasnicetitle:
+                title_from_barcode_product(job)
 
             logging.info(f"Disc title Post ident -  title:{job.title} "
                          f"year:{job.year} video_type:{job.video_type} "
@@ -291,7 +293,9 @@ def identify_dvd(job, title_known=False):
         logging.info(f"Title already identified from the case barcode: {job.title} ({job.year})")
     else:
         try:
-            dvd_info_xml = metadata_selector(job, dvd_title, year)
+            dvd_info_xml, refused = search_and_update(job, dvd_title, year)
+            if refused and year:
+                dvd_info_xml = None  # the exact title may be filed under another year, or none
             logging.debug(f"DVD_INFO_XML: {dvd_info_xml}")
             identify_loop(job, dvd_info_xml, dvd_title, year)
         except Exception:
@@ -416,14 +420,25 @@ def update_job(job, search_results, title=None, year=None):
     used to update a successfully found job
     :param job: job obj
     :param search_results: json returned from metadata provider
-    :param title: the title that was searched for, to prefer an exact match (see best_search_result)
+    :param title: the title that was searched for, to prefer an exact match (see best_search_result);
+                  when the job carries a product title from its case barcode only an exact match counts
     :param year: the year that was searched for
-    :return: None if error
+    :return: None if error or nothing acceptable
     """
     # logging.debug(f"s =======  {search_results}")
     if 'Search' not in search_results or not search_results['Search']:
         return None
-    best = best_search_result(search_results['Search'], title, year)
+    # Once the case barcode has named the product, a label search is only a guess at the real
+    # title: a page of near misses ("Cartoons D3" finds only "Greatest Cartoons of the Golden
+    # Era Vol. 3") must not outrank the product title (see title_from_barcode_product). Only a
+    # product title that can name the disc counts: one that is all packaging ("DVD") leaves the
+    # label search guessing as before, since nothing would take the guess's place.
+    product, _ = barcode_product_title(job)
+    best = best_search_result(search_results['Search'], title, year, exact_only=bool(product))
+    if best is None:
+        logging.info(f"Search for '{title}' found nothing titled exactly that; the case barcode says the disc "
+                     f"is '{product}', so '{search_results['Search'][0]['Title']}' is not taken")
+        return None
     if best is not search_results['Search'][0]:
         logging.info(f"Search for '{title}' returned '{search_results['Search'][0]['Title']}' first; "
                      f"taking the exact match '{best['Title']}' ({best['Year']})")
@@ -467,6 +482,19 @@ def metadata_selector(job, title=None, year=None):
 
     :return: json/dict object or None
     """
+    return search_and_update(job, title, year)[0]
+
+
+def search_and_update(job, title=None, year=None, cache=None):
+    """
+    :func:`metadata_selector`, also saying whether update_job refused every result the provider
+    returned (only an exact match counts once a case barcode has named the product, see
+    update_job). A refused response is an answer, but not one the job took.
+
+    :param cache: a dict shared by the searches of one :func:`search_with_year_retries` chain, so
+                  the yearless search below and the chain's own yearless attempt ask the provider once
+    :return: ``(search results or None, refused)``
+    """
     # A disc whose label could not be read is given the placeholder
     # "not identified" in identify_dvd(). Searching for that string finds real
     # films with unhelpful names -- TMDB matches a 2018 Brazilian film titled
@@ -476,14 +504,23 @@ def metadata_selector(job, title=None, year=None):
     # placeholder. Refuse the search here instead, where every caller passes.
     if title is None or str(title).strip().lower() in ("", "not identified"):
         logging.info(f"Not searching for placeholder title: {title!r}")
-        return None
+        return None, False
     provider = cfg.arm_config['METADATA_PROVIDER'].lower()
     if provider not in ("tmdb", "omdb"):
         logging.debug(cfg.arm_config['METADATA_PROVIDER'])
         logging.debug("unknown provider - doing nothing, saying nothing. Getting Kryten")
-        return None
+        return None, False
     logging.debug(f"provider {provider}")
-    search_results = provider_search(provider, title, year)
+
+    def search(search_year):
+        if cache is None:
+            return provider_search(provider, title, search_year)
+        key = (str(title), str(search_year) if search_year else None)
+        if key not in cache:
+            cache[key] = provider_search(provider, title, search_year)
+        return cache[key]
+
+    search_results = search(year)
     # The year can be wrong. A Blu-ray's comes from the date of its bdmt_eng.xml, which is when
     # that release was authored: 2016 for a pressing of RED 2 (2013), and TMDB filtered to 2016
     # has no RED 2, so its first result "High & Low The Red Rain" was taken. When the year
@@ -493,14 +530,15 @@ def metadata_selector(job, title=None, year=None):
     # where the yearless search would take the 1939 "Stagecoach". An empty year search is left
     # to identify_loop, which tries the year before next.
     if year and has_results(search_results) and not has_title_starting_with(search_results, title):
-        without_year = provider_search(provider, title, None)
+        without_year = search(None)
         if has_exact_match(without_year, title):
             logging.info(f"Search for '{title}' in {year} has no exact title match; "
                          "searching without the year found one")
             search_results, year = without_year, None
+    applied = None
     if search_results is not None:
-        update_job(job, search_results, title, year)
-    return search_results
+        applied = update_job(job, search_results, title, year)
+    return search_results, applied is None and has_results(search_results)
 
 
 def provider_search(provider, title, year):
@@ -547,10 +585,8 @@ def identify_loop(job, response, title, year):
     # this is a little kludgy, but it kind of works...
     logging.debug(f"Response = {response}")
     if response is None:
-        # try with year first
-        response = try_with_year(job, response, title, year)
-        # try submitting without the year
-        response = try_without_year(job, response, title)
+        # with the year, the year before, then without a year
+        response = search_with_year_retries(job, title, year)
 
         if response is None:
             while response is None and title.find("-") > 0:
@@ -571,43 +607,39 @@ def identify_loop(job, response, title, year):
                     response = metadata_selector(job, title)
 
 
-def try_without_year(job, response, title):
+def search_with_year_retries(job, title, year=None):
     """
+    Search a title with the year, the year before it (a disc often comes out the year after the
+    film), then without a year, stopping at the first attempt the provider answers. An answer
+    whose every result update_job refused (exact matches only once a case barcode has named the
+    product) does not stop the retries: the exact title may only turn up under another year, or
+    none (a Blu-ray's metadata file gives its own date, not the film's). Two exceptions keep
+    metadata_selector's year rule: a refused year search with a title that starts with the query
+    ends the chain (the year is right and the label is the start of a longer title, so a yearless
+    exact match would be another film: "Stagecoach" 1939 for the 2016 Texas Jack Story), and no
+    search is sent twice (metadata_selector's own yearless search is the chain's last attempt).
 
-    :param job:
-    :param response:
-    :param title:
-    :return:
+    :return: the response that was taken, else the last refused one, else None (no attempt got
+             an answer, so callers may shorten the title and try again)
     """
-    if response is None:
-        logging.debug("Removing year...")
-        response = metadata_selector(job, title)
+    attempts = [str(year), str(int(year) - 1)] if year and str(year).isdigit() else []
+    attempts.append(None)
+    cache = {}
+    refused_response = None
+    for attempt in attempts:
+        logging.debug(f"Trying title: {title} year: {attempt}")
+        response, refused = search_and_update(job, title, attempt, cache)
         logging.debug(f"response: {response}")
-    return response
-
-
-def try_with_year(job, response, title, year):
-    """
-
-    :param job:
-    :param response:
-    :param title:
-    :param year:
-    :return:
-    """
-    # If we have a response don't overwrite it
-    if response is not None:
-        return response
-    if year:
-        response = metadata_selector(job, title, str(year))
-        logging.debug(f"response: {response}")
-    # If we still don't have a response try removing a year off
-    if response is None and year:
-        # This accounts for when
-        # the dvd release date is the year following the movie release date
-        logging.debug("Subtracting 1 year...")
-        response = metadata_selector(job, title, str(int(year) - 1))
-    return response
+        if response is None:
+            continue
+        if not refused:
+            return response
+        refused_response = response
+        if attempt and has_title_starting_with(response, title):
+            logging.info(f"Search for '{title}' in {attempt} found titles that start with it but none exactly "
+                         "it; not searching other years")
+            break
+    return refused_response
 
 
 def repair_bluray_xml(xml_data):
@@ -690,7 +722,10 @@ def identify_from_photo(job):
     Only runs for video discs that the normal identification could not match
     (``hasnicetitle`` is False), when DISC_PHOTO_OCR is enabled and the job has a photo.
     The raw OCR text is kept on the job so the UI can show it on the title fix page even
-    when no online match is found.
+    when no online match is found. Once the case barcode has named the product the OCR
+    candidates are held to the same rule as the label search (see update_job): only a result
+    titled exactly like a candidate is taken, so a misread photo cannot replace the product
+    title the disc was named after.
 
     :return: True when a title was found from the photo
     """
@@ -713,15 +748,16 @@ def identify_from_photo(job):
 
     for candidate in candidates:
         try:
-            response = try_with_year(job, None, candidate, year)
-            response = try_without_year(job, response, candidate)
+            response = search_with_year_retries(job, candidate, year)
         except ui_metadata.MetadataUnavailable as error:
             logging.info(f"Metadata provider unreachable, not trying the other OCR candidates: {error}")
             return False
         except Exception as error:
             logging.debug(f"Metadata lookup for OCR candidate '{candidate}' failed: {error}")
             response = None
-        if response and 'Search' in response:
+        # A response is not a match: update_job may have refused every result (a barcode named
+        # the product and none is exactly the candidate), so only the job itself can say.
+        if response and job.hasnicetitle:
             logging.info(f"Identified disc from photo as '{job.title}' ({job.year}) via '{candidate}'")
             return True
     logging.info("OCR text did not match any title online")
@@ -997,6 +1033,62 @@ def _identify_video_from_barcode(job):
     logging.info("No title online is exactly the barcode's product title; "
                  "leaving the disc to its CRC64 record and label")
     return False
+
+
+def barcode_product_title(job):
+    """
+    The title and year the case barcode's product title gives a video disc, cleaned of packaging
+    words (``disc_photo.clean_upc_title``).
+
+    :return: ``(title, year)``; ``(None, None)`` when the job has no product title or it is all
+             packaging ("DVD", "Blu-ray Disc")
+    """
+    raw = getattr(job, 'disc_barcode_title', None)
+    if not raw:
+        return None, None
+    return disc_photo.clean_upc_title(raw)
+
+
+def _label_titles(job):
+    """
+    Every title the disc's own identification makes from its label when it finds nothing better:
+    identify_dvd's failsafe keeps the label, identify_bluray without a bdmt_eng.xml title-cases it
+    ("Cartoons D3") and with an unreadable one runs it through the filename cleaner.
+    """
+    label = str(job.label)
+    ascii_label = unicodedata.normalize('NFKD', label).encode('ascii', 'ignore').decode()
+    return {label, label.replace('_', ' ').title(), utils.clean_for_filename(ascii_label)}
+
+
+def title_from_barcode_product(job):
+    """
+    Name a disc nothing online matched after its case barcode's product title.
+
+    Runs last in :func:`identify` for video discs still without a nice title. A disc whose
+    barcode resolved to a product (``disc_barcode_title``) but whose title no provider has, and
+    whose label found nothing exact either, would otherwise be filed under its label
+    (``CARTOONS_D3``, or ``Cartoons D3`` for a Blu-ray); the product title ("59 Cartoon
+    Classics") is the better name for the unidentified folder and the title fix page. A title
+    the disc itself supplied (a Blu-ray's bdmt_eng.xml) is kept. The year goes with the title:
+    the product's, or none, never the date of a Blu-ray's metadata file. ``hasnicetitle`` stays
+    False: this is a name, not an identification.
+
+    :return: True when the title was set from the product title
+    """
+    if job.hasnicetitle or not getattr(job, 'disc_barcode_title', None):
+        return False
+    if job.title not in (None, "", "not identified") and str(job.title) not in _label_titles(job):
+        return False
+    title, year = barcode_product_title(job)
+    if not title:
+        return False
+    title = utils.clean_for_filename(title)
+    year = year or ""
+    args = {'title': title, 'title_auto': title, 'year': year, 'year_auto': year}
+    logging.info(f"Nothing online matched the disc; naming it after its case barcode's product title: "
+                 f"'{title}' ({year or 'no year'})")
+    utils.database_updater(args, job)
+    return True
 
 
 def _identify_music_from_barcode(job):
