@@ -199,7 +199,7 @@ class TestMetadataSelectorYear(unittest.TestCase):
         pages = {"2017": STAGECOACH_IN_2017, None: STAGECOACH_ANY_YEAR}
         job = _job(title="Stagecoach", year="2018", disc_barcode_title="Trace Adkins Stagecoach (Blu-ray)")
 
-        def search(query, search_year=None):
+        def search(query, search_year=None, **_options):
             return {"Search": pages[search_year]} if pages.get(search_year) else None
 
         with mock.patch.object(identify.ui_utils, "tmdb_search", side_effect=search) as tmdb, \
@@ -376,7 +376,7 @@ class TestIdentifyEndToEnd(unittest.TestCase):
             mock.patch.object(identify.urllib.request, "urlopen", return_value=crc_miss),
             mock.patch.object(identify, "arm_subprocess", return_value=None),
             mock.patch.object(identify.ui_utils, "tmdb_search",
-                              side_effect=lambda title, year=None: self.searched.append((title, year))
+                              side_effect=lambda title, year=None, **_options: self.searched.append((title, year))
                               or {"Search": CARTOONS_D3}),
         ]
         for patch in self.patches:
@@ -445,7 +445,7 @@ class TestIdentifyEndToEnd(unittest.TestCase):
 
     def test_bluray_metadata_title_found_without_the_files_year(self):
         """The year search finds only near misses, the exact title turns up without a year: it is taken."""
-        def tmdb(title, year=None):
+        def tmdb(title, year=None, **_options):
             self.searched.append((title, year))
             if title == "Cartoon-Classics-Collection" and year is None:
                 return {"Search": CARTOONS_D3 + [_result("Cartoon Classics Collection", "1998", 12)]}
@@ -524,7 +524,7 @@ class TestIdentifyFromPhoto(unittest.TestCase):
     def _ocr_with_year_hint(self, pages):
         searched = []
 
-        def tmdb(title, year=None):
+        def tmdb(title, year=None, **_options):
             searched.append((title, year))
             return {"Search": pages[year]} if pages.get(year) else None  # tmdb_search's "nothing found"
 
