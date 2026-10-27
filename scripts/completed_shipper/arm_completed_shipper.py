@@ -709,7 +709,7 @@ def job_folder_titles(job, sub_folder=None):
     """
     The plain folder names ARM may have filed a job folder under: ARM's ``fix_job_title`` for the manual
     title and the identified one, or :func:`film_folder_name` for a double feature's further film.
-    None for an unidentified folder, whose "title" is only the disc label (see :func:`arm_folder_name`).
+    An empty list for an unidentified folder, whose "title" is only the disc label (see :func:`arm_folder_name`).
     """
     if not job or sub_folder == UNIDENTIFIED:
         return []
