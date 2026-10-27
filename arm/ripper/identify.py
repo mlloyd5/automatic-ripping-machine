@@ -20,6 +20,9 @@ import arm.config.config as cfg
 from arm.models import Job, Film
 
 from arm.ripper import utils
+# The title helpers live in utils, which job_dupe_check needs them in and which this module imports
+from arm.ripper.utils import (_fold_accents, _title_words, _normalise_title,  # noqa: F401
+                              GENERIC_DISC_LABELS, is_placeholder_title)
 from arm.ripper import disc_photo
 from arm.ripper import disc_vision
 from arm.ripper.ProcessHandler import arm_subprocess
@@ -376,41 +379,6 @@ def get_video_details(job):
         identify_loop(job, None, title, year)
     except Exception as error:
         logging.info(f"Identification failed with the error: {error}. Continuing...")
-
-
-def _fold_accents(text) -> str:
-    """The text with accents dropped from their letters: "Pokémon" is "Pokemon", as clean_upc_title folds it."""
-    text = unicodedata.normalize("NFKD", str(text or ""))
-    return "".join(ch for ch in text if not unicodedata.combining(ch))
-
-
-def _title_words(text) -> list:
-    """The lower case runs of letters and digits, accents folded: "Thomas & Friends: Best of James" is
-    thomas, friends, best, of, james."""
-    return re.findall(r"[a-z0-9]+", _fold_accents(text).lower())
-
-
-def _normalise_title(text) -> str:
-    """Lower case letters and digits only, so "Coal Miner's Daughter" and "COAL MINERS DAUGHTER" agree,
-    and accents folded, so "Pokémon: The First Movie" and "Pokemon The First Movie" do too."""
-    return "".join(_title_words(text))
-
-
-GENERIC_DISC_LABELS = {"notidentified", "dvdvideo", "dvd", "dvdrom", "videots", "dvdvolume", "bluray", "bdrom",
-                       "bdmv", "bd", "cdrom", "disc", "disk", "volume", "logicalvolumeid", "nolabel", "untitled"}
-"""Disc labels (compared as by _normalise_title) that name no film: authoring tool defaults and ARM's placeholder"""
-
-
-def is_placeholder_title(title) -> bool:
-    """
-    Whether a title names no film and must not be searched for: ARM's "not identified" placeholder or
-    a disc label left at an authoring tool's default ("DVD_VIDEO", "DISC1", "BDROM"). TMDB still finds
-    something for those: "Backstreet Boys: All Access DVD" for DVD_VIDEO, which became the title of a
-    Fools Rush In DVD on the t620.
-    """
-    text = _normalise_title(title)
-    return (not text or text in GENERIC_DISC_LABELS
-            or re.fullmatch(r"(disc|disk|dvd|volume|vol)\d{1,2}", text) is not None)
 
 
 def vote_count(result) -> int:

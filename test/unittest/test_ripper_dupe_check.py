@@ -118,6 +118,22 @@ class TestJobDupeCheck(unittest.TestCase):
         self.assertFalse(utils.job_dupe_check(job))
         self.assertEqual(job.title, "BDROM")
 
+    def test_generic_label_identified_bluray_matches_same_film(self):
+        """A BDROM Blu-ray that bdmt_eng.xml names RED (2010) is the RED disc ripped before: a duplicate."""
+        make_job(label="BDROM", disctype="bluray", crc_id=None, title="RED", year="2010")
+        job = new_disc(label="BDROM", disctype="bluray", crc_id=None, title="RED", year="2010", hasnicetitle=True,
+                       video_type="movie")
+        self.assertTrue(utils.job_dupe_check(job))
+        self.assertEqual((job.title, job.year), ("RED", "2010"))
+
+    def test_generic_label_identified_bluray_other_film_is_not_matched(self):
+        """A BDROM Blu-ray named as another film does not take RED's title and is not its duplicate."""
+        make_job(label="BDROM", disctype="bluray", crc_id=None, title="RED", year="2010")
+        job = new_disc(label="BDROM", disctype="bluray", crc_id=None, title="Inception", year="2010",
+                       hasnicetitle=True, video_type="movie")
+        self.assertFalse(utils.job_dupe_check(job))
+        self.assertEqual((job.title, job.year), ("Inception", "2010"))
+
     def test_real_label_matches_on_label_alone(self):
         """A label that names the film still matches a previous rip of another pressing."""
         make_job(label="BLAZING_SADDLES", crc_id="1111111111111111", title="Blazing Saddles", year="1974")
