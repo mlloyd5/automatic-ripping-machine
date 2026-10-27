@@ -68,7 +68,10 @@ def get_omdb_poster(title=None, year=None, imdb_id=None, plot="short"):
         str_url_2 = ""
     elif title:
         # urlencode so a title with "&", "#", "+" or "?" is one parameter rather than a cut-off query
-        params = {"y": year, "plot": plot, "r": "json", "apikey": omdb_api_key}
+        params = {"plot": plot, "r": "json", "apikey": omdb_api_key}
+        if year:
+            # left out when unknown; urlencode would otherwise send the literal string "y=None"
+            params["y"] = year
         str_url = "https://www.omdbapi.com/?" + urllib.parse.urlencode({"s": title, **params})
         str_url_2 = "https://www.omdbapi.com/?" + urllib.parse.urlencode({"t": title, **params})
     else:

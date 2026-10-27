@@ -80,6 +80,28 @@ class TestOmdbSearchUrls(unittest.TestCase):
         self.assertEqual(query["s"], [TITLE])
         self.assertEqual(query["y"], ["2004"])
 
+    def test_poster_search_without_a_year_sends_no_year(self):
+        """year=None used to reach OMDb as the literal parameter y=None"""
+        payload = {"Search": [{"Poster": "https://img/p.jpg", "imdbID": "tt0000001"}]}
+        with mock.patch.object(metadata.urllib.request, "urlopen",
+                               return_value=io.BytesIO(json.dumps(payload).encode())) as urlopen:
+            self.assertEqual(metadata.get_omdb_poster(TITLE, None), ("https://img/p.jpg", "tt0000001"))
+        query = parse_qs(urlsplit(urlopen.call_args.args[0]).query, keep_blank_values=True)
+        self.assertEqual(query["s"], [TITLE])
+        self.assertNotIn("y", query)
+
+    def test_title_fallback_without_a_year_sends_no_year(self):
+        no_search = {"Response": "False", "Error": "Movie not found!"}
+        found = {"Response": "True", "Poster": "https://img/t.jpg", "imdbID": "tt0000002"}
+        with mock.patch.object(metadata.urllib.request, "urlopen",
+                               side_effect=[io.BytesIO(json.dumps(no_search).encode()),
+                                            io.BytesIO(json.dumps(found).encode())]) as urlopen:
+            self.assertEqual(metadata.get_omdb_poster(TITLE, ""), ("https://img/t.jpg", "tt0000002"))
+        self.assertEqual(urlopen.call_count, 2)
+        query = parse_qs(urlsplit(urlopen.call_args_list[1].args[0]).query, keep_blank_values=True)
+        self.assertEqual(query["t"], [TITLE])
+        self.assertNotIn("y", query)
+
 
 if __name__ == "__main__":
     unittest.main()
