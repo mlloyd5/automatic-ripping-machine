@@ -146,6 +146,22 @@ class TestDoubleFeaturePage(unittest.TestCase):
         self.assertEqual([call.args for call in sel.call_args_list],
                          [("search", "Stuart Little", "2005"), ("search", "Stuart Little", "")])
 
+    def test_messages_escape_what_was_typed(self):
+        # base.html renders flashed messages with |safe, so a searched or posted value must be escaped first
+        script = "<script>alert(1)</script>"
+        escaped = "&lt;script&gt;alert(1)&lt;/script&gt;"
+        with mock.patch("arm.ui.utils.metadata_selector", return_value=None):
+            html = self.client.get("/doublefeature", query_string={"job_id": self.disc.job_id, "title": script}
+                                   ).data.decode()
+        self.assertIn(f"No films found for {escaped}", html)
+        self.assertNotIn(script, html)
+        html = self._post(dict(as_form(STUART), imdb_id=script))
+        self.assertIn(f"'{escaped}' is not an IMDb id", html)
+        self.assertNotIn(script, html)
+        html = self._post({"action": "remove", "film_id": script})
+        self.assertIn(f"Film {escaped} is not a film of job", html)
+        self.assertNotIn(script, html)
+
     def test_two_films_make_a_double_feature_named_after_the_first(self):
         html = self._post(as_form(STUART))
         self.assertIn("Added Stuart Little (1999) as film 1", html)

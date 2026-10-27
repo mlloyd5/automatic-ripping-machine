@@ -36,7 +36,8 @@ still used, because the rip is matched to the films only when it is filed.
 
 Each film's runtime is looked up from the metadata provider (TMDB or OMDb) when it is added. A film with
 no known runtime cannot be matched to a ripped title. The first film then falls back to the usual
-main-feature rule; a later film is not filed, and its title ends up with the extras.
+main-feature rule; a later film is not filed: its title ends up with the extras, or is left out when
+`MAINFEATURE` is on (see below).
 
 **Not a double feature** removes every film. The job keeps its current title.
 

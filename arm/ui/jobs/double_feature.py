@@ -10,6 +10,8 @@ a film's runtime is that film's main feature, the first film in the job folder, 
 """
 import re
 
+from markupsafe import escape
+
 import arm.config.config as cfg
 import arm.ui.utils as ui_utils
 from arm.ui import app, db
@@ -135,9 +137,9 @@ def add_film(job, form):
     if not title:
         return False, "Pick a film from the search results"
     if year and not year.isdigit():
-        return False, f"'{year}' is not a year"
+        return False, f"'{escape(year)}' is not a year"
     if imdb_id and not IMDB_ID_RE.match(imdb_id):
-        return False, f"'{imdb_id}' is not an IMDb id"
+        return False, f"'{escape(imdb_id)}' is not an IMDb id"
     if not poster.startswith(("http://", "https://")):
         poster = None
     films = films_of(job)
@@ -167,7 +169,7 @@ def remove_film(job, film_id):
     if (reason := check_editable(job)) is not None:
         return False, reason
     if (film := _film_of(job, film_id)) is None:
-        return False, f"Film {film_id} is not a film of job {job.job_id}"
+        return False, f"Film {escape(film_id)} is not a film of job {job.job_id}"
     name = film.folder_name
     db.session.delete(film)
     db.session.flush()
@@ -181,7 +183,7 @@ def move_film_up(job, film_id):
     if (reason := check_editable(job)) is not None:
         return False, reason
     if (film := _film_of(job, film_id)) is None:
-        return False, f"Film {film_id} is not a film of job {job.job_id}"
+        return False, f"Film {escape(film_id)} is not a film of job {job.job_id}"
     films = films_of(job)
     index = films.index(film)
     if index == 0:

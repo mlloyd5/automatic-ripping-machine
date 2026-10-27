@@ -20,6 +20,7 @@ import os
 from pathlib import Path
 from flask_login import LoginManager, login_required, current_user  # noqa: F401
 from flask import render_template, request, Blueprint, flash, redirect, url_for, send_file, abort
+from markupsafe import escape
 from werkzeug.routing import ValidationError
 
 import arm.ui.utils as ui_utils
@@ -202,7 +203,7 @@ def title_search():
     job = Job.query.get(job_id)
     form = TitleSearchForm(request.args)
     if form.validate():
-        flash(f'Search for {request.args.get("title")}, year={request.args.get("year")}', 'success')
+        flash(f'Search for {escape(request.args.get("title"))}, year={escape(request.args.get("year"))}', 'success')
         return redirect(url_for('route_jobs.list_titles', title=request.args.get("title"),
                                 year=request.args.get("year"), job_id=job_id))
     return render_template('titlesearch.html', title='Update Title', form=form, job=job,
@@ -292,7 +293,7 @@ def doublefeature():
     year = str(request.args.get('year') or '').strip()
     results = double_feature.search(query, year) if query else []
     if query and not results:
-        flash(f"No films found for {query}", "danger")
+        flash(f"No films found for {escape(query)}", "danger")
     return render_template('doublefeature.html', title='Double Feature', job=job,
                            films=double_feature.films_of(job), reason=double_feature.check_editable(job),
                            query=query or job.title or '', year=year, results=results,
@@ -420,12 +421,12 @@ def list_titles():
     if search_results is None or 'Error' in search_results or (
             'Search' in search_results and len(search_results['Search']) < 1):
         app.logger.debug("No results found. Trying without year")
-        flash(f"No search results found for {title} ({year})<br/> Trying without year", 'danger')
+        flash(f"No search results found for {escape(title)} ({escape(year)})<br/> Trying without year", 'danger')
         search_results = ui_utils.metadata_selector("search", title, "")
 
     if search_results is None or 'Error' in search_results or (
             'Search' in search_results and len(search_results['Search']) < 1):
-        flash(f"No search results found for {title}", 'danger')
+        flash(f"No search results found for {escape(title)}", 'danger')
     return render_template('list_titles.html', results=search_results, job_id=job_id,
                            form=form, title=title, year=year)
 
