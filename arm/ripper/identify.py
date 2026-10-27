@@ -13,6 +13,7 @@ import tempfile
 from ast import literal_eval
 
 import pydvdid
+import requests
 import xmltodict
 import xml.parsers.expat
 import arm.config.config as cfg
@@ -395,6 +396,31 @@ def _normalise_title(text) -> str:
     return "".join(_title_words(text))
 
 
+GENERIC_DISC_LABELS = {"notidentified", "dvdvideo", "dvd", "dvdrom", "videots", "dvdvolume", "bluray", "bdrom",
+                       "bdmv", "bd", "cdrom", "disc", "disk", "volume", "logicalvolumeid", "nolabel", "untitled"}
+"""Disc labels (compared as by _normalise_title) that name no film: authoring tool defaults and ARM's placeholder"""
+
+
+def is_placeholder_title(title) -> bool:
+    """
+    Whether a title names no film and must not be searched for: ARM's "not identified" placeholder or
+    a disc label left at an authoring tool's default ("DVD_VIDEO", "DISC1", "BDROM"). TMDB still finds
+    something for those: "Backstreet Boys: All Access DVD" for DVD_VIDEO, which became the title of a
+    Fools Rush In DVD on the t620.
+    """
+    text = _normalise_title(title)
+    return (not text or text in GENERIC_DISC_LABELS
+            or re.fullmatch(r"(disc|disk|dvd|volume|vol)\d{1,2}", text) is not None)
+
+
+def vote_count(result) -> int:
+    """A search result's TMDB vote count (0 for OMDB results, which have none)."""
+    try:
+        return int(result.get("vote_count") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 def best_search_result(results, title=None, year=None, exact_only=False):
     """
     Pick the result a title search most likely meant.
@@ -430,11 +456,7 @@ def best_search_result(results, title=None, year=None, exact_only=False):
 
 def _rank_search_result(result):
     """Vote count, then whether the result has a year at all: the order among equally good titles."""
-    try:
-        votes = int(result.get("vote_count") or 0)
-    except (TypeError, ValueError):
-        votes = 0
-    return votes, bool(str(result.get("Year") or "").strip())
+    return vote_count(result), bool(str(result.get("Year") or "").strip())
 
 
 def update_job(job, search_results, title=None, year=None):
@@ -529,8 +551,9 @@ def search_and_update(job, title=None, year=None, cache=None):
     # "Prefiro nao ser identificada" -- and update_job() then overwrites
     # job.title with it. The guard in get_video_details() cannot catch this,
     # because by the time it runs job.title is the bogus match rather than the
-    # placeholder. Refuse the search here instead, where every caller passes.
-    if title is None or str(title).strip().lower() in ("", "not identified"):
+    # placeholder. Refuse the search here instead, where every caller passes. The same goes for
+    # labels an authoring tool left at its default, like DVD_VIDEO (see is_placeholder_title).
+    if is_placeholder_title(title):
         logging.info(f"Not searching for placeholder title: {title!r}")
         return None, False
     provider = cfg.arm_config['METADATA_PROVIDER'].lower()
@@ -907,7 +930,7 @@ def _provider_search(title, year=None):
 
     :return: the provider's response in OMDB style (``Search`` list), or None
     """
-    if not title or str(title).strip().lower() in ("", "not identified"):
+    if is_placeholder_title(title):
         return None
     provider = str(cfg.arm_config.get('METADATA_PROVIDER', '')).lower()
     if provider == "tmdb":
@@ -1023,6 +1046,94 @@ def film_runtime(result):
     except Exception as error:
         logging.debug(f"Runtime lookup for '{result.get('Title')}' failed: {error}")
     return None
+
+
+class RuntimeLookupError(Exception):
+    """The provider could not be asked for a film's runtime: network error, rate limit, bad API key"""
+
+
+def _lookup_json(url):
+    """GET a provider URL; any failure to get an answer is a RuntimeLookupError"""
+    try:
+        response = requests.get(url, timeout=30)
+        response.raise_for_status()
+        return response.json()
+    except (requests.RequestException, ValueError) as error:
+        raise RuntimeLookupError(str(error)) from error
+
+
+def identified_runtime(job):
+    """
+    The runtime, in seconds, of the film the job is identified as (looked up by its IMDb id).
+
+    "No runtime" and "could not ask" are kept apart: None means the provider answered and has no
+    runtime for a film with that id (or it is a series), while a failed lookup raises, so a
+    transient error is not taken for an unknown film (check_runtime then leaves the job alone).
+
+    :return: seconds or None
+    :raises RuntimeLookupError: when the provider could not be asked
+    """
+    if not job.imdb_id:
+        return None
+    provider = str(cfg.arm_config.get('METADATA_PROVIDER', '')).lower()
+    if provider == "omdb":
+        found = _lookup_json(f"https://www.omdbapi.com/?i={urllib.parse.quote(str(job.imdb_id))}"
+                             f"&r=json&apikey={cfg.arm_config['OMDB_API_KEY']}")
+        if found.get('Response') == "False":
+            if "incorrect imdb id" in str(found.get('Error', '')).lower():
+                return None
+            raise RuntimeLookupError(found.get('Error') or "OMDb gave no answer")
+        return ui_metadata.parse_runtime(found.get('Runtime')) if found.get('Type') == "movie" else None
+    if provider != "tmdb":
+        return None
+    api_key = cfg.arm_config['TMDB_API_KEY']
+    found = _lookup_json(f"https://api.themoviedb.org/3/find/{urllib.parse.quote(str(job.imdb_id))}"
+                         f"?api_key={api_key}&external_source=imdb_id")
+    movies = found.get('movie_results') or []
+    if not movies:
+        logging.debug(f"TMDB has no film with IMDb id {job.imdb_id}")
+        return None
+    details = _lookup_json(f"https://api.themoviedb.org/3/movie/{movies[0]['id']}?api_key={api_key}")
+    return int(details['runtime']) * 60 if details.get('runtime') else None
+
+
+def _names_title(result, query) -> bool:
+    """Whether a search result is titled ``query``, alone or before a subtitle ("Stagecoach: The Texas Jack Story")."""
+    wanted = _normalise_title(query)
+    title = str(result.get("Title") or result.get("title") or "")
+    main_title = re.split(r":|\s[-–]\s", title, maxsplit=1)[0]
+    return bool(wanted) and wanted in (_normalise_title(title), _normalise_title(main_title))
+
+
+def runtime_candidates(job):
+    """
+    The films a disc could be instead of the one it was identified as, most voted for first: search
+    results (without a year) titled like the disc label or the job title, alone or followed by a
+    subtitle. Leaving the year out matters for a Blu-ray, whose year is the date its release was
+    authored: TMDB filtered to 2017 has no RED (2010), only a 15 minute short called Red. Only films
+    count: a series' runtime is an episode's, and taking one would make the movie rip a series.
+
+    :return: search results in OMDB style; the identified film itself is left out
+    """
+    queries = []
+    for text in (str(job.label or "").replace("_", " "), job.title):
+        if not is_placeholder_title(text) and _normalise_title(text) not in map(_normalise_title, queries):
+            queries.append(text)
+    seen, candidates = {job.imdb_id}, []
+    for query in queries:
+        try:
+            response = _provider_search(query)
+        except Exception as error:
+            logging.debug(f"Metadata lookup for '{query}' failed: {error}")
+            continue
+        for result in (response or {}).get('Search') or []:
+            key = result.get('imdbID') or result.get('id')
+            # A series is no film for a movie disc: TMDB's search falls back to TV, OMDb's lists both
+            if key in seen or result.get('Type') != "movie" or not _names_title(result, query):
+                continue
+            seen.add(key)
+            candidates.append(result)
+    return sorted(candidates, key=vote_count, reverse=True)
 
 
 def store_films(job, films):
