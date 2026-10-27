@@ -299,11 +299,15 @@ class TestBonusPhoto(BonusFixture):
 class TestMarkDuringRip(BonusFixture):
     """rip_visual_media when the bonus disc choice is made, or cleared, in the ui while the disc rips."""
 
-    def _rip(self, job, mark):
-        """Rip ``job`` (one title, MakeMKV, no transcode); the ui's choice changes (``mark``) during the rip."""
+    def _rip(self, job, mark, poster=True):
+        """
+        Rip ``job`` (one title, MakeMKV, no transcode); the ui's choice changes (``mark``) during the rip.
+        save_disc_poster writes a poster.png into the job's folder unless ``poster`` is false.
+        """
         def save_poster(final_directory, _job):
-            with open(os.path.join(final_directory, "poster.png"), "w") as handle:
-                handle.write("png\n")
+            if poster:
+                with open(os.path.join(final_directory, "poster.png"), "w") as handle:
+                    handle.write("png\n")
 
         job.config.SKIP_TRANSCODE = True
         with mock.patch.object(arm_ripper.db.session, "refresh", side_effect=lambda _job: mark(job)), \
@@ -357,9 +361,31 @@ class TestMarkDuringRip(BonusFixture):
         self.assertEqual(sorted(os.listdir(os.path.join(self.film_path, "extras"))), ["title_t03.mkv"])
         self.assertEqual(os.listdir(job.config.TRANSCODE_PATH + "/movies"), [])
 
-    def test_unused_folder_is_never_the_bonus_folder(self):
-        arm_ripper.remove_unused_final_dir(self.film_path, self.film_path + os.sep)
-        self.assertTrue(os.path.isfile(os.path.join(self.film_path, "Monsters, Inc. (2001).mkv")))
+    def test_identified_as_the_shipped_film_and_marked_after_the_rip_started(self):
+        # The disc was identified as the film itself, whose folder had shipped: the job made a new folder
+        # of the film's name, which must not pass for the film's own folder
+        for poster in (False, True):
+            with self.subTest(poster=poster):
+                shutil.rmtree(self.completed, ignore_errors=True)
+                os.makedirs(self.raw_path, exist_ok=True)
+                job = self._job([_track(0, 600)], parent=False)
+                self._rip(job, self._mark, poster=poster).assert_called_once_with(self.film_path, job)
+                holding = f"{self.film_path} - bonus job41"
+                self.assertEqual(job.path, holding)
+                self.assertEqual(os.listdir(os.path.join(self.completed, "movies")), [os.path.basename(holding)])
+                self.assertEqual(os.listdir(holding), ["extras"])
+                self.assertEqual(os.listdir(os.path.join(holding, "extras")), ["Monsters_Inc_title_t00.mkv"])
+
+    def test_unused_folder_is_removed_before_the_bonus_folder_is_picked(self):
+        shutil.rmtree(self.film_path)
+        job = self._job()
+        os.makedirs(self.film_path)
+        with open(os.path.join(self.film_path, "poster.png"), "w") as handle:
+            handle.write("png\n")
+        arm_ripper.remove_unused_final_dir(self.film_path)
+        self.assertFalse(os.path.exists(self.film_path))
+        self.assertEqual(arm_ripper.bonus_folder(job), f"{self.film_path} - bonus job41")
+        arm_ripper.remove_unused_final_dir(self.film_path)  # gone already: nothing to do
 
 
 class TestManualWait(BonusFixture):

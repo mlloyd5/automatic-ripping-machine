@@ -113,7 +113,9 @@ def rip_visual_media(have_dupes, job, logfile, protection):
         if not bonus:
             logging.info(f"Job was marked as the bonus disc of job {job.bonus_of_job_id} during the rip; "
                          "filing its titles as extras")
-            remove_unused_final_dir(final_directory, bonus_folder(job))
+            # Before bonus_folder: identified as the film itself once the film had shipped, this folder
+            # has the film's own name, and bonus_folder would take it for the film's folder
+            remove_unused_final_dir(final_directory)
             bonus_transcode_path = transcode_folder
             bonus = True
         # The film's folder may have shipped (or the choice changed) since the rip started
@@ -373,18 +375,17 @@ def file_bonus(out_path, job, files):
     return len(videos)
 
 
-def remove_unused_final_dir(path, bonus_path):
+def remove_unused_final_dir(path):
     """
     Remove the completed folder a job made for itself before it was marked as a bonus disc mid-rip.
     check_for_dupe_folder made it (an existing folder gets a new ``_<stage>`` name, or stops the rip), so
-    it holds at most save_disc_poster's poster.png: left behind it would never ship (no job has it as its
-    path) and would stop the next rip of that title as a duplicate. Never the bonus disc's own folder.\n
+    it is never a folder that was there before (the film's own) and holds at most save_disc_poster's
+    poster.png: left behind it would never ship (no job has it as its path) and would stop the next rip
+    of that title as a duplicate. Called before bonus_folder, which would otherwise take a folder of the
+    film's name made by this job for the film's own folder.\n
     :param path: the job's final directory from before the mark
-    :param bonus_path: where the bonus disc's extras go (bonus_folder)
     :return: None
     """
-    if os.path.realpath(path) == os.path.realpath(bonus_path):
-        return
     if os.path.isdir(path):
         logging.info(f"Removing {path} ({', '.join(sorted(os.listdir(path))) or 'empty'}): "
                      "the job's titles are filed as extras instead")
