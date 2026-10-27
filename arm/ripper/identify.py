@@ -819,7 +819,8 @@ def runtime_candidates(job):
     The films a disc could be instead of the one it was identified as, most voted for first: search
     results (without a year) titled like the disc label or the job title, alone or followed by a
     subtitle. Leaving the year out matters for a Blu-ray, whose year is the date its release was
-    authored: TMDB filtered to 2017 has no RED (2010), only a 15 minute short called Red.
+    authored: TMDB filtered to 2017 has no RED (2010), only a 15 minute short called Red. Only films
+    count: a series' runtime is an episode's, and taking one would make the movie rip a series.
 
     :return: search results in OMDB style; the identified film itself is left out
     """
@@ -836,7 +837,8 @@ def runtime_candidates(job):
             continue
         for result in (response or {}).get('Search') or []:
             key = result.get('imdbID') or result.get('id')
-            if key in seen or not _names_title(result, query):
+            # A series is no film for a movie disc: TMDB's search falls back to TV, OMDb's lists both
+            if key in seen or result.get('Type') != "movie" or not _names_title(result, query):
                 continue
             seen.add(key)
             candidates.append(result)

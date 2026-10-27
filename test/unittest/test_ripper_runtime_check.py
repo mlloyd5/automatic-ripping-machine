@@ -13,6 +13,7 @@ throwaway arm.yaml is written first and pointed at with ARM_CONFIG_FILE. Needs t
 dependencies ARM itself needs (libdiscid, pyudev); skipped when they are missing.
 """
 import importlib
+import json
 import os
 import shutil
 import tempfile
@@ -77,7 +78,8 @@ def _track(number, length, fps=23.976):
 
 def _job(label, title, year, imdb_id, tracks):
     return SimpleNamespace(label=label, title=title, year=year, imdb_id=imdb_id, video_type="movie",
-                           title_manual=None, tracks=tracks, films=[])
+                           title_manual=None, tracks=tracks, films=[],
+                           config=SimpleNamespace(GET_VIDEO_TITLE=True))
 
 
 @unittest.skipIf(IMPORT_ERROR is not None, f"ARM could not be imported here: {IMPORT_ERROR}")
@@ -119,6 +121,14 @@ class TestRuntimeCandidates(unittest.TestCase):
         pages = {"RED 2": [RED_2, RED_2010], "High-and-Low-The-Red-Rain": []}
         self.assertEqual(self._candidates(job, pages), [RED_2])
 
+    def test_series_are_no_candidates(self):
+        # TMDB's search falls back to TV, and OMDb's lists series beside the films: a 90 minute
+        # miniseries episode would fit a film's title, and taking it would make the movie rip a series
+        series = dict(_result("Red", "2019", 900, "tt9999001"), Type="series")
+        episode = dict(_result("Red", "2008", 40, "tt9999002"), Type="episode")
+        job = _job("RED", "Red", "2017", RED_2017_SHORT["imdbID"], [])
+        self.assertEqual(self._candidates(job, {"RED": [series, RED_2010, episode, RED_2017_SHORT]}), [RED_2010])
+
     def test_generic_label_is_not_searched(self):
         job = _job("DVD_VIDEO", "Backstreet-Boys--All-Access-DVD", "1998", "tt0000001", [])
         pages = {"Backstreet-Boys--All-Access-DVD": []}
@@ -140,7 +150,6 @@ class TestCheckRuntime(unittest.TestCase):
                                          side_effect=lambda result: RUNTIMES.get(result["imdbID"])),
             "apply": mock.patch.object(identify, "apply_search_result"),
             "notify": mock.patch.object(arm_ripper.utils, "notify"),
-            "config": mock.patch.dict(arm_ripper.cfg.arm_config, {"GET_VIDEO_TITLE": True}),
         }
         self.mocks = {name: patch.start() for name, patch in patches.items()}
         for patch in patches.values():
@@ -151,7 +160,8 @@ class TestCheckRuntime(unittest.TestCase):
         job = _job("RED", "Red", "2017", RED_2017_SHORT["imdbID"], self.RED_DISC)
         self.assertTrue(arm_ripper.check_runtime(job))
         self.mocks["apply"].assert_called_once_with(job, RED_2010)
-        self.mocks["notify"].assert_not_called()
+        self.mocks["notify"].assert_called_once_with(
+            job, mock.ANY, "Identified as RED (2010) instead of Red (2017) by runtime")
 
     def test_closest_runtime_wins(self):
         # RED 2 (116 min) is within the tolerance of a 111 minute title too, but RED is closer
@@ -188,7 +198,7 @@ class TestCheckRuntime(unittest.TestCase):
         job = _job("RED_2", "High-and-Low-The-Red-Rain", "2016", HIGH_AND_LOW["imdbID"], disc)
         self.assertTrue(arm_ripper.check_runtime(job))
         self.mocks["apply"].assert_called_once_with(job, RED_2)
-        self.mocks["notify"].assert_not_called()
+        self.mocks["notify"].assert_called_once()
 
     def test_loose_fit_stands_without_a_closer_one(self):
         self.mocks["candidates"].return_value = [RED_2010]  # 111 min: further off than the identified film
@@ -219,16 +229,207 @@ class TestCheckRuntime(unittest.TestCase):
                 self.assertFalse(arm_ripper.check_runtime(job))
         self.mocks["apply"].assert_not_called()
 
-    def test_unknown_runtime_is_not_checked(self):
+    def test_unknown_runtime_gives_way_to_a_close_fit(self):
+        # the usual wrong pick is a little-known film without a runtime on TMDB
+        self.mocks["candidates"].return_value = [RED_2, RED_2010]
         job = _job("RED", "Red", "2017", "tt-unknown", self.RED_DISC)
+        self.assertTrue(arm_ripper.check_runtime(job))
+        self.mocks["apply"].assert_called_once_with(job, RED_2010)
+
+    def test_unknown_runtime_stands_against_a_loose_fit(self):
+        # RED 2 (116 min) is 5 minutes off the 111 minute title: inside the 6%, but not close, so a
+        # correct film TMDB has no runtime for keeps its title, and nobody is told
+        self.mocks["candidates"].return_value = [RED_2, _result("Turning Red", "2022", 6100, "tt8097030")]
+        job = _job("RED", "Red", "2017", "tt-unknown", self.RED_DISC)
+        self.assertFalse(arm_ripper.check_runtime(job))
+        self.mocks["apply"].assert_not_called()
+        self.mocks["notify"].assert_not_called()
+
+    def test_pal_disc_runs_the_film_four_percent_fast(self):
+        # a 100 minute film is a 96 minute title at 25 fps
+        self.mocks["identified"].side_effect = lambda job: 100 * 60
+        job = _job("FILM", "Film", "2001", "tt0000100", [_track(0, 96 * 60, fps=25.0), _track(1, 600, fps=25.0)])
         self.assertFalse(arm_ripper.check_runtime(job))
         self.mocks["candidates"].assert_not_called()
 
-    def test_disabled_title_lookup_is_not_checked(self):
-        with mock.patch.dict(arm_ripper.cfg.arm_config, {"GET_VIDEO_TITLE": False}):
-            job = _job("RED", "Red", "2017", RED_2017_SHORT["imdbID"], self.RED_DISC)
+    def test_pal_correction_only_applies_at_25_fps(self):
+        # the same 96 minute title at 23.976 fps plays at film speed: a 100 minute film is 4 minutes
+        # off it, a loose fit, so the other films of the title are looked at
+        self.mocks["identified"].side_effect = lambda job: 100 * 60
+        self.mocks["candidates"].return_value = []
+        job = _job("FILM", "Film", "2001", "tt0000100", [_track(0, 96 * 60), _track(1, 600)])
+        self.assertFalse(arm_ripper.check_runtime(job))
+        self.mocks["candidates"].assert_called_once()
+
+    def test_runtime_fit_at_25_and_23_976_fps(self):
+        pal, film = [_track(0, 96 * 60, fps=25.0)], [_track(0, 96 * 60)]
+        self.assertEqual(arm_ripper.runtime_fit(100 * 60, pal), 0)
+        self.assertEqual(arm_ripper.runtime_fit(100 * 60, film), 4 * 60)
+        # a 92 minute film is 88.3 minutes at 25 fps, 7.7 minutes short of the PAL title: no fit;
+        # at 23.976 fps it is 4 minutes off, inside the 6% (a loose fit)
+        self.assertIsNone(arm_ripper.runtime_fit(92 * 60, pal))
+        self.assertEqual(arm_ripper.runtime_fit(92 * 60, film), 4 * 60)
+
+    def test_backup_rip_without_title_lengths_is_not_checked(self):
+        job = _job("RED", "Red", "2017", RED_2017_SHORT["imdbID"], [])
+        with self.assertLogs(level="WARNING"):
             self.assertFalse(arm_ripper.check_runtime(job))
         self.mocks["identified"].assert_not_called()
+
+    def test_disabled_title_lookup_is_not_checked(self):
+        job = _job("RED", "Red", "2017", RED_2017_SHORT["imdbID"], self.RED_DISC)
+        job.config.GET_VIDEO_TITLE = False
+        self.assertFalse(arm_ripper.check_runtime(job))
+        self.mocks["identified"].assert_not_called()
+
+
+@unittest.skipIf(IMPORT_ERROR is not None, f"ARM could not be imported here: {IMPORT_ERROR}")
+class TestIdentifiedRuntime(unittest.TestCase):
+    """identified_runtime with TMDB: /find by the IMDb id, then the film's details for the runtime."""
+
+    def setUp(self):
+        for patch in (mock.patch.dict(identify.cfg.arm_config, {"METADATA_PROVIDER": "tmdb", "TMDB_API_KEY": "x"}),
+                      mock.patch.object(identify.ui_metadata, "tmdb_runtime", return_value=111 * 60)):
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def _find(self, movie_results=(), tv_results=()):
+        response = SimpleNamespace(text=json.dumps({"movie_results": list(movie_results),
+                                                    "tv_results": list(tv_results)}))
+        return mock.patch.object(identify.ui_metadata.requests, "get", return_value=response)
+
+    def test_film(self):
+        movie = {"id": 39514, "title": "RED", "release_date": "2010-10-13", "poster_path": "/red.jpg",
+                 "overview": "", "backdrop_path": ""}
+        with self._find(movie_results=[movie]):
+            self.assertEqual(identify.identified_runtime(_job("RED", "RED", "2010", "tt1245526", [])), 111 * 60)
+        identify.ui_metadata.tmdb_runtime.assert_called_once_with(39514)
+
+    def test_series(self):
+        show = {"id": 1399, "name": "Red", "first_air_date": "2019-01-01", "poster_path": "", "overview": "",
+                "backdrop_path": ""}
+        with self._find(tv_results=[show]):
+            self.assertIsNone(identify.identified_runtime(_job("RED", "Red", "2019", "tt9999001", [])))
+        identify.ui_metadata.tmdb_runtime.assert_not_called()
+
+    def test_unknown_to_tmdb(self):
+        # tmdb_find indexes the empty tv_results and raises IndexError, which is swallowed
+        with self._find():
+            self.assertIsNone(identify.identified_runtime(_job("RED", "Red", "2017", "tt0000000", [])))
+        identify.ui_metadata.tmdb_runtime.assert_not_called()
+
+
+@unittest.skipIf(IMPORT_ERROR is not None, f"ARM could not be imported here: {IMPORT_ERROR}")
+class TestRetitleFinalDirectory(unittest.TestCase):
+    """The completed folder after check_runtime (or a title set by hand) changed the job's title."""
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp(prefix="completed_", dir=_TMP)
+        self.movies = os.path.join(self.root, "movies")
+        os.makedirs(self.movies)
+        for patch in (mock.patch.dict(arm_ripper.utils.cfg.arm_config, {"ALLOW_DUPLICATES": True}),
+                      mock.patch.object(arm_ripper.utils, "database_updater",
+                                        side_effect=lambda args, job: vars(job).update(args))):
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def _job(self):
+        job = _job("RED", "Red", "2017", RED_2017_SHORT["imdbID"], [])
+        job.config.COMPLETED_PATH = self.root
+        job.stage = "170001"
+        job.path = None
+        return job
+
+    def _first_folder(self, poster=True):
+        folder = os.path.join(self.movies, "Red (2017)")
+        os.makedirs(folder)
+        if poster:
+            Path(folder, "poster.png").write_bytes(b"png")
+        return folder
+
+    def test_unchanged_title_keeps_the_folder(self):
+        job, folder = self._job(), self._first_folder()
+        self.assertEqual(arm_ripper.retitle_final_directory(False, job, folder, "movies", "Red (2017)"), folder)
+        self.assertTrue(os.path.isfile(os.path.join(folder, "poster.png")))
+        self.assertIsNone(job.path)
+
+    def test_new_title_moves_the_poster_and_removes_the_first_folder(self):
+        job, folder = self._job(), self._first_folder()
+        job.title, job.year = "RED", "2010"
+        with mock.patch.dict(arm_ripper.utils.cfg.arm_config, {"DELRAWFILES": False}):
+            new = arm_ripper.retitle_final_directory(False, job, folder, "movies", "Red (2017)")
+        self.assertEqual(new, os.path.join(self.movies, "RED (2010)"))
+        self.assertEqual(job.path, new)
+        self.assertFalse(os.path.exists(folder))
+        self.assertTrue(os.path.isfile(os.path.join(new, "poster.png")))
+
+    def test_film_ripped_before_keeps_its_folder(self):
+        existing = os.path.join(self.movies, "RED (2010)")
+        os.makedirs(existing)
+        Path(existing, "RED (2010).mkv").write_bytes(b"old rip")
+        job, folder = self._job(), self._first_folder(poster=False)
+        job.title, job.year = "RED", "2010"
+        new = arm_ripper.retitle_final_directory(False, job, folder, "movies", "Red (2017)")
+        self.assertEqual(new, existing + "_170001")
+        self.assertTrue(os.path.isdir(new))
+        self.assertEqual(os.listdir(existing), ["RED (2010).mkv"])
+        self.assertFalse(os.path.exists(folder))
+
+    def test_duplicate_rips_disabled_stops_at_the_existing_folder(self):
+        os.makedirs(os.path.join(self.movies, "RED (2010)"))
+        job, folder = self._job(), self._first_folder()
+        job.title, job.year = "RED", "2010"
+        with mock.patch.dict(arm_ripper.utils.cfg.arm_config, {"ALLOW_DUPLICATES": False}), \
+                mock.patch.object(arm_ripper.utils, "notify"):
+            with self.assertRaises(arm_ripper.utils.RipperException):
+                arm_ripper.retitle_final_directory(True, job, folder, "movies", "Red (2017)")
+
+    def test_folder_with_other_files_is_left(self):
+        job, folder = self._job(), self._first_folder()
+        Path(folder, "something.mkv").write_bytes(b"")
+        job.title, job.year = "RED", "2010"
+        with self.assertLogs(level="WARNING"):
+            arm_ripper.retitle_final_directory(False, job, folder, "movies", "Red (2017)")
+        self.assertEqual(os.listdir(folder), ["something.mkv"])
+
+    def test_rip_visual_media_files_the_switched_film_in_its_own_folder(self):
+        # RED (2010) was ripped before; this disc is taken for Red (2017) until check_runtime runs
+        existing = os.path.join(self.movies, "RED (2010)")
+        os.makedirs(existing)
+        Path(existing, "RED (2010).mkv").write_bytes(b"old rip")
+        job = self._job()
+        job.config = SimpleNamespace(GET_VIDEO_TITLE=True, COMPLETED_PATH=self.root,
+                                     TRANSCODE_PATH=os.path.join(self.root, "transcode"),
+                                     NOTIFY_RIP=False, SKIP_TRANSCODE=False)
+        job.devpath, job.status = "/dev/sr0", None
+        filed_in = []
+
+        def switch(job):
+            job.title, job.year = "RED", "2010"
+
+        def poster(folder, job):
+            Path(folder, "poster.png").write_bytes(b"png")
+
+        patches = [mock.patch.object(arm_ripper, "db"),
+                   mock.patch.object(arm_ripper, "rip_with_mkv", return_value=True),
+                   mock.patch.object(arm_ripper.makemkv, "makemkv", return_value=os.path.join(self.root, "raw")),
+                   mock.patch.object(arm_ripper, "check_runtime", side_effect=switch),
+                   mock.patch.object(arm_ripper, "start_transcode"),
+                   mock.patch.object(arm_ripper, "move_files_post",
+                                     side_effect=lambda path, job: filed_in.append(job.path)),
+                   mock.patch.object(arm_ripper, "notify_exit"),
+                   mock.patch.object(arm_ripper.utils, "save_disc_poster", side_effect=poster),
+                   mock.patch.dict(arm_ripper.utils.cfg.arm_config, {"DELRAWFILES": False})]
+        patches += [mock.patch.object(arm_ripper.utils, name) for name in
+                    ("copy_disc_photo", "copy_disc_barcode", "move_movie_poster", "scan_emby", "set_permissions")]
+        for patch in patches:
+            patch.start()
+            self.addCleanup(patch.stop)
+        arm_ripper.rip_visual_media(False, job, None, 0)
+        self.assertEqual(filed_in, [existing + "_170001"])
+        self.assertEqual(os.listdir(existing), ["RED (2010).mkv"])
+        self.assertFalse(os.path.exists(os.path.join(self.movies, "Red (2017)")))
+        self.assertTrue(os.path.isfile(os.path.join(existing + "_170001", "poster.png")))
 
 
 if __name__ == '__main__':
