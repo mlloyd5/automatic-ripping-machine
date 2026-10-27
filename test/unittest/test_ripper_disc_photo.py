@@ -220,6 +220,13 @@ class TestCleanUpcTitle(unittest.TestCase):
         self.assertEqual(disc_photo.clean_upc_title("Amélie DVD 2002"), ("Amelie", "2002"))
         self.assertEqual(disc_photo.clean_upc_title("Léon (The Professional) - Blu-ray"), ("Leon", None))
 
+    def test_en_and_em_dashes_separate_like_a_hyphen(self):
+        self.assertEqual(disc_photo.clean_upc_title("Thomas the Tank Engine and Friends \u2013 Best of James [DVD]"),
+                         ("Thomas the Tank Engine and Friends - Best of James", None))
+        self.assertEqual(disc_photo.clean_upc_title("Thomas & Friends\u2014Best of James (DVD, 2002)"),
+                         ("Thomas & Friends - Best of James", "2002"))
+        self.assertEqual(disc_photo.clean_upc_title("Breaking Bad \u2013 Season 2 (DVD)"), ("Breaking Bad", None))
+
     def test_nothing_left(self):
         self.assertEqual(disc_photo.clean_upc_title("DVD"), (None, None))
         self.assertEqual(disc_photo.clean_upc_title(""), (None, None))

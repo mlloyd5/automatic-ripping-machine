@@ -290,6 +290,7 @@ _UPC_BOILERPLATE = re.compile(
     r")\b",
     re.IGNORECASE,
 )
+_DASH_RE = re.compile(r"\s*[\u2013\u2014]\s*")
 _TRAILING_FORMAT_RE = re.compile(
     r"\s*[-:,/]?\s*(dvd|blu[- ]?ray|4k\s*(uhd|ultra\s*hd)?|uhd|hd[- ]?dvd|vhs)(\s*\+\s*\w+)*\s*$", re.IGNORECASE)
 
@@ -309,6 +310,9 @@ def clean_upc_title(title: Optional[str]) -> Tuple[Optional[str], Optional[str]]
         return None, None
     text = unicodedata.normalize("NFKD", str(title))
     text = "".join(ch for ch in text if not unicodedata.combining(ch))
+    # An en or em dash separates like " - " ("Thomas & Friends \u2013 Best of James"): keep it as one,
+    # since _KEEP_CHARS_RE would leave only a space and the subtitle search splits on " - "
+    text = _DASH_RE.sub(" - ", text)
     # Years in product titles sit in the brackets ("(DVD, 2010)"); a bare number in the title
     # itself ("Blade Runner 2049") is usually part of the title, so only a trailing one counts.
     years = [y for chunk in _BRACKETS_RE.findall(text) for y in _YEAR_RE.findall(chunk) if _plausible_year(y)]

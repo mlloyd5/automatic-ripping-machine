@@ -351,9 +351,22 @@ def get_video_details(job):
         logging.info(f"Identification failed with the error: {error}. Continuing...")
 
 
+def _fold_accents(text) -> str:
+    """The text with accents dropped from their letters: "Pokémon" is "Pokemon", as clean_upc_title folds it."""
+    text = unicodedata.normalize("NFKD", str(text or ""))
+    return "".join(ch for ch in text if not unicodedata.combining(ch))
+
+
+def _title_words(text) -> list:
+    """The lower case runs of letters and digits, accents folded: "Thomas & Friends: Best of James" is
+    thomas, friends, best, of, james."""
+    return re.findall(r"[a-z0-9]+", _fold_accents(text).lower())
+
+
 def _normalise_title(text) -> str:
-    """Lower case letters and digits only, so "Coal Miner's Daughter" and "COAL MINERS DAUGHTER" agree."""
-    return re.sub(r"[^a-z0-9]", "", str(text or "").lower())
+    """Lower case letters and digits only, so "Coal Miner's Daughter" and "COAL MINERS DAUGHTER" agree,
+    and accents folded, so "Pokémon: The First Movie" and "Pokemon The First Movie" do too."""
+    return "".join(_title_words(text))
 
 
 def best_search_result(results, title=None, year=None, exact_only=False):
@@ -728,8 +741,9 @@ def split_brand_subtitle(title):
     if len(parts) != 2:
         return None
     prefix, subtitle = parts[0].strip(), parts[1].strip()
-    words = [word for word in re.findall(r"[A-Za-z0-9]+", prefix) if word.lower() not in ("a", "an", "the")]
-    if not words or not _normalise_title(subtitle):
+    words = [word for word in re.findall(r"[A-Za-z0-9]+", _fold_accents(prefix))
+             if word.lower() not in ("a", "an", "the")]
+    if not words or not _title_words(subtitle):
         return None
     return words[0], subtitle
 
@@ -741,10 +755,11 @@ def search_film_by_subtitle(title, year=None):
     A case barcode gives "Thomas the Tank Engine and Friends - Best of James" where TMDB has
     "Thomas & Friends: Best of James", so no title is exactly the product title (see search_film).
     When the product title splits into a brand prefix and a subtitle, the subtitle alone is
-    searched and a result counts when its title ends with the subtitle and also contains the
-    prefix's first word: "The Best of Mickie James" and "James Last: Best of the 70's" do not
-    qualify. Several such results rank as best_search_result ranks exact matches: the year when
-    one is known, then the vote count.
+    searched and a result counts when its title's last words are the subtitle's words and one of
+    its words is the prefix's first word: "The Best of Mickie James" and "James Last: Best of the
+    70's" do not qualify, and neither does a title where the brand ("Ed") or the subtitle ("Ice")
+    only turns up inside a longer word ("Remastered", "Justice"). Several such results rank as
+    best_search_result ranks exact matches: the year when one is known, then the vote count.
 
     :return: one search result in OMDB style, or None
     """
@@ -752,11 +767,11 @@ def search_film_by_subtitle(title, year=None):
     if not split:
         return None
     brand, subtitle = split
-    wanted_brand, wanted_subtitle = _normalise_title(brand), _normalise_title(subtitle)
+    wanted_brand, wanted_subtitle = brand.lower(), _title_words(subtitle)
 
     def qualifies(result):
-        found = _normalise_title(result.get("Title") or result.get("title"))
-        return found.endswith(wanted_subtitle) and wanted_brand in found
+        found = _title_words(result.get("Title") or result.get("title"))
+        return found[-len(wanted_subtitle):] == wanted_subtitle and wanted_brand in found
 
     attempts = [str(year), str(int(year) - 1)] if year and str(year).isdigit() else []
     attempts.append(None)
