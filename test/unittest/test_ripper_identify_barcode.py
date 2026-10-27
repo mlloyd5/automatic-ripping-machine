@@ -778,6 +778,21 @@ class TestIdentifyEndToEnd(unittest.TestCase):
             job = self._identify_without_a_barcode(disctype, [_result("Cartoons D3", "2009", 3)])
             self.assertEqual((job.title, job.year, job.hasnicetitle), ("Cartoons-D3", "2009", True), disctype)
 
+    def test_a_confident_read_refuses_a_year_search_that_only_starts_with_the_label(self):
+        """
+        A Blu-ray without bdmt_eng.xml metadata searches its label with the file's year. A result that
+        merely starts with the label ends the year retries (main's Stagecoach rule) but is still a
+        near miss: after a confident read it is not taken, and the disc is named after the read.
+        """
+        self._bdmt(BDMT_BROKEN)
+        starts_with = [_result("Cartoons D3: The Lost Reels", "2026", 1)]
+        job = self._identify_without_a_barcode("bluray", lambda year: starts_with if year else CARTOONS_D3)
+        label_searches = [year for title, year in self.searched if title == "CARTOONS+D3"]
+        self.assertEqual(len(label_searches), 1)  # the starts-with page stopped the year retries
+        self.assertTrue(label_searches[0])
+        self.assertEqual((job.title, job.year, job.hasnicetitle),
+                         ("Toon-Time--Ultimate-Cartoon-Collection", "2011", False))
+
     def test_without_a_barcode_or_a_read_the_label_search_still_guesses(self):
         self.assertIsNone(identify.disc_label_read_title(_job()))
         job = _job(label="CARTOONS_D3", disc_barcode=None,
