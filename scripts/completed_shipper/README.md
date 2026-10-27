@@ -84,7 +84,10 @@ numeric stage nor a start time has none of its further films claimed, with a
 warning.
 
 A film folder that is also some job's own `job.path` (that film ripped on its
-own earlier and still in completed) ships as that job, never as the film.
+own earlier and still in completed) ships as that job, never as the film.  A
+film folder that films of more than one job claim (the same double feature
+ripped on two drives, one job's stage overwritten) ships with none of them: the
+run logs a warning naming the folder and the jobs, and you move it by hand.
 
 ### Never overwriting what the media box holds
 
@@ -491,7 +494,8 @@ film's folder ships for a `success` job and waits while it rips or while
 another job on that path does, a database without a `film` table, an unfiled
 film ignored, the `_<stage>` folder shipped under the plain name without taking
 over the older plain one, a progress-text stage judged by `start_time`, no
-stage or start time, a folder that is another successful job's path, the film's
+stage or start time, a folder that is another successful job's path, a folder
+claimed by films of two jobs, the film's
 own record and destination state); and the itemized output of both
 rsync and openrsync (the one on macOS), which the test runs under whichever
 `rsync` is on `PATH`:

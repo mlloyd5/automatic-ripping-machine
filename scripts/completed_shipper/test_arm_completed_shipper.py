@@ -1393,6 +1393,44 @@ class DoubleFeature(ShipperFixture):
         self.assertEqual(shipper.read_films(conn), {})
         conn.close()
 
+    def test_single_film_claim_ships_as_that_film(self):
+        row = shipper.finished_jobs(self.db, self.completed)[os.path.realpath(self._local("movies", self.FILM_2))]
+        self.assertEqual((row["job_id"], row["film"], row["title"]), (self.job_id, 2, "Land Before Time IX"))
+        self.assertEqual(self._run(), 0)
+        self.assertFalse(os.path.exists(self._local("movies", self.FILM_2)))
+        self.assertTrue(os.path.isfile(os.path.join(self._shipped("Movies", self.FILM_2), f"{self.FILM_2}.mkv")))
+
+    def test_folder_claimed_by_films_of_two_jobs_ships_with_neither(self):
+        # Two drives ripped the same double feature: job M filed the plain "IX (2002)" after job N started,
+        # so N filed its film 2 into "IX (2002)_<stage>"; N's stage was then overwritten with progress text,
+        # and by start_time N's film 2 claims M's plain folder as well.
+        other = self._job("movies", "Land Before Time VIII (2001) second drive", "success",
+                          files=["Land Before Time VIII (2001).mkv"])
+        m_stage = str(int(self.STAGE) + 1000)
+        self._set_job(os.path.basename(other), title="Land Before Time VIII", year="2001", label="LBT_8_9_B",
+                      stage=m_stage, start_time=datetime.datetime.fromtimestamp(int(m_stage) / 100 + 5).isoformat(" "),
+                      stop_time="2026-10-24 20:30:00")
+        job_m = self._job_id("second drive")
+        self._film(1, "Land Before Time VIII", "2001", "tt0000008", "1", job_id=job_m)
+        self._film(2, "Land Before Time IX", "2002", "tt0000009", "3", job_id=job_m)
+        self._folder("movies", f"{self.FILM_2}_{self.STAGE}", files=[f"{self.FILM_2}.mkv"])
+        self._set_job("Land Before Time VIII (2001)", stage="Track 2/2<br>Saving to MKV file")
+        with self.assertLogs("arm-completed-shipper", "WARNING") as logs:
+            self.assertEqual(self._run(), 0)
+        warned = [line for line in logs.output if "claim it" in line]
+        self.assertEqual(len(warned), 1, logs.output)
+        self.assertIn(self.FILM_2, warned[0])
+        self.assertIn(f"{min(self.job_id, job_m)}, {max(self.job_id, job_m)}", warned[0])
+        for name in (self.FILM_2, f"{self.FILM_2}_{self.STAGE}"):
+            self.assertTrue(os.path.isfile(os.path.join(self._local("movies", name), f"{self.FILM_2}.mkv")), name)
+        self.assertNotIn(self.FILM_2, "\n".join(self._calls()))
+        self.assertFalse(os.path.exists(self._shipped("Movies", self.FILM_2)))
+        self.assertFalse([name for name in os.listdir(self.spool) if name.endswith(".destination")]
+                         if os.path.isdir(self.spool) else [])
+        # Both jobs' own folders still ship.
+        self.assertFalse(os.path.exists(other))
+        self.assertFalse(os.path.exists(self._local("movies", "Land Before Time VIII (2001)")))
+
     def test_film_filed_beside_an_existing_folder_ships_from_the_stage_suffixed_one(self):
         # ARM found "IX (2002)" already there (an older rip nobody tracks) and filed into "IX (2002)_<stage>".
         os.rename(self._local("movies", self.FILM_2), self._local("movies", f"{self.FILM_2}_{self.STAGE}"))

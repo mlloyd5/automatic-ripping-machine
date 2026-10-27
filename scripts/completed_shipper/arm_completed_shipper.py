@@ -143,6 +143,8 @@ DEFAULTS = {
 }
 
 log = logging.getLogger("arm-completed-shipper")
+_warned = set()
+"""Warnings :func:`warn_once` has logged this run; :func:`finished_jobs` runs several times per run."""
 
 
 class ShipperError(Exception):
@@ -250,6 +252,14 @@ def read_films(conn):
             for job_id, films in by_job.items()}
 
 
+def warn_once(message, *args):
+    """``log.warning`` a message only the first time this run (see :func:`run`)."""
+    key = (message, args)
+    if key not in _warned:
+        _warned.add(key)
+        log.warning(message, *args)
+
+
 def film_folder_name(film):
     """``Title (Year)``, or the title alone when the year is unknown: ARM's ``Film.folder_name``."""
     year = _clean(film.get("year"))
@@ -290,9 +300,9 @@ def film_folder_for(job, film, completed_path):
     else:
         started = _epoch(job.get("start_time"))
     if started is None:
-        log.warning("not claiming %s for film %s of job %s: the job has neither a numeric stage nor a start time "
-                    "to tell its folder from an older one; move it by hand", plain, film.get("position"),
-                    job.get("job_id"))
+        warn_once("not claiming %s for film %s of job %s: the job has neither a numeric stage nor a start time "
+                  "to tell its folder from an older one; move it by hand", plain, film.get("position"),
+                  job.get("job_id"))
         return None
     try:
         changed = os.stat(plain).st_mtime
@@ -359,7 +369,9 @@ def finished_jobs(db_path, completed_path, arm_completed_path=None):
     for that job too.  Only the films of a job whose ``job.path`` is under
     COMPLETED_PATH are looked at, since ARM files them beside it.  A film row
     never represents a folder that is some job's own path: that folder ships
-    with the newest successful such job, or not at all.
+    with the newest successful such job, or not at all.  A folder that is no
+    job's own and that films of more than one job claim ships with none of
+    them (a warning names the jobs).
     """
     by_folder = {}
     for job in read_jobs(db_path):
@@ -382,6 +394,12 @@ def finished_jobs(db_path, completed_path, arm_completed_path=None):
             continue
         if any(status not in FINISHED_STATUSES for status in seen):
             log.debug("skipping %s: another job on that path is still %s", path, sorted(seen))
+            continue
+        claimants = sorted({job.get("job_id") or 0 for job in jobs if job.get("film")})
+        if len(claimants) > 1:
+            # Two rips of one double feature (two drives): which job's film this is cannot be told apart.
+            warn_once("not shipping %s: it is no job's own folder and films of jobs %s all claim it; move it by hand",
+                      path, ", ".join(str(job_id) for job_id in claimants))
             continue
         successes = [job for job in jobs if job["status"] == SUCCESS_STATUS]
         shippable[path] = max(successes, key=lambda job: job.get("job_id") or 0)
@@ -1392,6 +1410,7 @@ def ship_recognized(cfg, dry_run, verbose, stats):
 def run(cfg, dry_run=False, verbose=False):
     """One full pass.  Returns the exit code for the process."""
     stats = {"shipped": 0, "failed": 0, "records": 0, "renamed": 0}
+    _warned.clear()
     attempted_unidentified = set()
     settle_destination_states(cfg, dry_run)
     ship_pending_records(cfg, dry_run, stats)
