@@ -62,13 +62,29 @@ state file and catalog record.  A film ARM could not match to a ripped title
 has no `track_number` and no folder, so a folder of that name is left alone.
 
 When `movies/<Title (Year)>` already existed, ARM files the film in
-`<Title (Year)>_<job.stage>` instead, and the shipper ships that folder (under
-the same name).  `job.stage` is the job's start stamp, `time() * 100`.  The
+`<Title (Year)>_<job.stage>` instead, with `job.stage` as it was at that
+moment: the job's start stamp, `time() * 100`.  The shipper ships that
+suffixed folder under the plain `<Title (Year)>` name, since the suffix only
+avoided a clash in completed (and steps aside to `<Title (Year)> - <label>` as
+usual if the media box already has that name); the catalog record's `library`
+and `destination` name the plain folder, its `source` the suffixed one.  The
 plain folder that was already there is someone else's: the shipper claims a
 plain film folder only if it changed after the job started, so it never takes
-over that older folder, even once the suffixed one has shipped.  ARM's web UI
-can overwrite `job.stage` with rip progress text; with no number to go by, the
-shipper takes the plain folder and leaves a suffixed one for you to move by hand.
+over that older folder, even once the suffixed one has shipped.
+
+ARM's web UI overwrites `job.stage` with rip progress text (`Track 2/2<br>...`)
+on most jobs: anything that polls its job list, the UI included, writes it to
+the database.  The suffix is then unknown, so a suffixed folder is not found
+and stays for you to move by hand.  The plain folder is still judged by when
+the job started, read from `job.start_time`, which nothing overwrites: an older
+plain folder is left alone, and one ARM filed during the job ships as usual.
+`start_time` is ARM's local time, read in the shipper's own timezone, so run
+both in the same timezone (`TZ` in the container).  A job with neither a
+numeric stage nor a start time has none of its further films claimed, with a
+warning.
+
+A film folder that is also some job's own `job.path` (that film ripped on its
+own earlier and still in completed) ships as that job, never as the film.
 
 ### Never overwriting what the media box holds
 
@@ -473,8 +489,10 @@ rip; the state file wins over a disagreeing pending record; stale state
 files are dropped; the probe command shape; double features (a further
 film's folder ships for a `success` job and waits while it rips or while
 another job on that path does, a database without a `film` table, an unfiled
-film ignored, the `_<stage>` folder shipped without taking over the older plain
-one, a progress-text stage, the film's own record and destination state); and the itemized output of both
+film ignored, the `_<stage>` folder shipped under the plain name without taking
+over the older plain one, a progress-text stage judged by `start_time`, no
+stage or start time, a folder that is another successful job's path, the film's
+own record and destination state); and the itemized output of both
 rsync and openrsync (the one on macOS), which the test runs under whichever
 `rsync` is on `PATH`:
 
@@ -524,6 +542,9 @@ PATH=/opt/homebrew/bin:$PATH python3 -m unittest scripts/completed_shipper/test_
   `sqlite3 /home/arm/db/arm.db "select job_id,position,title,year,track_number from film order by job_id desc limit 5"`.
   No `track_number` means ARM never filed it (that folder is not the film's);
   a `<Title (Year)>_<suffix>` folder whose job's `stage` is no longer a number
-  is not found either.  Move such a folder by hand.
+  (the web UI overwrites it on most jobs) is not found either, nor is any
+  further film of a job with neither a numeric `stage` nor a `start_time`
+  (the run logs a warning).  Move such a folder by hand, under the plain
+  `<Title (Year)>` name.
 * **Permissions on the media box.**  Use `rsync_extra_args = --chmod=D775,F664`
   (and `--chown=` if the ssh user may chown) so the Plex user can read the files.

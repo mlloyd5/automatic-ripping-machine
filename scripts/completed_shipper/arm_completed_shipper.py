@@ -114,7 +114,7 @@ PROBE_CHECKSUM_RATE = 50 * 1024 * 1024
 
 JOB_COLUMNS = ("job_id", "status", "path", "title", "title_manual", "year", "year_manual", "video_type",
                "imdb_id", "label", "disctype", "disc_barcode", "disc_barcode_title", "sleeve_id", "box",
-               "stop_time", "stage")
+               "stop_time", "stage", "start_time")
 """Columns read from ARM's job table when present; a stock ARM lacks the fork's disc_barcode and sleeve ones."""
 FILM_COLUMNS = ("job_id", "position", "title", "year", "imdb_id", "track_number")
 """Columns read from the fork's film table (the 2nd+ films of a double-feature disc); a stock ARM has no such table."""
@@ -260,39 +260,60 @@ def film_folder_name(film):
 
 def film_folder_for(job, film, completed_path):
     """
-    The local folder ARM filed one of a double feature's further films in.
+    The local folder ARM filed one of a double feature's further films in, or None when there is none to claim.
 
     ARM files it in ``COMPLETED_PATH/movies/<Title (Year)>``, or, when that
-    folder already existed, in ``<Title (Year)>_<job.stage>``.  ``job.stage``
-    is the job's start stamp (``time() * 100``), unique to it, so the suffixed
-    folder is the film's whenever it exists.  The plain folder is the film's
-    only if it changed after the job started: one older than that is the
-    folder that made ARM add the suffix, and is someone else's even once the
-    suffixed one has shipped.  Returns None when the film has no folder of its
-    own to claim.
+    folder already existed, in ``<Title (Year)>_<job.stage>``, with the stage
+    as it was at filing time: the job's start stamp (``time() * 100``), unique
+    to it, so a suffixed folder of that name is the film's whenever it exists.
+    The plain folder is the film's only if it changed after the job started:
+    one older than that is the folder that made ARM add the suffix, someone
+    else's rip, and is never claimed, even once the suffixed one has shipped.
 
-    ARM's UI may overwrite ``job.stage`` with rip progress text; without a
-    numeric stage there is neither a suffix to look for nor a start to compare
-    with, so the plain folder is taken as the film's and a suffixed one stays
-    for a hand transfer.
+    ARM's web UI (anything that polls its job list) overwrites ``job.stage``
+    with rip progress text on most jobs, so the suffix is often unknown.  The
+    job's start is then ``job.start_time``, which nothing overwrites; a plain
+    folder older than it is still left alone, and the suffixed folder, which
+    cannot be named, stays for a hand transfer.  A numeric stage is preferred
+    for the comparison: it is an epoch, while ``start_time`` is ARM's local
+    time, read here in the shipper's own timezone.  With neither, nothing is
+    claimed.
     """
     name = film_folder_name(film)
     plain = os.path.realpath(os.path.join(completed_path, FILM_SUB_FOLDER, name))
     stage = _clean(job.get("stage"))
-    if not stage or not stage.isdigit():
-        return plain
-    suffixed = os.path.realpath(os.path.join(completed_path, FILM_SUB_FOLDER, f"{name}_{stage}"))
-    if os.path.isdir(suffixed):
-        return suffixed
+    if stage and stage.isdigit():
+        suffixed = os.path.realpath(os.path.join(completed_path, FILM_SUB_FOLDER, f"{name}_{stage}"))
+        if os.path.isdir(suffixed):
+            return suffixed
+        started = int(stage) / 100
+    else:
+        started = _epoch(job.get("start_time"))
+    if started is None:
+        log.warning("not claiming %s for film %s of job %s: the job has neither a numeric stage nor a start time "
+                    "to tell its folder from an older one; move it by hand", plain, film.get("position"),
+                    job.get("job_id"))
+        return None
     try:
         changed = os.stat(plain).st_mtime
     except OSError:
         return plain  # gone (shipped) or never there: nothing to claim either way
-    if changed < int(stage) / 100:
+    if changed < started:
         log.debug("not claiming %s for film %s of job %s: it predates the job", plain, film.get("position"),
                   job.get("job_id"))
         return None
     return plain
+
+
+def _epoch(value):
+    """Seconds since the epoch for a database timestamp (ARM's local time, read as this host's), or None."""
+    text = _clean(value)
+    if not text:
+        return None
+    try:
+        return datetime.datetime.fromisoformat(text).timestamp()
+    except (ValueError, OverflowError, OSError):
+        return None
 
 
 def film_job(job, film):
@@ -336,7 +357,9 @@ def finished_jobs(db_path, completed_path, arm_completed_path=None):
     of their own, each with its parent job's status and a :func:`film_job` row,
     under the same rules: a film folder that is also another job's path waits
     for that job too.  Only the films of a job whose ``job.path`` is under
-    COMPLETED_PATH are looked at, since ARM files them beside it.
+    COMPLETED_PATH are looked at, since ARM files them beside it.  A film row
+    never represents a folder that is some job's own path: that folder ships
+    with the newest successful such job, or not at all.
     """
     by_folder = {}
     for job in read_jobs(db_path):
@@ -350,9 +373,12 @@ def finished_jobs(db_path, completed_path, arm_completed_path=None):
                 by_folder.setdefault(folder, []).append(film_job(job, film))
 
     shippable = {}
-    for path, jobs in by_folder.items():
-        seen = {job["status"] for job in jobs}
-        if SUCCESS_STATUS not in seen:
+    for path, rows in by_folder.items():
+        seen = {job["status"] for job in rows}
+        # Every row waits (a film whose job is still ripping), but a film row stands for its folder only
+        # when no job has that folder as its path; otherwise the folder holds that job's rip, not the film's.
+        jobs = [job for job in rows if not job.get("film")] or rows
+        if SUCCESS_STATUS not in {job["status"] for job in jobs}:
             continue
         if any(status not in FINISHED_STATUSES for status in seen):
             log.debug("skipping %s: another job on that path is still %s", path, sorted(seen))
@@ -535,21 +561,38 @@ def colliding_files(cfg, sub_folder, local_folder, remote_name):
     return sorted(would_send - new_only)
 
 
+def arm_folder_name(local_folder, job=None):
+    """
+    The name the media box should know a job folder by: its own, less a suffix that only avoided a local clash.
+
+    That is the folder's basename, except for a double feature's further film
+    that ARM filed as ``<Title (Year)>_<stage>`` because ``<Title (Year)>``
+    already existed in completed (see :func:`film_folder_for`): it ships as
+    the plain ``<Title (Year)>``.
+    """
+    folder = os.path.basename(local_folder.rstrip(os.sep))
+    if job and job.get("film") and _clean(job.get("title")):
+        plain = film_folder_name(job)
+        if folder.startswith(plain + "_") and folder[len(plain) + 1:].isdigit():
+            return plain
+    return folder
+
+
 def remote_folder_names(local_folder, job, sub_folder=None):
     """
     Destination folder names to try for one job folder, in order.
 
-    ARM's own name first.  Then, for a folder that already holds a file the
-    transfer would replace, the same name with the disc label appended and
-    finally with the job id, so a second disc of a title the pool already has
-    (the Blu-ray after the UHD, a re-rip) lands beside the first copy, never over
-    it.  Plex groups both as versions of the one title.
+    ARM's own name first (:func:`arm_folder_name`).  Then, for a folder that
+    already holds a file the transfer would replace, the same name with the
+    disc label appended and finally with the job id, so a second disc of a
+    title the pool already has (the Blu-ray after the UHD, a re-rip) lands
+    beside the first copy, never over it.  Plex groups both as versions of the one title.
 
     The label is skipped for an unidentified folder, which ARM names after the
     label itself (``DVD_VIDEO - DVD_VIDEO`` says nothing), and whenever it
     matches the folder name; those go straight to the job id.
     """
-    folder = os.path.basename(local_folder.rstrip(os.sep))
+    folder = arm_folder_name(local_folder, job)
     names = [folder]
     label = _clean(job.get("label")) if job and sub_folder != UNIDENTIFIED else None
     if label:
@@ -725,7 +768,7 @@ def resolve_remote_name(cfg, sub_folder, local_folder, job, dry_run=False, stats
     if remote_name is None or dry_run or job is None:
         return remote_name
     if not save_destination_state(cfg, job, source, remote_name):
-        if remote_name != os.path.basename(local_folder.rstrip(os.sep)):
+        if remote_name != arm_folder_name(local_folder, job):
             log.error("not shipping %s as %s without a record of that name; leaving it for the next run",
                       local_folder, remote_name)
             return None
@@ -785,7 +828,7 @@ def ship_folder(cfg, sub_folder, local_folder, dry_run=False, verbose=False, job
     remote_name = resolve_remote_name(cfg, sub_folder, local_folder, job, dry_run, stats)
     if remote_name is None:
         return False
-    renamed = remote_name != os.path.basename(local_folder.rstrip(os.sep))
+    renamed = remote_name != arm_folder_name(local_folder, job)
     if renamed:
         log.warning("shipping %s as %s instead", local_folder, remote_name)
     pending = None
@@ -954,8 +997,9 @@ def catalog_record(cfg, sub_folder, local_folder, job, remote_name=None):
 
     Reads the Matroska header of every media file in the folder, so it must run
     before rsync starts removing them.  ``remote_name`` is the folder on the
-    media box that receives the files (the job folder's own name unless that
-    was taken); ``library``, ``destination`` and the file paths name it.
+    media box that receives the files (:func:`arm_folder_name` unless that
+    was taken); ``library``, ``destination`` and the file paths name it, and
+    ``source`` the local folder.
     Returns ``(file name, TOML text)`` (the name ends in ``.toml``), or None
     when the folder holds no media file (nothing for a catalog to register).
     """
@@ -964,7 +1008,7 @@ def catalog_record(cfg, sub_folder, local_folder, job, remote_name=None):
         log.warning("no media file in %s; no catalog record written", local_folder)
         return None
     folder = os.path.basename(local_folder.rstrip(os.sep))
-    remote_name = remote_name or folder
+    remote_name = remote_name or arm_folder_name(local_folder, job)
     library = library_path(sub_folder, remote_name)
     # ARM names the main feature after its own folder, whatever the destination is called; a further
     # film's after the film, even in a folder that carries a _<stage> suffix.
@@ -1175,7 +1219,7 @@ def prepare_record(cfg, sub_folder, local_folder, job, remote_name=None, dry_run
     existing = pending_record_path(cfg, job, library_path(sub_folder, local_folder))
     if existing:
         log.info("reusing catalog record %s from an earlier, unfinished transfer", existing)
-        remote_name = remote_name or os.path.basename(local_folder.rstrip(os.sep))
+        remote_name = remote_name or arm_folder_name(local_folder, job)
         if read_record_key(existing, "library") != library_path(sub_folder, remote_name):
             if dry_run:
                 log.info("dry run: would point catalog record %s at %s", existing, remote_name)
