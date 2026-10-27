@@ -1,5 +1,5 @@
 {# Link from the title forms to the bonus disc page, for a disc that is the extras of a film ripped earlier. Expects `job`. #}
-{% if job and not job.finished %}
+{% if job and job.status and not job.finished %}
 <div class="container mb-3">
     <div class="row justify-content-center">
         <div class="col-auto text-center">

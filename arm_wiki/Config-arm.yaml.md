@@ -19,7 +19,7 @@ They include
   - The ARM web-server ip and port
   - Emby notification/server details (allowing emby refresh after rips)
   - Notification settings (Pushbullet, IFTTT, Pushover)
-  - Disc camera settings (webcam photo of each disc, OCR fallback for titles) - see [Disc Camera](Disc-Camera)
+  - Disc camera settings (webcam photo of each disc, vision model and OCR fallbacks for titles: `DISC_PHOTO_VISION_URL`, `DISC_PHOTO_VISION_MODEL`, `DISC_PHOTO_VISION_TIMEOUT`, `DISC_PHOTO_OCR`) - see [Disc Camera](Disc-Camera)
   - Barcode scanner settings (scan the case, look the UPC up when identification fails) - see [Barcode Scanner](Barcode-Scanner)
   - Sleeve label settings (print a label per disc on a P-touch, track boxes) - see [Sleeve Labels](Sleeve-Labels)
   - The minimum title length for a disc marked as a bonus disc (`BONUS_MINLENGTH`) - see [Bonus Discs](Bonus-Discs)

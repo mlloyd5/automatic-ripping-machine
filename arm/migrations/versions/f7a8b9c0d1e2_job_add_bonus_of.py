@@ -1,7 +1,7 @@
 """Add bonus_of_job_id and bonus_of_film_id to the job table
 
 Revision ID: f7a8b9c0d1e2
-Revises: e5f6a7b8c9d0
+Revises: f6a7b8c9d0e1
 Create Date: 2026-10-26
 
 """
@@ -11,7 +11,7 @@ import sqlalchemy as sa
 
 # revision identifiers, used by Alembic.
 revision = 'f7a8b9c0d1e2'
-down_revision = 'e5f6a7b8c9d0'
+down_revision = 'f6a7b8c9d0e1'
 branch_labels = None
 depends_on = None
 

@@ -17,7 +17,8 @@ for you to rename by hand, at lower priority and with a bandwidth cap.
    is under `arm_completed_path` (ARM's own `COMPLETED_PATH`) and whose
    `status` is `success`, translated to the same folder under `completed_path`.  A folder is only
    eligible if no other job (for example a re-rip of the same disc) is still
-   unfinished on that same path.  Logs are never tailed.
+   unfinished on that same path.  Logs are never tailed.  A double feature's
+   further films count too (see **Double features** below).
 2. Ships every eligible folder in `movies/`, then `tv/`, with
    `rsync -a -s --partial-dir=.rsync-partial --remove-source-files`.  First,
    though, two rsync dry runs ask the media box whether the destination folder
@@ -46,6 +47,52 @@ has transferred it, and the next timer run simply resumes.  Running it twice in 
 
 Folders whose job is still `active`, `ripping`, `transcoding`, `waiting` or
 `fail`, and folders ARM knows nothing about, are never touched.
+
+### Double features
+
+A disc that carries several films (the fork's double-feature support) is one
+ARM job: the first film goes into `job.path` as usual, and every further film
+into its own `movies/<Title (Year)>` folder beside it, listed in the fork's
+`film` table.  The shipper reads that table too (a stock ARM database has
+none, and nothing changes there) and treats each film that ARM filed (its
+`track_number` is set) as a folder of its own: it ships once its job is
+`success`, waits while the job (or any other job on that same path) is
+unfinished, and gets its own destination name, `job<id>-film<position>.destination`
+state file and catalog record.  A film ARM could not match to a ripped title
+has no `track_number` and no folder, so a folder of that name is left alone.
+
+When `movies/<Title (Year)>` already existed, ARM files the film in
+`<Title (Year)>_<job.stage>` instead, with `job.stage` as it was at that
+moment: the job's start stamp, `time() * 100`.  The shipper ships that
+suffixed folder under the plain `<Title (Year)>` name, since the suffix only
+avoided a clash in completed (and steps aside to `<Title (Year)> - <label>` as
+usual if the media box already has that name); the catalog record's `library`
+and `destination` name the plain folder, its `source` the suffixed one.  The
+plain folder that was already there is someone else's: the shipper claims a
+plain film folder for a job only if the folder last changed while that job ran,
+after its start and no later than 15 minutes after its `stop_time`.  So it
+never takes over that older folder, even once the suffixed one has shipped, and
+an earlier rip of the same disc (the DVD before the Blu-ray, a redone rip) does
+not claim the new rip's folder.  A job with no `stop_time` (still running, or
+killed) keeps claiming.
+
+ARM's web UI overwrites `job.stage` with rip progress text (`Track 2/2<br>...`)
+on most jobs: anything that polls its job list, the UI included, writes it to
+the database.  The suffix is then unknown, so a suffixed folder is not found
+and stays for you to move by hand.  The plain folder is still judged by when
+the job ran, read from `job.start_time` and `job.stop_time`, which nothing
+overwrites: an older plain folder is left alone, and one ARM filed during the
+job ships as usual.  Those are ARM's local time, read in the shipper's own
+timezone, so run both in the same timezone (`TZ` in the container).  A job with neither a
+numeric stage nor a start time has none of its further films claimed, with a
+warning.
+
+A film folder that is also some job's own `job.path` (that film ripped on its
+own earlier and still in completed) ships as that job, never as the film.  A
+film folder claimed by jobs whose runs overlapped (the same double feature
+ripped on two drives at once, one job's stage overwritten) ships with none of
+them: the run logs a warning naming the folder and the jobs, and you move it
+by hand.
 
 ### Never overwriting what the media box holds
 
@@ -287,11 +334,13 @@ each, which case they live in, what is on the pool) needs to hear about every
 rip, and ARM is the one place that knows the disc label, the metadata match,
 the sleeve id and the case barcode together.  With `remote_catalog_path` set,
 each shipped `movies/` or `tv/` folder leaves one TOML record there, named
-`<rip finished>-<ripper>-job<id>.toml`:
+`<rip finished>-<ripper>-job<id>.toml` (`-job<id>-film<position>.toml` for a
+double feature's further film):
 
 ```toml
 ripper = "ts140"
 job = 12
+film = 2                             # only for a double feature's further film, its position on the disc
 shipped = "2026-10-25T14:03:11"       # when the folder's transfer finished
 type = "movie"                       # movie | series, from the folder shipped
 title = "Back to the Future"
@@ -333,7 +382,8 @@ Matroska header reader shipped next to the script (`python3 mkvheader.py
 <path>` prints the same columns as TSV), so a file that is not Matroska is
 listed by size alone.  Keys ARM did not fill (no barcode scanned, no sleeve
 label, a stock ARM database without those columns) are left out rather than
-written empty.
+written empty.  A further film's record has the film's `title`, `year` and
+metadata id and the job's disc details (label, format, sleeve, barcode).
 
 `library`, `destination` and every file `path` name the folder the files
 actually landed in: a rip that had to ship as `Movie A (2001) - MOVIE_A_BD`
@@ -478,7 +528,15 @@ delivered folder; a transfer interrupted after stepping aside finishes in the
 same folder on the next run (movies with and without records, unidentified),
 with one complete record; a kept name that has since been taken leaves the
 rip; the state file wins over a disagreeing pending record; stale state
-files are dropped; the probe command shape; and the itemized output of both
+files are dropped; the probe command shape; double features (a further
+film's folder ships for a `success` job and waits while it rips or while
+another job on that path does, a database without a `film` table, an unfiled
+film ignored, the `_<stage>` folder shipped under the plain name without taking
+over the older plain one, a progress-text stage judged by `start_time`, no
+stage or start time, a folder that is another successful job's path, a folder
+claimed by two jobs whose runs overlapped, a re-rip of the same disc shipping
+as the new job, the film's
+own record and destination state); and the itemized output of both
 rsync and openrsync (the one on macOS), which the test runs under whichever
 `rsync` is on `PATH`:
 
@@ -524,5 +582,13 @@ PATH=/opt/homebrew/bin:$PATH python3 -m unittest scripts/completed_shipper/test_
   remove `job<id>.destination` and the job's `.pending` catalog record (which
   also remembers the name) from `catalog_spool_path` to let the shipper choose
   a new name, which leaves the part already delivered where it is.
+* **A double feature's second film stays in `movies/`.**  Check its row:
+  `sqlite3 /home/arm/db/arm.db "select job_id,position,title,year,track_number from film order by job_id desc limit 5"`.
+  No `track_number` means ARM never filed it (that folder is not the film's);
+  a `<Title (Year)>_<suffix>` folder whose job's `stage` is no longer a number
+  (the web UI overwrites it on most jobs) is not found either, nor is any
+  further film of a job with neither a numeric `stage` nor a `start_time`
+  (the run logs a warning).  Move such a folder by hand, under the plain
+  `<Title (Year)>` name.
 * **Permissions on the media box.**  Use `rsync_extra_args = --chmod=D775,F664`
   (and `--chown=` if the ssh user may chown) so the Plex user can read the files.

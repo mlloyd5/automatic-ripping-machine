@@ -7,6 +7,7 @@ import shutil
 import logging
 from importlib.util import find_spec
 from pathlib import Path
+from types import SimpleNamespace
 
 # If the arm module can't be found, add the folder this file is in to PYTHONPATH
 # This is a bad workaround for non-existent packaging
@@ -14,7 +15,7 @@ if find_spec("arm") is None:
     sys.path.append(str(Path(__file__).parents[2]))
 
 import arm.config.config as cfg  # noqa E402
-from arm.ripper import utils, makemkv, handbrake, ffmpeg  # noqa E402
+from arm.ripper import utils, makemkv, handbrake, ffmpeg, identify  # noqa E402
 from arm.ui import app, db, constants  # noqa E402
 from arm.models.job import JobState  # noqa E402
 
@@ -31,6 +32,9 @@ RUNTIME_TOLERANCE_MIN = 180
 BONUS_MINLENGTH_DEFAULT = 45
 # Files of a bonus disc's rip that are filed as extras
 VIDEO_EXTENSIONS = (".mkv", ".mp4", ".m4v", ".avi", ".ts", ".webm")
+# When the identified film's runtime fits none of the disc's feature-length titles, the runtimes of
+# at most this many other films with the disc's title are looked up (one provider request each).
+RUNTIME_CHECK_MAX_CANDIDATES = 6
 
 
 def rip_visual_media(have_dupes, job, logfile, protection):
@@ -92,6 +96,12 @@ def rip_visual_media(have_dupes, job, logfile, protection):
         except Exception as mkv_error:  # noqa: E722
             raise utils.RipperException("Error while running MakeMKV") from mkv_error
 
+        # The titles' lengths are known now, so the identification can be checked against them.
+        # The rip is done by now: a failed check must not fail the job.
+        try:
+            check_runtime(job)
+        except Exception as error:
+            logging.error(f"Checking the runtime of {job.title} failed: {error}", exc_info=True)
         if job.config.NOTIFY_RIP:
             utils.notify(job, constants.NOTIFY_TITLE, f"{job.title} rip complete. Starting transcode. ")
         logging.info("************* Ripping with MakeMKV completed *************")
@@ -107,37 +117,15 @@ def rip_visual_media(have_dupes, job, logfile, protection):
         utils.delete_raw_files([transcode_out_path])
         transcode_out_path = transcode_in_path
 
-    # Marked as a bonus disc in the ui since the wait: file it as one all the same
-    db.session.refresh(job)
-    if utils.is_bonus_disc(job):
-        if not bonus:
-            logging.info(f"Job was marked as the bonus disc of job {job.bonus_of_job_id} during the rip; "
-                         "filing its titles as extras")
-            # Before bonus_folder: identified as the film itself once the film had shipped, this folder
-            # has the film's own name, and bonus_folder would take it for the film's folder
-            remove_unused_final_dir(final_directory)
-            bonus_transcode_path = transcode_folder
-            bonus = True
-        # The film's folder may have shipped (or the choice changed) since the rip started
-        final_directory = bonus_folder(job)
-        utils.database_updater({'path': final_directory}, job)
-    elif bonus:
-        # Not in the film's folder, where the main feature would meet the film's own file
-        logging.warning("Job is no longer marked as a bonus disc; filing its titles the usual way")
-        bonus = False
-        final_directory = utils.check_for_dupe_folder(
-            False, os.path.join(job.config.COMPLETED_PATH, type_sub_folder, job_title), job)
-        utils.database_updater({'path': final_directory}, job)
+    # Marked (or no longer marked) as a bonus disc in the ui since the wait: file it accordingly
+    bonus, final_directory, bonus_transcode_path = recheck_bonus(
+        job, bonus, final_directory, transcode_folder, bonus_transcode_path, type_sub_folder, job_title)
 
-    # Update final path if user has set a custom/manual title
+    # Update final path if user has set a custom/manual title, or check_runtime found a better match.
+    # Not for a bonus disc: its titles go to the film's folder whatever the job is called
     logging.debug(f"Job title status: [{job.title_manual}]")
-    if job.title_manual and not bonus:
-        # Remove the old final dir
-        utils.delete_raw_files([final_directory])
-        job_title = utils.fix_job_title(job)
-        final_directory = os.path.join(job.config.COMPLETED_PATH, type_sub_folder, job_title)
-        # Update the job.path with the final directory
-        utils.database_updater({'path': final_directory}, job)
+    if not bonus:
+        final_directory = retitle_final_directory(have_dupes, job, final_directory, type_sub_folder, job_title)
 
     # Move to final folder
     move_files_post(transcode_out_path, job)
@@ -162,6 +150,81 @@ def rip_visual_media(have_dupes, job, logfile, protection):
     # report errors if any
     notify_exit(job)
     logging.info("************* ARM processing complete *************")
+
+
+def recheck_bonus(job, bonus, final_directory, transcode_folder, bonus_transcode_path, type_sub_folder,
+                  job_title):
+    """
+    Take up a bonus disc choice made, or cleared, in the ui while the disc ripped\n
+    :param bonus: whether the rip started as a bonus disc (apply_bonus_settings)
+    :param final_directory: the completed folder picked when the rip started
+    :param transcode_folder: the transcode folder the rip used
+    :param bonus_transcode_path: the transcode folder to remove once empty, or None
+    :return: (bonus, final_directory, bonus_transcode_path) to file the rip with
+    """
+    db.session.refresh(job)
+    if utils.is_bonus_disc(job):
+        if not bonus:
+            logging.info(f"Job was marked as the bonus disc of job {job.bonus_of_job_id} during the rip; "
+                         "filing its titles as extras")
+            # Before bonus_folder: identified as the film itself once the film had shipped, this folder
+            # has the film's own name, and bonus_folder would take it for the film's folder
+            remove_unused_final_dir(final_directory)
+            bonus_transcode_path = transcode_folder
+            bonus = True
+        # The film's folder may have shipped (or the choice changed) since the rip started
+        final_directory = bonus_folder(job)
+        utils.database_updater({'path': final_directory}, job)
+    elif bonus:
+        # Not in the film's folder, where the main feature would meet the film's own file
+        logging.warning("Job is no longer marked as a bonus disc; filing its titles the usual way")
+        bonus = False
+        final_directory = utils.check_for_dupe_folder(
+            False, os.path.join(job.config.COMPLETED_PATH, type_sub_folder, job_title), job)
+        utils.database_updater({'path': final_directory}, job)
+    return bonus, final_directory, bonus_transcode_path
+
+
+def retitle_final_directory(have_dupes, job, final_directory, type_sub_folder, job_title):
+    """
+    Give the completed folder the job's title when it changed during the rip: a title set by hand
+    in the meantime, or another film taken by check_runtime. The new folder goes through the same
+    duplicate check as the first one, so a film ripped before keeps its folder (RED (2010) is
+    already there when a disc first taken for Red (2017) turns out to be RED); the first folder,
+    which holds no more than the disc's poster at this point, is removed whatever DELRAWFILES says\n
+    :param have_dupes: Does this disc already exist in the database
+    :param final_directory: the completed folder made for the title the rip started with
+    :param job_title: that title (utils.fix_job_title at the start of the rip)
+    :return: the completed folder to file the rip in
+    """
+    new_title = utils.fix_job_title(job)
+    if new_title == job_title:
+        return final_directory
+    logging.info(f"Job title changed from {job_title} to {new_title}; renaming the completed folder")
+    new_directory = utils.check_for_dupe_folder(
+        have_dupes, os.path.join(job.config.COMPLETED_PATH, type_sub_folder, new_title), job)
+    remove_superseded_folder(final_directory, new_directory)
+    utils.database_updater({'path': new_directory}, job)
+    return new_directory
+
+
+def remove_superseded_folder(old_directory, new_directory):
+    """
+    Remove the completed folder a job no longer uses, moving the disc's poster (save_disc_poster)
+    to the new one first. A folder holding anything else is left alone with a warning\n
+    :param old_directory: the folder to remove
+    :param new_directory: the job's folder now
+    """
+    poster = os.path.join(old_directory, "poster.png")
+    try:
+        if os.path.isfile(poster) and not os.path.exists(os.path.join(new_directory, "poster.png")):
+            shutil.move(poster, os.path.join(new_directory, "poster.png"))
+        os.rmdir(old_directory)
+        logging.info(f"Removed the superseded folder {old_directory}")
+    except FileNotFoundError:
+        pass
+    except OSError as error:
+        logging.warning(f"Left the superseded folder {old_directory} in place: {error}")
 
 
 def start_transcode(job, logfile, raw_in_path, transcode_out_path, protection):
@@ -467,6 +530,134 @@ def match_tracks_to_films(tracks, films):
         logging.info(f"Title {track.track_number} ({track.filename}, {track.length}s) is {film.folder_name}: "
                      f"{difference}s off its {film.runtime}s runtime{pal}")
     return matched
+
+
+def feature_length_titles(job):
+    """
+    The disc's titles that are long enough to be the film: within MAIN_FEATURE_MIN_FRACTION of the
+    longest, so a theatrical and an extended cut both count but the extras do not\n
+    :return: list of tracks
+    """
+    tracks = [track for track in job.tracks if int(track.length or 0) > 0]
+    if not tracks:
+        return []
+    longest = max(int(track.length) for track in tracks)
+    return [track for track in tracks if int(track.length) >= longest * MAIN_FEATURE_MIN_FRACTION]
+
+
+def runtime_fit(runtime, tracks):
+    """
+    How close the nearest of these titles comes to a film's runtime as the disc plays it (see
+    expected_length), when it is within the tolerance match_tracks_to_films uses\n
+    :param runtime: the film's runtime in seconds
+    :return: the difference in seconds, or None when no title fits
+    """
+    best = None
+    for track in tracks:
+        expected = expected_length(SimpleNamespace(runtime=runtime), track)
+        tolerance = max(RUNTIME_TOLERANCE_MIN, expected * RUNTIME_TOLERANCE_FRACTION)
+        difference = abs(int(track.length) - expected)
+        if difference <= tolerance and (best is None or difference < best):
+            best = difference
+    return best
+
+
+def check_runtime(job):
+    """
+    Check the film the disc was identified as against the disc: its runtime has to fit one of the
+    feature-length titles. The year of a Blu-ray is when the release was authored, so a search can
+    find the wrong film of that title: RED in 2017 is a 15 minute short, not RED (2010), whose 111
+    minutes the disc's main title runs. When the runtime does not fit, the other films with the
+    disc's title are tried (identify.runtime_candidates) and the one whose runtime fits best is
+    taken; when none fits, the title is kept and the user is told it may be wrong.
+
+    A runtime more than RUNTIME_TOLERANCE_MIN off but within the tolerance only loosely fits: RED 2
+    (116 min) once became "High & Low The Red Rain" (110 min), which is 6 minutes short of the disc
+    and inside the 6%. Then the other films are tried too, and one is only taken when it fits
+    closely (within RUNTIME_TOLERANCE_MIN); otherwise the identification stands without a word.
+    A film the provider has no runtime for is treated the same way: a typical wrong pick is a
+    little-known film nobody entered a runtime for, but a right one without a runtime must not give
+    way to a film that only loosely fits. When the runtime could not be looked up at all (network
+    error, rate limit), the identification is left alone.
+
+    When another film is taken, the user is notified. Left alone: titles set by hand, series,
+    double features (file_collection matches those by runtime), and rips without title lengths:
+    only the mkv rip method lists the titles (makemkv.get_track_info); a Blu-ray ripped with
+    RIPMETHOD backup is not checked, which is logged as a warning\n
+    :return: True when the job was given another film
+    """
+    if (not job.config.GET_VIDEO_TITLE or job.title_manual or job.video_type != "movie"
+            or not job.imdb_id or collection_films(job)):
+        return False
+    tracks = feature_length_titles(job)
+    if not tracks:
+        logging.warning(f"MakeMKV listed no title lengths for {job.title} ({job.year}), as with RIPMETHOD backup; "
+                        "the identification is not checked against the disc's runtime")
+        return False
+    try:
+        runtime = identify.identified_runtime(job)
+    except identify.RuntimeLookupError as error:
+        logging.warning(f"Could not look up the runtime of {job.title} ({job.year}): {error}; not checked")
+        return False
+    main_title = max(int(track.length) for track in tracks)
+    current = runtime_fit(runtime, tracks) if runtime else None
+    if current is not None and current <= RUNTIME_TOLERANCE_MIN:
+        logging.info(f"{job.title} ({job.year}) runs {runtime // 60} min, which fits the disc "
+                     f"(main title {main_title // 60} min)")
+        return False
+    if not runtime:
+        logging.info(f"No runtime known for {job.title} ({job.year}); looking for a film of that title "
+                     f"that runs as long as the disc's main title ({main_title // 60} min)")
+        limit = RUNTIME_TOLERANCE_MIN
+    elif current is None:
+        logging.warning(f"{job.title} ({job.year}) runs {runtime // 60} min but the disc's main title runs "
+                        f"{main_title // 60} min; looking for a film of that title that fits")
+        limit = None
+    else:
+        logging.info(f"{job.title} ({job.year}) runs {runtime // 60} min, {current}s off the disc's titles; "
+                     "looking for a film of that title that fits better")
+        limit = min(current, RUNTIME_TOLERANCE_MIN)
+    best = best_runtime_candidate(job, tracks, limit)
+    if best is None:
+        if runtime and current is None:
+            utils.notify(job, constants.NOTIFY_TITLE,
+                         f"{job.title} ({job.year}) runs {runtime // 60} min, but the disc's main title runs "
+                         f"{main_title // 60} min. The title may be wrong; check the completed folder.")
+        return False
+    identified = f"{job.title} ({job.year})"
+    # A re-rip has the earlier job's title and year but not its IMDb id: then only the id changes
+    renamed = f"{utils.clean_for_filename(best['Title'])} ({best['Year']})" != identified
+    logging.info(f"Identifying the disc as {best['Title']} ({best['Year']}) instead of {identified}")
+    identify.apply_search_result(job, best)
+    if renamed:
+        utils.notify(job, constants.NOTIFY_TITLE,
+                     f"Identified as {best['Title']} ({best['Year']}) instead of {identified} by runtime")
+    return True
+
+
+def best_runtime_candidate(job, tracks, limit=None):
+    """
+    The film with the disc's title whose runtime fits the feature-length titles best (the most
+    voted for of equally close ones), of at most RUNTIME_CHECK_MAX_CANDIDATES
+    (identify.runtime_candidates)\n
+    :param tracks: the feature-length titles
+    :param limit: when given, a film has to come within this many seconds of a title to count
+    :return: a search result in OMDB style, or None when none fits
+    """
+    fits = []
+    for candidate in identify.runtime_candidates(job)[:RUNTIME_CHECK_MAX_CANDIDATES]:
+        candidate_runtime = identify.film_runtime(candidate)
+        difference = runtime_fit(candidate_runtime, tracks) if candidate_runtime else None
+        if limit is not None and difference is not None and difference > limit:
+            difference = None
+        logging.info(f"  {candidate['Title']} ({candidate['Year']}): "
+                     f"{candidate_runtime // 60 if candidate_runtime else 'unknown'} min"
+                     f"{'' if difference is None else ', fits'}")
+        if difference is not None:
+            fits.append((difference, -identify.vote_count(candidate), candidate))
+    if not fits:
+        return None
+    return min(fits, key=lambda fit: fit[:2])[2]
 
 
 def file_film(out_path, filename, film, job):
