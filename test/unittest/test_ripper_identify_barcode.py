@@ -90,6 +90,21 @@ TOON_TIME = {"title": "Toon Time", "subtitle": "Ultimate Cartoon Collection", "y
              "studio": "Echo Bridge Home Entertainment", "disc_number": None, "catalog_number": "73619",
              "format": "DVD", "other_text": None, "confidence": 0.95, "rotation": 0}
 
+# Job 37 on the ts140: barcode 013131210392 is "Thomas the Tank Engine and Friends - Best of James [DVD]",
+# TMDB words the brand "Thomas & Friends", and the query "Best of James" is led by a wrestling compilation.
+BEST_OF_JAMES = [_result("The Best of Mickie James", "2020", 1),
+                 _result("Thomas & Friends: The Best of James", "2012", 0),
+                 _result("Thomas & Friends: Best of James", "2002", 3),
+                 _result("James Last: Best of the 70's", "1998", 2)]
+THOMAS_PRODUCT = {"title": "Thomas the Tank Engine and Friends - Best of James", "year": None,
+                  "raw": "Thomas the Tank Engine and Friends - Best of James [DVD]"}
+
+
+def disc_photo_candidates(raw):
+    """What lookup_upc gives for a product with this title: the title cleaned as upcitemdb's would be."""
+    return identify.disc_photo.parse_upc_response({"code": "OK", "items": [
+        {"title": raw, "category": "Media > Movies & TV > DVDs"}]})
+
 
 @unittest.skipIf(IMPORT_ERROR is not None, f"ARM could not be imported here: {IMPORT_ERROR}")
 class TestBestSearchResult(unittest.TestCase):
@@ -181,7 +196,7 @@ class TestMetadataSelectorYear(unittest.TestCase):
     def _select(self, pages, title, year, search_loop=False):
         job = _job(title=title, year=year)
 
-        def search(query, search_year=None):
+        def search(query, search_year=None, **_options):
             return {"Search": pages[search_year]} if pages.get(search_year) else None
 
         with mock.patch.object(identify.ui_utils, "tmdb_search", side_effect=search) as tmdb, \
@@ -969,6 +984,145 @@ class TestIdentifyFromBarcode(unittest.TestCase):
         search.assert_called_once_with("WALL-E", None)
         self.assertEqual((job.title, job.year, job.hasnicetitle), ("not identified", "", False))
         self.assertEqual(job.disc_barcode_title, "WALL-E (DVD) Disney Adventure  Animated")
+
+    def test_video_brand_worded_differently_online_is_found_by_subtitle(self):
+        """No title is exactly the product title: the subtitle's result that names the brand is taken."""
+        asked = []
+
+        def fake_search(title, year=None):
+            asked.append((title, year))
+            return {"Search": BEST_OF_JAMES} if title == "Best of James" else {"Search": []}
+
+        job = _job(disc_barcode="013131210392", label="The_Best_of_James")
+        with mock.patch.object(identify.disc_photo, "lookup_upc", return_value=[THOMAS_PRODUCT]), \
+                mock.patch.object(identify, "_provider_search", side_effect=fake_search), \
+                self.assertLogs(level="INFO") as logs:
+            self.assertTrue(identify.identify_from_barcode(job))
+        self.assertEqual(asked, [("Thomas the Tank Engine and Friends - Best of James", None), ("Best of James", None)])
+        self.assertEqual((job.title, job.year, job.imdb_id, job.hasnicetitle),
+                         ("Thomas-and-Friends--Best-of-James", "2002", BEST_OF_JAMES[2]["imdbID"], True))
+        self.assertEqual(job.disc_barcode_title, THOMAS_PRODUCT["raw"])
+        self.assertEqual([line for line in logs.output if "subtitle 'Best of James'" in line and "'Thomas'" in line
+                          and "(2002)" in line], logs.output[-1:])
+
+    def test_video_subtitle_result_without_the_brand_is_not_taken(self):
+        """"Best of James" alone is not the disc: without the brand word the barcode must not guess."""
+        no_brand = [r for r in BEST_OF_JAMES if "Thomas" not in r["Title"]] + [_result("The Best of James", "2012", 5)]
+        job = _job(disc_barcode="013131210392", label="The_Best_of_James")
+        with mock.patch.object(identify.disc_photo, "lookup_upc", return_value=[THOMAS_PRODUCT]), \
+                mock.patch.object(identify, "_provider_search", return_value={"Search": no_brand}) as search:
+            self.assertFalse(identify.identify_from_barcode(job))
+        self.assertEqual([c.args[0] for c in search.call_args_list],
+                         ["Thomas the Tank Engine and Friends - Best of James", "Best of James"])
+        self.assertEqual((job.title, job.year, job.hasnicetitle), ("not identified", "", False))
+
+    def test_video_product_title_without_a_separator_is_searched_once(self):
+        candidates = [{"title": "Obscure Film", "year": None, "raw": "Obscure Film (DVD)"}]
+        job = _job()
+        with mock.patch.object(identify.disc_photo, "lookup_upc", return_value=candidates), \
+                mock.patch.object(identify, "_provider_search", return_value={"Search": WALL_E_HYPHEN}) as search:
+            self.assertFalse(identify.identify_from_barcode(job))
+        search.assert_called_once_with("Obscure Film", None)
+        self.assertEqual(job.title, "not identified")
+
+    def test_search_film_by_subtitle(self):
+        with mock.patch.object(identify, "_provider_search", return_value={"Search": BEST_OF_JAMES}):
+            best = identify.search_film_by_subtitle("Thomas the Tank Engine and Friends - Best of James")
+            self.assertEqual((best["Title"], best["Year"]), ("Thomas & Friends: Best of James", "2002"))
+            # a known year narrows the qualifying results before the vote count decides
+            best = identify.search_film_by_subtitle("Thomas & Friends: Best of James", "2012")
+            self.assertEqual(best["Year"], "2012")
+            self.assertIsNone(identify.search_film_by_subtitle("Best of James"))
+            self.assertIsNone(identify.search_film_by_subtitle("The - Best of James"))
+        self.assertEqual(identify.split_brand_subtitle("The Simpsons: Season 1"), ("Simpsons", "Season 1"))
+        self.assertEqual(identify.split_brand_subtitle("Thomas & Friends - Best of James"), ("Thomas", "Best of James"))
+        self.assertIsNone(identify.split_brand_subtitle("Blade Runner 2049"))
+        self.assertIsNone(identify.split_brand_subtitle("Mission:Impossible"))  # no space after the colon
+        self.assertIsNone(identify.split_brand_subtitle(None))
+
+    def test_subtitle_match_needs_whole_words(self):
+        """A two letter brand ("Ed") inside "Remastered", or the subtitle "Ice" ending "Justice", is no match."""
+        remastered = [_result("The Remastered Christmas Special", "2010", 50)]
+        with mock.patch.object(identify, "_provider_search", return_value={"Search": remastered}):
+            self.assertIsNone(identify.search_film_by_subtitle("Ed, Edd n Eddy - Christmas Special"))
+        with mock.patch.object(identify, "_provider_search",
+                               return_value={"Search": remastered + [_result("Ed, Edd n Eddy: Christmas Special",
+                                                                             "2005", 1)]}):
+            self.assertEqual(identify.search_film_by_subtitle("Ed, Edd n Eddy - Christmas Special")["Year"], "2005")
+        justice = [_result("Batman and the Fight for Justice", "2015", 40)]
+        with mock.patch.object(identify, "_provider_search", return_value={"Search": justice}):
+            self.assertIsNone(identify.search_film_by_subtitle("Batman - Ice"))
+        with mock.patch.object(identify, "_provider_search",
+                               return_value={"Search": justice + [_result("Batman: Ice", "2016", 2)]}):
+            self.assertEqual(identify.search_film_by_subtitle("Batman - Ice")["Title"], "Batman: Ice")
+
+    def test_accented_titles_online_match_the_folded_product_title(self):
+        """clean_upc_title folds "Pokémon" to "Pokemon": both the exact and the subtitle search must too."""
+        pokemon = [_result("The First Movie", "2009", 20), _result("Pok\u00e9mon: The First Movie", "1998", 900)]
+        self.assertEqual(identify.best_search_result(pokemon, "Pokemon: The First Movie", exact_only=True)["Year"],
+                         "1998")
+        with mock.patch.object(identify, "_provider_search", return_value={"Search": pokemon}):
+            self.assertEqual(identify.search_film_by_subtitle("Pokemon - The First Movie")["Year"], "1998")
+        self.assertEqual(identify.split_brand_subtitle("Pok\u00e9mon - The First Movie"),
+                         ("Pokemon", "The First Movie"))
+        candidates = disc_photo_candidates("Pok\u00e9mon: The First Movie (DVD, 1999)")
+        job = _job()
+        with mock.patch.object(identify.disc_photo, "lookup_upc", return_value=candidates), \
+                mock.patch.object(identify, "_provider_search", return_value={"Search": pokemon}) as search:
+            self.assertTrue(identify.identify_from_barcode(job))
+        search.assert_called_once_with("Pokemon: The First Movie", "1999")
+        self.assertEqual((job.year, job.imdb_id), ("1998", pokemon[1]["imdbID"]))
+
+    def test_video_en_dash_product_title_is_found_by_subtitle(self):
+        """upcitemdb writes "Thomas the Tank Engine and Friends \u2013 Best of James": the dash still splits."""
+        raw = "Thomas the Tank Engine and Friends \u2013 Best of James [DVD]"
+        asked = []
+
+        def fake_search(title, year=None):
+            asked.append((title, year))
+            return {"Search": BEST_OF_JAMES} if title == "Best of James" else {"Search": []}
+
+        job = _job(disc_barcode="013131210392", label="The_Best_of_James")
+        with mock.patch.object(identify.disc_photo, "lookup_upc", return_value=disc_photo_candidates(raw)), \
+                mock.patch.object(identify, "_provider_search", side_effect=fake_search):
+            self.assertTrue(identify.identify_from_barcode(job))
+        self.assertEqual(asked, [("Thomas the Tank Engine and Friends - Best of James", None), ("Best of James", None)])
+        self.assertEqual((job.year, job.imdb_id), ("2002", BEST_OF_JAMES[2]["imdbID"]))
+        self.assertEqual(job.disc_barcode_title, raw)
+
+    def test_video_subtitle_search_tries_the_year_before(self):
+        """A 2003 disc of a 2002 film: the subtitle search finds it on its second query, with the year before."""
+        asked = []
+
+        def fake_search(title, year=None):
+            asked.append((title, year))
+            return {"Search": BEST_OF_JAMES} if (title, year) == ("Best of James", "2002") else {"Search": []}
+
+        job = _job(disc_barcode="013131210392")
+        with mock.patch.object(identify.disc_photo, "lookup_upc", return_value=[dict(THOMAS_PRODUCT, year="2003")]), \
+                mock.patch.object(identify, "_provider_search", side_effect=fake_search):
+            self.assertTrue(identify.identify_from_barcode(job))
+        full = THOMAS_PRODUCT["title"]
+        self.assertEqual(asked, [(full, "2003"), (full, "2002"), (full, None),
+                                 ("Best of James", "2003"), ("Best of James", "2002")])
+        self.assertEqual((job.year, job.imdb_id), ("2002", BEST_OF_JAMES[2]["imdbID"]))
+
+    def test_video_subtitle_search_failure_moves_on_to_the_next_query(self):
+        """A provider error on one subtitle query is that query's miss, not the end of the barcode path."""
+        asked = []
+
+        def fake_search(title, year=None):
+            asked.append((title, year))
+            if (title, year) == ("Best of James", "2002"):
+                raise RuntimeError("tmdb timed out")
+            return {"Search": BEST_OF_JAMES} if (title, year) == ("Best of James", None) else {"Search": []}
+
+        job = _job(disc_barcode="013131210392")
+        with mock.patch.object(identify.disc_photo, "lookup_upc", return_value=[dict(THOMAS_PRODUCT, year="2002")]), \
+                mock.patch.object(identify, "_provider_search", side_effect=fake_search):
+            self.assertTrue(identify.identify_from_barcode(job))
+        self.assertEqual(asked[-3:], [("Best of James", "2002"), ("Best of James", "2001"), ("Best of James", None)])
+        self.assertEqual((job.year, job.imdb_id), ("2002", BEST_OF_JAMES[2]["imdbID"]))
 
     def test_video_no_online_match_keeps_product_title(self):
         candidates = [{"title": "Obscure Film", "year": None, "raw": "Obscure Film (DVD)"}]
