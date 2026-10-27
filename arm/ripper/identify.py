@@ -465,7 +465,8 @@ def metadata_selector(job, title=None, year=None):
     search_results = None
     if cfg.arm_config['METADATA_PROVIDER'].lower() == "tmdb":
         logging.debug("provider tmdb")
-        search_results = ui_utils.tmdb_search(title, year)
+        # An unreachable TMDB raises, ending identify_loop's fallback searches at the first one
+        search_results = ui_utils.tmdb_search(title, year, raise_unreachable=True)
         if search_results is not None:
             update_job(job, search_results, title, year)
     elif cfg.arm_config['METADATA_PROVIDER'].lower() == "omdb":
