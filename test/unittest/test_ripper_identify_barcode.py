@@ -628,6 +628,29 @@ class TestIdentifyEndToEnd(unittest.TestCase):
             identify.identify(job)
         self.assertEqual((job.title, job.year, job.year_auto), ("Toon-Time--Ultimate-Cartoon-Collection", "", ""))
 
+    def test_bluray_without_bdmt_eng_xml_is_named_after_the_disc_label_read(self):
+        """No bdmt_eng.xml at all: identify_bluray title-cases the label ("Cartoons D3"), which the read replaces."""
+        job = self._job("bluray")
+        with self._vision(TOON_TIME):
+            identify.identify(job)
+        self.assertEqual(self.searched[:2], [("59 Cartoon Classics", None), "vision"])
+        self.assertEqual((job.title, job.title_auto, job.year, job.year_auto, job.hasnicetitle),
+                         ("Toon-Time--Ultimate-Cartoon-Collection", "Toon-Time--Ultimate-Cartoon-Collection",
+                          "2011", "2011", False))
+        self.searched.clear()
+        job = self._job("bluray")
+        with self._vision(dict(TOON_TIME, year=None)):
+            identify.identify(job)
+        self.assertEqual((job.title, job.year, job.year_auto), ("Toon-Time--Ultimate-Cartoon-Collection", "", ""))
+
+    def test_disc_label_read_replaces_every_label_title_and_the_files_year(self):
+        """title_from_disc_photo, like title_from_barcode_product, knows identify_bluray's spellings of the label."""
+        for label_title in ("CARTOONS_D3", "Cartoons D3", identify.utils.clean_for_filename("CARTOONS_D3")):
+            job = _job(label="CARTOONS_D3", title=label_title, year="2026", year_auto="2026",
+                       disc_photo_vision=json.dumps(dict(TOON_TIME, year=None)))
+            self.assertTrue(identify.title_from_disc_photo(job), label_title)
+            self.assertEqual((job.title, job.year, job.year_auto), ("Toon-Time--Ultimate-Cartoon-Collection", "", ""))
+
     def test_without_a_barcode_the_first_answer_ends_the_year_retries(self):
         job = self._job("bluray")
         job.disc_barcode = None
