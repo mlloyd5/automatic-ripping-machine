@@ -394,6 +394,48 @@ class TestJobProcessAlive(unittest.TestCase):
 
 
 @unittest.skipIf(IMPORT_ERROR is not None, f"ARM could not be imported here: {IMPORT_ERROR}")
+class TestFindFile(unittest.TestCase):
+    def setUp(self):
+        self.root = tempfile.mkdtemp(prefix="arm_find_file_", dir=_TMP)
+
+    def _touch(self, *parts):
+        path = os.path.join(self.root, *parts)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        Path(path).touch()
+
+    def test_finds_a_file_within_the_depth(self):
+        self._touch("VIDEO_TS", "VIDEO_TS.IFO")
+        self._touch("a", "b", "HVDVD_TS")
+        self.assertTrue(utils.find_file("VIDEO_TS.IFO", self.root))
+        self.assertTrue(utils.find_file("HVDVD_TS", self.root))
+        self.assertFalse(utils.find_file("BDMV", self.root))
+
+    def test_a_directory_of_that_name_is_not_a_file(self):
+        os.makedirs(os.path.join(self.root, "HVDVD_TS"))
+        self.assertFalse(utils.find_file("HVDVD_TS", self.root))
+
+    def test_stops_below_max_depth(self):
+        self._touch("a", "b", "c", "d", "HVDVD_TS")
+        self.assertFalse(utils.find_file("HVDVD_TS", self.root, max_depth=3))
+        self.assertTrue(utils.find_file("HVDVD_TS", self.root, max_depth=4))
+
+    def test_stops_on_a_directory_that_lists_without_end(self):
+        def endless(_path):
+            entry = mock.MagicMock()
+            entry.is_dir.return_value = False
+            entry.name = "VTS_01_1.VOB"
+            listing = mock.MagicMock()
+            listing.__enter__.return_value = (entry for _ in itertools.count())
+            return listing
+
+        with mock.patch.object(utils.os, "scandir", side_effect=endless):
+            self.assertFalse(utils.find_file("HVDVD_TS", self.root, max_entries=1000))
+
+    def test_an_unreadable_directory_is_skipped(self):
+        self.assertFalse(utils.find_file("HVDVD_TS", os.path.join(self.root, "missing")))
+
+
+@unittest.skipIf(IMPORT_ERROR is not None, f"ARM could not be imported here: {IMPORT_ERROR}")
 class TestQuietExceptions(unittest.TestCase):
     def test_hierarchy(self):
         for cls in (utils.EmptyDriveException, utils.UnlistedDriveException, utils.DuplicateRunException):
