@@ -427,16 +427,36 @@ def make_dir(path: str, exist_ok: bool = True) -> bool:
         raise RipperException(f"Could not create folder: {path}") from err
 
 
-def find_file(filename, search_path):
+def find_file(filename, search_path, max_depth=3, max_entries=20000):
     """
     Check to see if file exists by searching a directory recursively\n
+    The search is bounded: a misread UDF directory can list without end, and an unbounded
+    walk then grows until the container is out of memory.\n
     :param filename: filename to look for
     :param search_path: path to search recursively
+    :param max_depth: directory levels below search_path to descend
+    :param max_entries: directory entries to look at before giving up
     :return bool:
     """
-    for dirpath, dirnames, filenames in os.walk(search_path):
-        if filename in filenames:
-            return True
+    seen = 0
+    pending = [(search_path, 0)]
+    while pending:
+        path, depth = pending.pop()
+        try:
+            with os.scandir(path) as entries:
+                for entry in entries:
+                    seen += 1
+                    if seen > max_entries:
+                        logging.warning(f"Stopped looking for {filename} under {search_path} "
+                                        f"after {max_entries} entries")
+                        return False
+                    if entry.is_dir(follow_symlinks=False):
+                        if depth < max_depth:
+                            pending.append((entry.path, depth + 1))
+                    elif entry.name == filename:
+                        return True
+        except OSError as error:
+            logging.debug(f"Could not list {path}: {error}")
     return False
 
 
