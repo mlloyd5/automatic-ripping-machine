@@ -200,6 +200,7 @@ class Job(db.Model):
     poster_url_manual = db.Column(db.String(256))
     disc_photo = db.Column(db.String(256))  # filename inside DISC_PHOTO_PATH
     disc_photo_ocr = db.Column(db.Text)  # raw OCR text from the disc photo
+    disc_photo_vision = db.Column(db.Text)  # JSON the vision model read off the disc photo
     disc_barcode = db.Column(db.String(32))  # UPC/EAN scanned from the case before the tray closed
     disc_barcode_title = db.Column(db.String(256))  # product title the barcode looked up to
     sleeve_id = db.Column(db.String(16), index=True)  # code on the sleeve label (T6-0001...), assigned once

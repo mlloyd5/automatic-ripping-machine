@@ -440,6 +440,22 @@ DISC_PHOTO_RETENTION_DAYS: 14
 # can give a rip the wrong title, so check the title fix page when enabling it.
 DISC_PHOTO_OCR: false
 
+# Read the disc label with a vision model served by Ollama (http://host:11434) when disc
+# identification fails. The photo is sent as is and, when the answer is unsure, rotated 90 and
+# 270 degrees (labels are often sideways in the tray). The title read is searched online, exact
+# matches only, and otherwise names the unidentified disc. Blank turns the step off; with no
+# URL the tesseract OCR step above is the only fallback.
+DISC_PHOTO_VISION_URL: ""
+
+# Vision model to ask. qwen2.5vl:7b fits a 16 GB GPU and reads a 640x480 webcam frame in
+# a few seconds; pull it on the Ollama host first (ollama pull qwen2.5vl:7b).
+DISC_PHOTO_VISION_MODEL: "qwen2.5vl:7b"
+
+# Seconds to wait for one answer from the vision model (the first request after an idle
+# period also loads the model into the GPU). Connecting gives up after 5 seconds, and a
+# request that fails or times out is not retried with the photo rotated.
+DISC_PHOTO_VISION_TIMEOUT: 120
+
 # Copy the disc photo into the completed rip folder as disc.jpg, and the barcode scanned
 # from the case as disc.barcode (one line, the code), so both stay with the rip.
 DISC_PHOTO_COPY: true

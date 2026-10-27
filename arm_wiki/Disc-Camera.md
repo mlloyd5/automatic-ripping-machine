@@ -1,6 +1,6 @@
 # Disc Camera
 
-The disc camera feature points a webcam at your drive trays and photographs each disc as the tray closes. The photo is attached to the ARM job, shown in the web UI (home page cards, job detail, history and the title fix pages), copied into the finished rip folder as `disc.jpg`, and, when ARM cannot identify a disc, read with OCR to search for the title.
+The disc camera feature points a webcam at your drive trays and photographs each disc as the tray closes. The photo is attached to the ARM job, shown in the web UI (home page cards, job detail, history and the title fix pages), copied into the finished rip folder as `disc.jpg`, and, when ARM cannot identify a disc, read by a [vision model](#vision-model) (or with OCR) to search for the title.
 
 It gives you a ground-truth record of what was actually inserted, which is handy when the online lookup gets a title wrong or a disc has no usable label.
 
@@ -12,8 +12,9 @@ ARM itself only wakes up on the udev `change` event, which fires after the tray 
 2. It keeps a rolling buffer of the last few seconds of webcam frames.
 3. When a tray goes from **open** to anything else, it saves the frame from `CAMERA_LEAD_SECONDS` earlier, i.e. the disc sitting in the open tray just before it retracted, as `DISC_PHOTO_PATH/<srN>_<YYYYmmdd-HHMMSS>.jpg`.
 4. A few seconds later udev starts the ripper for that drive. The ripper looks for the newest photo of that drive taken within `DISC_PHOTO_MAX_AGE` seconds and stores its filename on the job.
-5. If identification fails, the ripper runs `tesseract` over the photo and tries the largest lines of text as title searches. The raw OCR text is kept on the job and offered on the Title Search / Custom Title pages.
-6. After the rip, the photo is copied to the completed folder as `disc.jpg`.
+5. If neither the case barcode nor the disc's own metadata (a DVD's CRC64 record, a Blu-ray's `bdmt_eng.xml` title) identified the disc and `DISC_PHOTO_VISION_URL` is set, the ripper sends the photo to a vision model and searches for the title it reads, before searching the disc's volume label (see [Vision model](#vision-model)). What the model read is kept on the job and offered on the Title Search / Custom Title pages, and names the disc when nothing online matches it.
+6. If identification still fails and `DISC_PHOTO_OCR` is on, the ripper runs `tesseract` over the photo and tries the largest lines of text as title searches, unless the vision model already read the label well enough to name the disc (at least 50% sure): then OCR is skipped, so its noisier reading cannot retitle the rip. The raw OCR text is kept on the job and offered on the same pages. When a [case barcode](Barcode-Scanner) named the product, a line only counts if a provider has a title that is exactly that line; otherwise the disc keeps the product title.
+7. After the rip, the photo is copied to the completed folder as `disc.jpg`.
 
 Photos that no job claims (empty-tray closes, ejects) are deleted after `DISC_PHOTO_RETENTION_DAYS`.
 
@@ -43,7 +44,30 @@ All settings live in `arm.yaml` under the **Disc Camera** heading. Use the **Dis
 | `DISC_PHOTO_MAX_AGE` | `180` | Seconds. A photo older than this when the job starts is not attached. |
 | `DISC_PHOTO_RETENTION_DAYS` | `14` | Unattached photos older than this are deleted. |
 | `DISC_PHOTO_OCR` | `false` | Run tesseract on the photo when identification fails. Off by default because misread label text can retitle a rip; only lines of two or more words, or six or more letters, are searched. |
+| `DISC_PHOTO_VISION_URL` | blank | Ollama server to send the photo to (`http://host:11434`) when identification fails. Blank turns the vision model off. See [Vision model](#vision-model). |
+| `DISC_PHOTO_VISION_MODEL` | `qwen2.5vl:7b` | Vision model to ask; must be pulled on the Ollama host. |
+| `DISC_PHOTO_VISION_TIMEOUT` | `120` | Seconds to wait for one answer. The first request after an idle period also loads the model into the GPU. Connecting gives up after 5 seconds. |
 | `DISC_PHOTO_COPY` | `true` | Copy the photo into the completed rip folder as `disc.jpg` (and a scanned [barcode](Barcode-Scanner) as `disc.barcode`). |
+
+## Vision model
+
+Tesseract reads next to nothing off a webcam frame of a printed disc: the text is curved, reflective and often sideways. A small multimodal model does far better. With `qwen2.5vl:7b` on one 16 GB GPU, every one of a batch of 640x480 tray photos (WALL-E, Room on the Broom, Tarzan, Thomas & Friends, Toon Time, The Peanuts Movie) was read correctly, in about six seconds each after a fifteen second first load.
+
+**What it needs.** An [Ollama](https://ollama.com) server ARM can reach over the network with a vision model pulled on it:
+
+```bash
+ollama pull qwen2.5vl:7b
+```
+
+Ollama only listens on localhost by default; set `OLLAMA_HOST=0.0.0.0` on that machine so the ARM box can reach port 11434. Nothing is installed on the ARM side: the ripper talks to Ollama's `/api/generate` endpoint over HTTP. Rotating the photo needs Pillow, which comes with the sleeve label extras (`requirements-labels.txt`, installed by the Dockerfile and the Debian installer); without it only the photo as taken is sent.
+
+**Settings.** Set `DISC_PHOTO_VISION_URL` to the server (`http://192.168.1.20:11434`) in `arm.yaml`; `DISC_PHOTO_VISION_MODEL` and `DISC_PHOTO_VISION_TIMEOUT` have working defaults. A blank URL turns the step off entirely, and then tesseract OCR (`DISC_PHOTO_OCR`) is the only fallback that reads the photo.
+
+**What happens.** The model is asked only about a video disc that nothing cheaper identified: the case [barcode](Barcode-Scanner) missed, the volume label does not name a collection of films, and the disc's own metadata has no title (a DVD the CRC64 database does not know, a Blu-ray whose `bdmt_eng.xml` is missing or unreadable and so only gives the volume label). The order is: case barcode, collection label, CRC64 record or `bdmt_eng.xml`, vision model, label search. The ripper sends the photo to the model and asks for JSON: title, subtitle, year, studio, disc number, catalogue number, format, other legible text and how sure it is of the title. Labels are often printed sideways in the tray, so when the model is less than about 90% sure, or reads a one-word title, the photo is sent again rotated 90° and 270° and the most confident answer wins. A request that fails (Ollama down, a timeout, the model not pulled) is not repeated rotated: the step gives up at once rather than holding up the rip. The title (and the title with its subtitle) is then searched online with the year read, exact matches only, like a barcode's product title: a near miss is refused and the disc goes on to the label search. Once the model has read a title it is at least half sure of, the label search is held to the same rule as after a case barcode: only a result titled exactly like the volume label is taken, so "CARTOONS_D3" cannot take a provider's first near miss over what the disc says. When nothing online matches, the title read off the disc names the unidentified rip, with the year read (or none), ahead of the barcode's product title, because the disc names itself more precisely than its case does (one case said "59 Cartoon Classics", the disc "Toon Time: Ultimate Cartoon Collection"). A read the model was less than half sure of is not used as a name, and leaves tesseract OCR (if on) to try; a read it was surer of turns OCR off for that disc.
+
+What the model read is stored on the job and shown on the Title Search and Custom Title pages as **Disc label**, with the year and how sure the model was, next to the barcode and OCR suggestions; click it to fill the title field. The title field starts out filled with the same full title (title and subtitle) the rip was named after.
+
+**Database upgrade.** This step adds a column to the job table. The migration runs when the web UI starts, so start the web UI once after upgrading before inserting a disc.
 
 ## The Disc Camera page
 
@@ -109,4 +133,5 @@ A file named `sr0_<timestamp>.jpg` should appear in `DISC_PHOTO_PATH`.
 - **Photos exist but jobs do not show them.** The photo must be of the same drive (`sr0_…` for `/dev/sr0`) and taken less than `DISC_PHOTO_MAX_AGE` seconds before the job started. Check the job log for "Attaching disc photo" or "No disc photo found".
 - **Photo is of a closed tray.** Increase `CAMERA_LEAD_SECONDS` on the Disc Camera page and use **Test capture** to check.
 - **OCR never finds anything.** Run `tesseract /home/arm/media/disc_photos/<file>.jpg stdout` by hand to see what it reads. Better lighting and a crop region help far more than a higher resolution camera.
+- **The vision model never answers.** Look in the job log for "asking vision model": a request failure names the URL and the error. Check the ARM box can reach the server (`curl http://host:11434/api/tags` lists the models pulled there; the model in `DISC_PHOTO_VISION_MODEL` must be among them) and that the first request is not timing out while the model loads (raise `DISC_PHOTO_VISION_TIMEOUT`). "could not read a title" means the model answered but not with a usable title; try the photo by hand with `ollama run qwen2.5vl:7b "What disc is this?" /path/to/photo.jpg` on the server.
 - **Job fails right after upgrading.** The database has not been migrated yet. Restart the web UI (or the container) once.

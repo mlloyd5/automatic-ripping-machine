@@ -27,6 +27,7 @@ from arm.models.notifications import Notifications
 import arm.config.config as cfg
 from arm.ui.forms import TitleSearchForm, ChangeParamsForm, TrackFormDynamic
 from arm.ripper import disc_photo
+from arm.ripper import disc_vision
 
 route_jobs = Blueprint('route_jobs', __name__,
                        template_folder='templates',
@@ -37,22 +38,32 @@ def ocr_suggestion(job):
     """
     Title and year candidates for pre-filling the title forms.
 
-    The product title the case barcode looked up to comes first (it names the exact release),
-    followed by what OCR read from the disc photo.
+    What the vision model read off the disc label comes first (the disc names its release most
+    precisely), then the product title the case barcode looked up to, then what OCR read from
+    the disc photo. Of the vision read only the full title ("Toon Time: Ultimate Cartoon
+    Collection") is a candidate: it is the name the ripper gave the disc and the one the "Disc
+    label" link offers, so the title box is pre-filled with it rather than the bare "Toon Time".
 
-    :return: dict with 'candidates' (list of str), 'year' (str or None) and 'barcode' (dict or None), or None
+    :return: dict with 'candidates' (list of str), 'year' (str or None), 'barcode' (dict or None) and
+             'vision' (dict or None), or None
     """
     if job is None:
         return None
     candidates, year, barcode = [], None, None
+    vision = disc_vision.parse_answer(getattr(job, 'disc_photo_vision', None))
+    if vision:
+        vision['titles'] = disc_vision.search_titles(vision)
+        candidates.append(vision['titles'][-1])
+        year = vision['year']
     if job.disc_barcode:
         barcode = {'code': job.disc_barcode, 'raw': job.disc_barcode_title, 'title': None}
         if job.disc_barcode_title:
             title, barcode_year = disc_photo.clean_upc_title(job.disc_barcode_title)
             if title:
                 barcode['title'] = title
-                candidates.append(title)
-                year = barcode_year
+                if title.lower() not in (x.lower() for x in candidates):
+                    candidates.append(title)
+                year = year or barcode_year
             # a double feature's product title names each film: offer them one by one too
             candidates.extend(part for part in disc_photo.split_collection_title(job.disc_barcode_title)
                               if part.lower() not in (x.lower() for x in candidates))
@@ -62,7 +73,7 @@ def ocr_suggestion(job):
         year = year or ocr_year
     if not candidates and barcode is None:
         return None
-    return {'candidates': candidates, 'year': year, 'barcode': barcode}
+    return {'candidates': candidates, 'year': year, 'barcode': barcode, 'vision': vision}
 
 
 @route_jobs.route('/discphoto')
