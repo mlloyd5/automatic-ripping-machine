@@ -498,12 +498,14 @@ def metadata_selector(job, title=None, year=None):
     return search_and_update(job, title, year)[0]
 
 
-def search_and_update(job, title=None, year=None):
+def search_and_update(job, title=None, year=None, cache=None):
     """
     :func:`metadata_selector`, also saying whether update_job refused every result the provider
     returned (only an exact match counts once a case barcode has named the product, see
     update_job). A refused response is an answer, but not one the job took.
 
+    :param cache: a dict shared by the searches of one :func:`search_with_year_retries` chain, so
+                  the yearless search below and the chain's own yearless attempt ask the provider once
     :return: ``(search results or None, refused)``
     """
     # A disc whose label could not be read is given the placeholder
@@ -516,23 +518,67 @@ def search_and_update(job, title=None, year=None):
     if title is None or str(title).strip().lower() in ("", "not identified"):
         logging.info(f"Not searching for placeholder title: {title!r}")
         return None, False
-    search_results = None
-    applied = None
-    if cfg.arm_config['METADATA_PROVIDER'].lower() == "tmdb":
-        logging.debug("provider tmdb")
-        search_results = ui_utils.tmdb_search(title, year)
-        if search_results is not None:
-            applied = update_job(job, search_results, title, year)
-    elif cfg.arm_config['METADATA_PROVIDER'].lower() == "omdb":
-        logging.debug("provider omdb")
-        search_results = ui_utils.call_omdb_api(str(title), str(year))
-        if search_results is not None:
-            applied = update_job(job, search_results, title, year)
-    else:
+    provider = cfg.arm_config['METADATA_PROVIDER'].lower()
+    if provider not in ("tmdb", "omdb"):
         logging.debug(cfg.arm_config['METADATA_PROVIDER'])
         logging.debug("unknown provider - doing nothing, saying nothing. Getting Kryten")
-    refused = applied is None and bool((search_results or {}).get('Search'))
-    return search_results, refused
+        return None, False
+    logging.debug(f"provider {provider}")
+
+    def search(search_year):
+        if cache is None:
+            return provider_search(provider, title, search_year)
+        key = (str(title), str(search_year) if search_year else None)
+        if key not in cache:
+            cache[key] = provider_search(provider, title, search_year)
+        return cache[key]
+
+    search_results = search(year)
+    # The year can be wrong. A Blu-ray's comes from the date of its bdmt_eng.xml, which is when
+    # that release was authored: 2016 for a pressing of RED 2 (2013), and TMDB filtered to 2016
+    # has no RED 2, so its first result "High & Low The Red Rain" was taken. When the year
+    # search returns films but none whose title even starts with the query, and the same search
+    # without the year finds the exact title, drop the year. A label is often the start of the
+    # title: "Stagecoach" in 2017 finds "Stagecoach: The Texas Jack Story", the film on the disc,
+    # where the yearless search would take the 1939 "Stagecoach". An empty year search is left
+    # to identify_loop, which tries the year before next.
+    if year and has_results(search_results) and not has_title_starting_with(search_results, title):
+        without_year = search(None)
+        if has_exact_match(without_year, title):
+            logging.info(f"Search for '{title}' in {year} has no exact title match; "
+                         "searching without the year found one")
+            search_results, year = without_year, None
+    applied = None
+    if search_results is not None:
+        applied = update_job(job, search_results, title, year)
+    return search_results, applied is None and has_results(search_results)
+
+
+def provider_search(provider, title, year):
+    """Search the metadata provider ("tmdb" or "omdb"); the results are in OMDB format, or None."""
+    if provider == "tmdb":
+        return ui_utils.tmdb_search(title, year)
+    return ui_utils.call_omdb_api(str(title), str(year))
+
+
+def has_results(search_results) -> bool:
+    """Whether a search returned anything at all."""
+    return bool(search_results and search_results.get('Search'))
+
+
+def has_title_starting_with(search_results, title) -> bool:
+    """Whether a search returned a result whose title starts with ``title`` (compared as in best_search_result)."""
+    wanted = _normalise_title(title)
+    return has_results(search_results) and any(
+        _normalise_title(result.get("Title") or result.get("title")).startswith(wanted)
+        for result in search_results['Search'])
+
+
+def has_exact_match(search_results, title) -> bool:
+    """Whether a search returned a result titled exactly ``title`` (see best_search_result)."""
+    if not search_results or not search_results.get('Search'):
+        return False
+    return best_search_result(search_results['Search'], title, exact_only=True) is not None
 
 
 def identify_loop(job, response, title, year):
@@ -575,23 +621,32 @@ def search_with_year_retries(job, title, year=None):
     film), then without a year, stopping at the first attempt the provider answers. An answer
     whose every result update_job refused (exact matches only once a case barcode has named the
     product) does not stop the retries: the exact title may only turn up under another year, or
-    none (a Blu-ray's metadata file gives its own date, not the film's).
+    none (a Blu-ray's metadata file gives its own date, not the film's). Two exceptions keep
+    metadata_selector's year rule: a refused year search with a title that starts with the query
+    ends the chain (the year is right and the label is the start of a longer title, so a yearless
+    exact match would be another film: "Stagecoach" 1939 for the 2016 Texas Jack Story), and no
+    search is sent twice (metadata_selector's own yearless search is the chain's last attempt).
 
     :return: the response that was taken, else the last refused one, else None (no attempt got
              an answer, so callers may shorten the title and try again)
     """
     attempts = [str(year), str(int(year) - 1)] if year and str(year).isdigit() else []
     attempts.append(None)
+    cache = {}
     refused_response = None
     for attempt in attempts:
         logging.debug(f"Trying title: {title} year: {attempt}")
-        response, refused = search_and_update(job, title, attempt)
+        response, refused = search_and_update(job, title, attempt, cache)
         logging.debug(f"response: {response}")
         if response is None:
             continue
         if not refused:
             return response
         refused_response = response
+        if attempt and has_title_starting_with(response, title):
+            logging.info(f"Search for '{title}' in {attempt} found titles that start with it but none exactly "
+                         "it; not searching other years")
+            break
     return refused_response
 
 

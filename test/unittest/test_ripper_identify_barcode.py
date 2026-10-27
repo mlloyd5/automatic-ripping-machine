@@ -162,6 +162,78 @@ class TestBestSearchResult(unittest.TestCase):
             self.assertEqual(job.title, "CARTOONS_D3")
 
 
+# What TMDB returns for the RED 2 Blu-ray's title: its bdmt_eng.xml is dated 2016, and the 2016
+# results have no RED 2 (job 4 on the t620 was filed as High & Low The Red Rain).
+RED_2_IN_2016 = [_result("Kunoichi Ninja Scroll 2 – Red Murder", "2016", 0),
+                 _result("High & Low The Red Rain", "2016", 18), _result("Red Dog: True Blue", "2016", 105)]
+RED_2_ANY_YEAR = [_result("RED 2", "2013", 4475), _result("Legally Blonde 2: Red, White & Blonde", "2003", 1826)]
+# The Trace Adkins Stagecoach Blu-ray (label "Stagecoach", bdmt_eng.xml dated 2018): TMDB has nothing
+# in 2018, the 2016 film in 2017, and the 1939 John Wayne film first without a year (job 8 on the t620).
+STAGECOACH_IN_2017 = [_result("Stagecoach: The Texas Jack Story", "2016", 40)]
+STAGECOACH_ANY_YEAR = [_result("Stagecoach", "1939", 1100), _result("Stagecoach", "1966", 60),
+                       _result("Stagecoach: The Texas Jack Story", "2016", 40)]
+
+
+@unittest.skipIf(IMPORT_ERROR is not None, f"ARM could not be imported here: {IMPORT_ERROR}")
+class TestMetadataSelectorYear(unittest.TestCase):
+    """A year that filters out the exact title is dropped."""
+
+    def _select(self, pages, title, year, search_loop=False):
+        job = _job(title=title, year=year)
+
+        def search(query, search_year=None):
+            return {"Search": pages[search_year]} if pages.get(search_year) else None
+
+        with mock.patch.object(identify.ui_utils, "tmdb_search", side_effect=search) as tmdb, \
+                mock.patch.object(identify.utils, "database_updater", side_effect=_fake_updater):
+            if search_loop:
+                identify.identify_loop(job, None, title, year)
+            else:
+                identify.metadata_selector(job, title, year)
+        return job, [call.args[1] for call in tmdb.call_args_list]
+
+    def test_label_that_starts_the_title_keeps_the_year(self):
+        pages = {"2017": STAGECOACH_IN_2017, None: STAGECOACH_ANY_YEAR}
+        job, years = self._select(pages, "Stagecoach", "2017")
+        self.assertEqual((job.title, job.year), ("Stagecoach--The-Texas-Jack-Story", "2016"))
+        self.assertEqual(years, ["2017"])
+
+    def test_empty_year_search_is_left_to_the_year_before(self):
+        pages = {"2017": STAGECOACH_IN_2017, None: STAGECOACH_ANY_YEAR}
+        job, years = self._select(pages, "Stagecoach", "2018", search_loop=True)
+        self.assertEqual((job.title, job.year), ("Stagecoach--The-Texas-Jack-Story", "2016"))
+        self.assertEqual(years, ["2018", "2017"])
+
+    def test_label_that_starts_the_title_keeps_the_year_with_a_barcode(self):
+        """Exact-only after a barcode refuses the Texas Jack Story, and must not take the 1939 film instead."""
+        pages = {"2017": STAGECOACH_IN_2017, None: STAGECOACH_ANY_YEAR}
+        job = _job(title="Stagecoach", year="2018", disc_barcode_title="Trace Adkins Stagecoach (Blu-ray)")
+
+        def search(query, search_year=None, **_options):
+            return {"Search": pages[search_year]} if pages.get(search_year) else None
+
+        with mock.patch.object(identify.ui_utils, "tmdb_search", side_effect=search) as tmdb, \
+                mock.patch.object(identify.utils, "database_updater", side_effect=_fake_updater):
+            identify.identify_loop(job, None, "Stagecoach", "2018")
+        self.assertEqual([call.args[1] for call in tmdb.call_args_list], ["2018", "2017"])
+        self.assertEqual((job.title, job.hasnicetitle), ("Stagecoach", False))
+
+    def test_wrong_year_falls_back_to_the_exact_title(self):
+        job, years = self._select({"2016": RED_2_IN_2016, None: RED_2_ANY_YEAR}, "RED+2", "2016")
+        self.assertEqual((job.title, job.year), ("RED-2", "2013"))
+        self.assertEqual(years, ["2016", None])
+
+    def test_year_with_an_exact_match_is_kept(self):
+        job, years = self._select({"1990": HOME_ALONE}, "Home+Alone", "1990")
+        self.assertEqual((job.title, job.year), ("Home-Alone", "1990"))
+        self.assertEqual(years, ["1990"])
+
+    def test_no_exact_match_either_way_keeps_the_year_search(self):
+        job, years = self._select({"2016": RED_2_IN_2016, None: RED_2_IN_2016}, "Red+Rain", "2016")
+        self.assertEqual(job.title, identify.utils.clean_for_filename(RED_2_IN_2016[0]["Title"]))
+        self.assertEqual(years, ["2016", None])
+
+
 @unittest.skipIf(IMPORT_ERROR is not None, f"ARM could not be imported here: {IMPORT_ERROR}")
 class TestBarcodeComesFirst(unittest.TestCase):
     """identify() asks the case barcode before the CRC database and the label search."""
@@ -483,7 +555,7 @@ class TestIdentifyEndToEnd(unittest.TestCase):
             mock.patch.object(identify.urllib.request, "urlopen", return_value=crc_miss),
             mock.patch.object(identify, "arm_subprocess", return_value=None),
             mock.patch.object(identify.ui_utils, "tmdb_search",
-                              side_effect=lambda title, year=None: self.searched.append((title, year))
+                              side_effect=lambda title, year=None, **_options: self.searched.append((title, year))
                               or {"Search": CARTOONS_D3}),
         ]
         for patch in self.patches:
@@ -544,14 +616,15 @@ class TestIdentifyEndToEnd(unittest.TestCase):
         identify.identify(job)
         year = self._file_year()
         self.assertEqual((job.title, job.year, job.hasnicetitle), ("Cartoon-Classics-Collection", str(year), False))
-        # every year was tried before the metadata title was kept
+        # every year was tried before the metadata title was kept, none of them twice: the yearless
+        # search metadata_selector makes after the year search is the chain's last attempt
         self.assertEqual(self.searched[1:], [("Cartoon-Classics-Collection", str(year)),
-                                             ("Cartoon-Classics-Collection", str(year - 1)),
-                                             ("Cartoon-Classics-Collection", None)])
+                                             ("Cartoon-Classics-Collection", None),
+                                             ("Cartoon-Classics-Collection", str(year - 1))])
 
     def test_bluray_metadata_title_found_without_the_files_year(self):
         """The year search finds only near misses, the exact title turns up without a year: it is taken."""
-        def tmdb(title, year=None):
+        def tmdb(title, year=None, **_options):
             self.searched.append((title, year))
             if title == "Cartoon-Classics-Collection" and year is None:
                 return {"Search": CARTOONS_D3 + [_result("Cartoon Classics Collection", "1998", 12)]}
@@ -562,9 +635,9 @@ class TestIdentifyEndToEnd(unittest.TestCase):
         with mock.patch.object(identify.ui_utils, "tmdb_search", side_effect=tmdb):
             identify.identify(job)
         year = self._file_year()
+        # metadata_selector's yearless search finds the exact title right after the year search
         self.assertEqual(self.searched, [("59 Cartoon Classics", None),
                                          ("Cartoon-Classics-Collection", str(year)),
-                                         ("Cartoon-Classics-Collection", str(year - 1)),
                                          ("Cartoon-Classics-Collection", None)])
         self.assertEqual((job.title, job.year, job.hasnicetitle), ("Cartoon-Classics-Collection", "1998", True))
 
@@ -619,12 +692,14 @@ class TestIdentifyEndToEnd(unittest.TestCase):
         job = self._job("bluray")
         with self._vision(TOON_TIME):
             identify.identify(job)
-        # then get_video_details searches the cleaned label with the metadata file's year, the year
-        # before, then no year: every page of near misses is refused once the barcode named the product
+        # then get_video_details searches the cleaned label with the metadata file's year; nothing
+        # there starts with the label, so metadata_selector's yearless search follows, then the year
+        # before (the chain's own yearless attempt reuses the first one): every page of near misses
+        # is refused once the barcode named the product
         file_year = datetime.fromtimestamp(
             os.path.getmtime(os.path.join(self.mountpoint, "BDMV", "META", "DL", "bdmt_eng.xml"))).year
         self.assertEqual(self.searched, [("59 Cartoon Classics", None), "vision", ("CARTOONS+D3", str(file_year)),
-                                         ("CARTOONS+D3", str(file_year - 1)), ("CARTOONS+D3", None)])
+                                         ("CARTOONS+D3", None), ("CARTOONS+D3", str(file_year - 1))])
         self.assertEqual((job.title, job.year, job.year_auto, job.hasnicetitle),
                          ("Toon-Time--Ultimate-Cartoon-Collection", "2011", "2011", False))
         self.searched.clear()
@@ -661,10 +736,10 @@ class TestIdentifyEndToEnd(unittest.TestCase):
         The real identify_from_photo_vision with only the model stubbed. Every search finds the
         near misses; a search for the volume label also finds ``label_search`` results.
         """
-        def tmdb(title, year=None):
+        def tmdb(title, year=None, **_options):
             self.searched.append((title, year))
             if title.replace("+", "_").upper() == "CARTOONS_D3":
-                return {"Search": CARTOONS_D3 + label_search}
+                return {"Search": label_search(year) if callable(label_search) else CARTOONS_D3 + label_search}
             return {"Search": CARTOONS_D3}
 
         cfg.arm_config["DISC_PHOTO_VISION_URL"] = "http://llm:11434"
@@ -676,7 +751,7 @@ class TestIdentifyEndToEnd(unittest.TestCase):
         job = self._job(disctype)
         job.disc_barcode = None
         job.disc_photo = "sr1_20261026-120000.jpg"
-        patches = self._read_by_vision(TOON_TIME, list(label_search))
+        patches = self._read_by_vision(TOON_TIME, label_search if callable(label_search) else list(label_search))
         for patch in patches:
             patch.start()
         try:
@@ -715,7 +790,8 @@ class TestIdentifyEndToEnd(unittest.TestCase):
         job = self._job("bluray")
         job.disc_barcode = None
         self.assertIs(identify.search_with_year_retries(job, "Cartoons+D3", "2026")["Search"], CARTOONS_D3)
-        self.assertEqual(self.searched, [("Cartoons+D3", "2026")])
+        # metadata_selector looks for the exact title without the year, finds none, keeps the year search
+        self.assertEqual(self.searched, [("Cartoons+D3", "2026"), ("Cartoons+D3", None)])
         self.assertEqual((job.title, job.hasnicetitle), ("Greatest-Cartoons-of-the-Golden-Era-Vol.-3", True))
 
 
@@ -776,21 +852,44 @@ class TestIdentifyFromPhoto(unittest.TestCase):
             self.assertTrue(identify.identify_from_photo(job))
         self.assertEqual(job.title, "Greatest-Cartoons-of-the-Golden-Era-Vol.-3")
 
-    def test_exact_match_without_the_ocr_year_still_identifies(self):
-        """The year read off the photo finds only near misses: the year before, then no year, are tried."""
+    def _ocr_with_year_hint(self, pages):
         searched = []
 
-        def tmdb(title, year=None):
+        def tmdb(title, year=None, **_options):
             searched.append((title, year))
-            return {"Search": CARTOONS_D3 + ([_result("Greatest Cartoons", "1999", 4)] if year is None else [])}
+            return {"Search": pages[year]} if pages.get(year) else None  # tmdb_search's "nothing found"
 
         job = self._job(title="59-Cartoon-Classics", disc_barcode_title="59 Cartoon Classics (DVD)")
         with mock.patch.object(identify.disc_photo, "clean_ocr_text", return_value=(["GREATEST CARTOONS"], "2003")), \
                 mock.patch.object(identify.ui_utils, "tmdb_search", side_effect=tmdb):
-            self.assertTrue(identify.identify_from_photo(job))
+            found = identify.identify_from_photo(job)
+        return found, job, searched
+
+    def test_exact_match_without_the_ocr_year_still_identifies(self):
+        """The year read off the photo finds only unrelated titles: the exact title without a year is taken."""
+        found, job, searched = self._ocr_with_year_hint({
+            "2003": [_result("Looney Tunes Golden Collection", "2003", 9)],
+            "2002": [_result("Looney Tunes Golden Collection", "2003", 9)],
+            None: CARTOONS_D3 + [_result("Greatest Cartoons", "1999", 4)]})
+        self.assertTrue(found)
+        self.assertEqual(searched, [("GREATEST CARTOONS", "2003"), ("GREATEST CARTOONS", None)])
+        self.assertEqual((job.title, job.year, job.hasnicetitle), ("Greatest-Cartoons", "1999", True))
+        # nothing in the year hint, the year before has only unrelated titles: then no year
+        found, job, searched = self._ocr_with_year_hint({
+            "2002": [_result("Looney Tunes Golden Collection", "2003", 9)],
+            None: [_result("Greatest Cartoons", "1999", 4)]})
+        self.assertTrue(found)
         self.assertEqual(searched, [("GREATEST CARTOONS", "2003"), ("GREATEST CARTOONS", "2002"),
                                     ("GREATEST CARTOONS", None)])
-        self.assertEqual((job.title, job.year, job.hasnicetitle), ("Greatest-Cartoons", "1999", True))
+        self.assertEqual((job.title, job.year), ("Greatest-Cartoons", "1999"))
+
+    def test_a_title_starting_with_the_line_keeps_the_year(self):
+        """metadata_selector's rule holds with a barcode too: a longer title in the year means no yearless guess."""
+        found, job, searched = self._ocr_with_year_hint({
+            "2003": CARTOONS_D3, None: [_result("Greatest Cartoons", "1999", 4)]})
+        self.assertFalse(found)
+        self.assertEqual(searched, [("GREATEST CARTOONS", "2003")])
+        self.assertEqual((job.title, job.hasnicetitle), ("59-Cartoon-Classics", False))
 
     def test_without_a_barcode_the_first_result_is_taken(self):
         job = self._job()
