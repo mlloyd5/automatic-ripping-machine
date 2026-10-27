@@ -7,7 +7,6 @@ Reference:
 - https://github.com/automatic-ripping-machine/automatic-ripping-machine/wiki/MakeMKV-Codes
 """
 
-import collections
 import contextlib
 import dataclasses
 import enum
@@ -48,7 +47,7 @@ DUPLICATE_DURATION_TOLERANCE = 2  # [s]
 DUPLICATE_FILESIZE_TOLERANCE = 0.02
 """Titles whose sizes differ by more than this fraction of the larger one are never treated as duplicates"""
 DISC_OPEN_ATTEMPTS = 3
-"""How often makemkvcon info is run before a disc it cannot open is given up on"""
+"""How often makemkvcon info, or a rip, is run before a disc it cannot open is given up on"""
 DISC_OPEN_RETRY_WAIT = 30  # [s]
 """Pause between those attempts"""
 MAKEMKV_INFO_LOCK = os.path.join(tempfile.gettempdir(), "arm-makemkv-info.lock")
@@ -713,7 +712,7 @@ def makemkv_backup(job, rawpath):
         rawpath,
     ]
     logging.info("Backing up disc")
-    collections.deque(run(cmd, OutputType.MSG), maxlen=0)
+    run_rip(cmd)
 
 
 def makemkv_mkv(job, rawpath):
@@ -775,7 +774,7 @@ def makemkv_mkv(job, rawpath):
             f"--minlength={job.config.MINLENGTH}",
         ]
         logging.info("Process all tracks from disc.")
-        collections.deque(run(cmd, OutputType.MSG), maxlen=0)
+        run_rip(cmd)
     else:
         if skipped:
             logging.info(f"{len(skipped)} duplicate title(s) skipped, ripping the remaining titles one at a time.")
@@ -858,7 +857,7 @@ def rip_mainfeature(job, track, rawpath):
     ]
     logging.info("Ripping main feature")
     # Possibly update db to say track was ripped
-    collections.deque(run(cmd, OutputType.MSG), maxlen=0)
+    run_rip(cmd)
 
 
 def process_single_tracks(job, rawpath, mode: str):
@@ -934,7 +933,7 @@ def process_single_tracks(job, rawpath, mode: str):
                 f.write(f"\nBINF:{int(time())},{process_index},{len(tracks_to_process)},0000")
 
         logging.debug("Starting to rip single track.")
-        collections.deque(run(cmd, OutputType.MSG), maxlen=0)
+        run_rip(cmd)
         process_index += 1
 
 
@@ -1404,6 +1403,35 @@ class MakeMKVOutputChecker:
         log_func = self.LOG_ONLY_CODES[self.data.code]
         log_func(self.data.message)
         return self.data
+
+
+def run_rip(cmd):
+    """
+    Run a makemkvcon rip (mkv or backup), trying again while MakeMKV cannot open the disc
+
+    MakeMKV sometimes fails to open a disc its info scan opened a minute earlier, seen on the t620
+    for a BD+ Blu-ray in a USB drive while another drive was busy. Nothing has been written then,
+    so the rip is started again, as get_track_info does for the scan. A rip that fails after the
+    disc opened is not retried: MakeMKV cannot resume it.
+
+    Parameters:
+        cmd (list): makemkvcon cli options
+    Raises:
+        MakeMkvRuntimeError when makemkvcon fails for another reason or after the last attempt
+    """
+    for attempt in range(1, DISC_OPEN_ATTEMPTS + 1):
+        open_failed = False
+        try:
+            for message in run(cmd, OutputType.MSG):
+                if isinstance(message, MakeMKVMessage) and message.code == MessageID.RIP_DISC_OPEN_ERROR:
+                    open_failed = True
+            return
+        except MakeMkvRuntimeError:
+            if not open_failed or attempt == DISC_OPEN_ATTEMPTS:
+                raise
+        logging.warning(f"MakeMKV could not open the disc to rip it (attempt {attempt} of {DISC_OPEN_ATTEMPTS}); "
+                        f"trying again in {DISC_OPEN_RETRY_WAIT}s")
+        sleep(DISC_OPEN_RETRY_WAIT)
 
 
 def run(options, select):

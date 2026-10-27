@@ -316,6 +316,57 @@ class TestGetTrackInfoRetry(unittest.TestCase):
 
 
 @unittest.skipIf(IMPORT_ERROR is not None, f"ARM could not be imported here: {IMPORT_ERROR}")
+class TestRipRetry(unittest.TestCase):
+    """A rip MakeMKV fails to open the disc for is started again (Spiral in sr1 on the t620)."""
+
+    OPEN_FAILED = ['MSG:5010,0,0,"Failed to open disc","Failed to open disc"']
+    RIPPED = ['MSG:5004,0,2,"1 titles saved","%1 titles saved, %2 failed","1","0"']
+    TITLE_FAILED = ['MSG:5003,0,2,"Failed to save title 0 to file t00.mkv",'
+                    '"Failed to save title %1 to file %2","0","t00.mkv"']
+    CMD = ["mkv", "dev:/dev/sr1", "all", "/raw"]
+
+    def _rip(self, *outputs):
+        """Run run_rip against makemkvcon runs that print these lines; a run with a 5010 or 5003 exits 11."""
+        runs = iter(outputs)
+
+        def run(options, select):
+            lines = next(runs)
+            for line in lines:
+                msg_type, data = makemkv.parse_line(line)
+                if msg_type in select:
+                    yield data
+            if lines is not self.RIPPED:
+                raise makemkv.MakeMkvRuntimeError(11, options)
+
+        with mock.patch.object(makemkv, "run", side_effect=run) as rip, \
+                mock.patch.object(makemkv, "sleep") as pause:
+            try:
+                makemkv.run_rip(list(self.CMD))
+                failed = False
+            except makemkv.MakeMkvRuntimeError:
+                failed = True
+        return rip.call_count, pause.call_count, failed
+
+    def test_opens_on_the_second_try(self):
+        self.assertEqual(self._rip(self.OPEN_FAILED, self.RIPPED), (2, 1, False))
+
+    def test_gives_up_after_the_last_attempt(self):
+        self.assertEqual(self._rip(*[self.OPEN_FAILED] * makemkv.DISC_OPEN_ATTEMPTS),
+                         (makemkv.DISC_OPEN_ATTEMPTS, makemkv.DISC_OPEN_ATTEMPTS - 1, True))
+
+    def test_failure_after_the_disc_opened_is_not_retried(self):
+        # A drive that resets halfway through the film: MakeMKV cannot resume, so the job fails
+        self.assertEqual(self._rip(self.TITLE_FAILED), (1, 0, True))
+
+    def test_mainfeature_rip_is_retried(self):
+        track = _track(0, 5587, 0, 20)
+        with mock.patch.object(makemkv, "run_rip") as rip, \
+                mock.patch.object(makemkv, "progress_log", return_value="/tmp/progress.log"):
+            makemkv.rip_mainfeature(_job([track]), track, "/raw")
+        rip.assert_called_once()
+
+
+@unittest.skipIf(IMPORT_ERROR is not None, f"ARM could not be imported here: {IMPORT_ERROR}")
 class TestInfoScanLock(unittest.TestCase):
     """Only one makemkvcon info scan runs at a time (two at once failed to open RED 2 on the t620)."""
 
