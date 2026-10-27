@@ -96,6 +96,40 @@ def get_omdb_poster(title=None, year=None, imdb_id=None, plot="short"):
     return None, None
 
 
+def tmdb_search_request(kind, search_query, year, tmdb_api_key, timeout=30):
+    """
+    Query TMDB's movie or tv search with the title sent as a real URL parameter.
+
+    These URLs used to be assembled by hand, so a title with an ampersand ("Thomas & Friends -
+    Best of Gordon") was cut at the "&" and TMDB searched for "Thomas " alone; "#" and "?" did
+    the same.
+
+    Every "+" in the query is turned into a space before it is sent. The ripper writes the spaces
+    of a query as "+" (identify.get_video_details), which proper encoding would otherwise send to
+    TMDB as literal pluses. The cost is that a title which really contains a plus ("+1", "Dragon
+    Ball Z: Battle of Gods +") is searched without it, including when typed into the UI title
+    search; the fix for that is to stop get_video_details writing "+", which is left for later.
+
+    A TMDB that cannot be reached, is too slow (``timeout`` seconds) or answers with something
+    that is not JSON is reported the way TMDB reports its own errors, as a dict carrying
+    ``status_code`` (-1 here) and ``status_message``, so callers show "no results" instead of
+    raising out of a page view.
+
+    :param kind: "movie" or "tv"
+    :param year: release year to narrow a movie search; ignored for tv
+    :return: (decoded JSON, response); the response is None when the request itself failed
+    """
+    params = {"api_key": tmdb_api_key, "query": str(search_query).replace("+", " ")}
+    if year and kind == "movie":
+        params["year"] = str(year)
+    try:
+        response = requests.get(f"https://api.themoviedb.org/3/search/{kind}", params=params, timeout=timeout)
+        return json.loads(response.text), response
+    except (requests.RequestException, ValueError) as error:
+        app.logger.error(f"TMDB {kind} search failed - {error}")
+        return {"status_code": -1, "status_message": str(error)}, None
+
+
 def get_tmdb_poster(search_query=None, year=None):
     """
     Queries api.themoviedb.org for the poster and backdrop for movie
@@ -117,10 +151,11 @@ def get_tmdb_poster(search_query=None, year=None):
         return tmdb_process_poster(search_results, poster_base)
 
     # Search tmdb for tv series
-    response = requests.get("https://api.themoviedb.org/3/search/tv",
-                            params={"api_key": tmdb_api_key, "query": search_query})
-    search_results = json.loads(response.text)
+    search_results, response = tmdb_search_request("tv", search_query, None, tmdb_api_key)
     # app.logger.debug(json.dumps(response.json(), indent=4, sort_keys=True))
+    if 'status_code' in search_results:
+        app.logger.debug(f"get_tmdb_poster tv search failed with error -  {search_results['status_message']}")
+        return None
     if search_results['total_results'] > 0:
         app.logger.debug(search_results['total_results'])
         return tmdb_process_poster(search_results, poster_base)
@@ -167,9 +202,10 @@ def tmdb_search(search_query=None, year=None):
         return tmdb_process_results(poster_base, return_results, search_results, "movie")
     # Search for tv series
     app.logger.debug("tmdb_search - movie not found, trying tv series ")
-    response = requests.get("https://api.themoviedb.org/3/search/tv",
-                            params={"api_key": tmdb_api_key, "query": search_query})
-    search_results = json.loads(response.text)
+    search_results, response = tmdb_search_request("tv", search_query, None, tmdb_api_key)
+    if 'status_code' in search_results:
+        app.logger.error(f"tmdb_search tv search failed with error -  {search_results['status_message']}")
+        return None
     if search_results['total_results'] > 0:
         app.logger.debug(search_results['total_results'])
         return tmdb_process_results(poster_base, return_results, search_results, "series")
@@ -332,20 +368,11 @@ def tmdb_fetch_results(search_query, year, tmdb_api_key):
     :param str search_query: search query from ARMui
     :param str year: the year of the movie/tv-show
     :param str tmdb_api_key: tmdb API key
-    :return: [search_results dict, poster_img string, requests Response]
+    :return: [search_results dict, poster_img string, requests Response or None if the request failed]
     """
-    # https://api.themoviedb.org/3/movie/78?api_key= # base url
-    # Additional
-    # &append_to_response=alternative_titles,changes,credits,images,keywords,lists,releases,reviews,similar,videos
-    # requests percent-encodes the params, so a title such as "Thomas & Friends - Best of Gordon" reaches
-    # TMDB whole instead of being cut at the "&" (job 36 on the ts140 was filed as Gordon (2003) that way)
-    params = {"api_key": tmdb_api_key, "query": search_query}
-    if year:
-        params["year"] = year
     # Valid poster sizes
     # "w92", "w154", "w185", "w342", "w500", "w780", "original"
     poster_size = "original"
     poster_base = f"https://image.tmdb.org/t/p/{poster_size}"
-    response = requests.get("https://api.themoviedb.org/3/search/movie", params=params)
-    return_json = json.loads(response.text)
+    return_json, response = tmdb_search_request("movie", search_query, year, tmdb_api_key)
     return return_json, poster_base, response
