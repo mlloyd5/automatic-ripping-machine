@@ -1,0 +1,79 @@
+{% extends "base.html" %}
+{% block title %}Bonus Disc{% endblock %}
+
+{% block nav %}{{ super() }}{% endblock %}
+
+{% block content %}
+<div class="container">
+    <div class="row text-center justify-content-center">
+        <div class="col">
+            <h4>Bonus disc of&hellip;</h4>
+            <p>
+                Job {{ job.job_id }}: disc <strong>{{ job.label }}</strong> in {{ job.devpath }}
+                ({{ job.disctype }}, {{ job.status }}).
+                Pick the film this disc belongs to: every title it rips, however short, is filed in that film's
+                extras folder, and nothing on it is taken for the film itself.
+            </p>
+            {% if job.disc_photo %}
+                <a href="discphoto?job_id={{ job.job_id }}" target="_blank" title="Photo of the disc taken as the tray closed">
+                    <img src="discphoto?job_id={{ job.job_id }}" width="240px" class="img-thumbnail mb-3" alt="Disc photo"></a>
+            {% endif %}
+            {% if job.finished %}
+                <div class="alert alert-warning" role="alert">
+                    This job has finished, so its titles have been filed already.
+                </div>
+            {% endif %}
+        </div>
+    </div>
+    <form method="post" action="bonusdisc" autocomplete="off">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        <input type="hidden" name="job_id" value="{{ job.job_id }}">
+        <div class="table-responsive">
+            <table class="table table-striped table-sm" aria-label="Recent movie rips">
+                <thead class="bg-secondary">
+                <tr>
+                    <th scope="col"></th>
+                    <th scope="col" style="text-align:left">Film</th>
+                    <th scope="col" style="text-align:left">Disc label</th>
+                    <th scope="col" style="text-align:left">Drive</th>
+                    <th scope="col" style="text-align:left">Finished</th>
+                    <th scope="col" style="text-align:left">Job</th>
+                </tr>
+                </thead>
+                <tbody>
+                <tr>
+                    <td><input type="radio" name="bonus_of" id="bonus_none" value="none"
+                               {{ 'checked' if not job.bonus_of_job_id else '' }}></td>
+                    <td colspan="5" style="text-align:left"><label for="bonus_none" class="mb-0">Not a bonus disc</label></td>
+                </tr>
+                {% for candidate in candidates %}
+                    {% set parent = candidate.job %}
+                    <tr>
+                        <td><input type="radio" name="bonus_of" id="bonus_job_{{ parent.job_id }}" value="job:{{ parent.job_id }}"
+                                   {{ 'checked' if job.bonus_of_job_id == parent.job_id and not job.bonus_of_film_id else '' }}></td>
+                        <td style="text-align:left"><label for="bonus_job_{{ parent.job_id }}" class="mb-0">
+                            <strong>{{ film_label(parent.title, parent.year) }}</strong></label></td>
+                        <td style="text-align:left">{{ parent.label }}</td>
+                        <td style="text-align:left">{{ parent.devpath }}</td>
+                        <td style="text-align:left">{{ parent.stop_time.strftime('%Y-%m-%d %H:%M') if parent.stop_time else '' }}</td>
+                        <td style="text-align:left"><a href="jobdetail?job_id={{ parent.job_id }}">{{ parent.job_id }}</a></td>
+                    </tr>
+                    {% for film in candidate.films %}
+                        <tr>
+                            <td><input type="radio" name="bonus_of" id="bonus_film_{{ film.film_id }}" value="film:{{ film.film_id }}"
+                                       {{ 'checked' if job.bonus_of_film_id == film.film_id else '' }}></td>
+                            <td style="text-align:left" class="pl-4"><label for="bonus_film_{{ film.film_id }}" class="mb-0">
+                                &#8627; {{ film_label(film.title, film.year) }}</label></td>
+                            <td style="text-align:left" colspan="4"><small>film {{ film.position }} of the same disc</small></td>
+                        </tr>
+                    {% endfor %}
+                {% else %}
+                    <tr><td colspan="6">No successful movie rips to pick from.</td></tr>
+                {% endfor %}
+                </tbody>
+            </table>
+        </div>
+        <button class="btn btn-info btn-lg btn-block" type="submit" {{ 'disabled' if job.finished else '' }}>Save</button>
+    </form>
+</div>
+{% endblock %}

@@ -205,9 +205,66 @@ def fix_job_title(job):
 
 
 #  ############## Start of post processing functions
+def bonus_parent(job):
+    """
+    The job (and the film of its double feature, if one was picked) a bonus disc belongs to\n
+    :param job: Current job
+    :return: (parent Job, Film or None), or (None, None) when the job is not a bonus disc
+    """
+    if not getattr(job, "bonus_of_job_id", None):
+        return None, None
+    parent = getattr(job, "bonus_of", None)
+    if parent is None:
+        logging.warning(f"Job {job.job_id} is marked as the bonus disc of job {job.bonus_of_job_id}, "
+                        "which no longer exists; ripping it as an ordinary disc")
+        return None, None
+    film = getattr(job, "bonus_of_film", None)
+    if film is not None and film.job_id != parent.job_id:
+        logging.warning(f"Film {film.film_id} is not a film of job {parent.job_id}; filing the bonus disc "
+                        "with the job's own title")
+        film = None
+    return parent, film
+
+
+def is_bonus_disc(job):
+    """True when the job was marked in the ui as the bonus disc of an earlier job (see bonus_parent)"""
+    return bonus_parent(job)[0] is not None
+
+
+def bonus_tag(job):
+    """
+    What a bonus disc's files are prefixed with, so they never collide with the extras already in the
+    film's folder: the disc label made safe for a file name, or ``job<id>`` without one\n
+    :param job: Current job
+    :return: str
+    """
+    label = re.sub(r"(?:[^\w.-]|_)+", "_", str(job.label or "")).strip("_.")[:40]
+    return label or f"job{job.job_id}"
+
+
+def bonus_extras_sub(job):
+    """A bonus disc's extras folder: EXTRAS_SUB, or "extras" when EXTRAS_SUB is "none" (its titles are all extras)"""
+    extras_sub = str(job.config.EXTRAS_SUB or "")
+    if extras_sub.lower() in ("", "none"):
+        return "extras"
+    return extras_sub
+
+
+def unused_name(folder, filename):
+    """``filename``, or ``<stem>-2<ext>``, ``-3``... when the folder already holds a file of that name"""
+    stem, ext = os.path.splitext(filename)
+    candidate, number = filename, 1
+    while os.path.exists(os.path.join(folder, candidate)):
+        number += 1
+        candidate = f"{stem}-{number}{ext}"
+    return candidate
+
+
 def move_files(base_path, filename, job, is_main_feature=False):
     """
     Run extra checks then move files from RAW_PATH or TRANSCODE_PATH to final media directory\n
+    A bonus disc (see bonus_parent) has no main feature: every file goes to the film's extras folder
+    as ``<disc label>_<filename>``\n
     :param str base_path: Path to source directory\n
     :param str filename: name of file to be moved\n
     :param job: instance of Job class\n
@@ -223,9 +280,15 @@ def move_files(base_path, filename, job, is_main_feature=False):
         return None
 
     movie_path = job.path
+    bonus = is_bonus_disc(job)
     logging.info(f"Moving {job.video_type} {filename} to {movie_path}")
-    # For series there are no extras so always use the base path
-    extras_path = os.path.join(movie_path, job.config.EXTRAS_SUB) if job.video_type != "series" else movie_path
+    if bonus:
+        # Named like the film's own file it would replace it, here or once shipped
+        is_main_feature = False
+        extras_path = os.path.join(movie_path, bonus_extras_sub(job))
+    else:
+        # For series there are no extras so always use the base path
+        extras_path = os.path.join(movie_path, job.config.EXTRAS_SUB) if job.video_type != "series" else movie_path
     make_dir(movie_path)
 
     if is_main_feature:
@@ -235,9 +298,10 @@ def move_files(base_path, filename, job, is_main_feature=False):
     else:
         # Don't make the extra's path unless we need it
         make_dir(extras_path)
-        logging.info(f"Moving '{os.path.join(base_path, filename)}' to {extras_path}")
+        extra_name = unused_name(extras_path, f"{bonus_tag(job)}_{filename}") if bonus else filename
+        logging.info(f"Moving '{os.path.join(base_path, filename)}' to {os.path.join(extras_path, extra_name)}")
         # This also handles series - But it doesn't use the extras folder
-        move_files_main(os.path.join(base_path, filename), os.path.join(extras_path, filename), extras_path)
+        move_files_main(os.path.join(base_path, filename), os.path.join(extras_path, extra_name), extras_path)
     return movie_path
 
 
@@ -973,6 +1037,9 @@ def check_for_wait(job):
             time.sleep(5)
             sleep_time += 5
             db.session.refresh(job)
+            if job.bonus_of_job_id:
+                logging.info(f"Marked as the bonus disc of job {job.bonus_of_job_id}.")
+                break
             if job.title_manual:
                 logging.info("Manual override found.  Overriding auto identification values.")
                 job.updated = True
@@ -1126,12 +1193,13 @@ def copy_disc_barcode(final_directory, job) -> Optional[str]:
     return destination
 
 
-def copy_disc_photo(final_directory, job) -> Optional[str]:
+def copy_disc_photo(final_directory, job, filename=None) -> Optional[str]:
     """
     Copy the job's disc photo into the completed rip folder as disc.jpg when DISC_PHOTO_COPY is set.
 
     :param final_directory: folder the finished rip lives in
     :param job: the current job
+    :param filename: name to copy it as instead of disc.jpg (a bonus disc's photo beside the film's)
     :return: destination path or None
     """
     if not cfg.arm_config.get("DISC_PHOTO_COPY", False) or not job.disc_photo:
@@ -1145,7 +1213,7 @@ def copy_disc_photo(final_directory, job) -> Optional[str]:
         return None
     try:
         os.makedirs(final_directory, exist_ok=True)
-        destination = os.path.join(final_directory, disc_photo.COPY_FILENAME)
+        destination = os.path.join(final_directory, filename or disc_photo.COPY_FILENAME)
         shutil.copy2(source, destination)
         logging.info(f"Copied disc photo to {destination}")
         return destination

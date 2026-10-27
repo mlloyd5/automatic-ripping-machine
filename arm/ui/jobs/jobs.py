@@ -9,6 +9,7 @@ Covers
 - updatetitle [GET]
 - activerips [GET]
 - changeparams [GET]
+- bonusdisc [GET, POST]
 - list_titles [GET]
 - json [JSON GET]
 """
@@ -28,6 +29,7 @@ import arm.config.config as cfg
 from arm.ui.forms import TitleSearchForm, ChangeParamsForm, TrackFormDynamic
 from arm.ripper import disc_photo
 from arm.ripper import disc_vision
+from arm.ui.jobs import bonus
 
 route_jobs = Blueprint('route_jobs', __name__,
                        template_folder='templates',
@@ -230,6 +232,29 @@ def customtitle():
         return redirect(url_for('home'))
     return render_template('customTitle.html', title='Change Title', form=form, job=job,
                            ocr=ocr_suggestion(job))
+
+
+@route_jobs.route('/bonusdisc', methods=['GET', 'POST'])
+@login_required
+def bonusdisc():
+    """
+    Mark the disc of a job as the bonus disc of a recent job (or one film of its double feature), so
+    every title it rips is filed as that film's extras
+    """
+    job_id = str(request.values.get('job_id') or '').strip()
+    if not job_id.isdigit() or (job := Job.query.get(int(job_id))) is None:
+        abort(404)
+    if request.method == 'POST':
+        success, message = bonus.set_bonus_of(job, request.form.get('bonus_of'))
+        if not success:
+            flash(message, "danger")
+            return redirect(url_for('route_jobs.bonusdisc', job_id=job.job_id))
+        db.session.add(Notifications(f"Job: {job.job_id} was updated", message))
+        db.session.commit()
+        flash(message, "success")
+        return redirect(url_for('home'))
+    return render_template('bonusdisc.html', title='Bonus Disc', job=job,
+                           candidates=bonus.bonus_candidates(job), film_label=bonus.film_label)
 
 
 @route_jobs.route('/gettitle')

@@ -25,6 +25,7 @@
   "VIDEOTYPE": "# Video type identification.  Options are \"auto\", \"series\", \"movie\".\n# If \"auto\" then ARM will get the video type when querying the movie webservice.  This is default.\n# If the disc is not clearly a movie or series, or if ARM is having difficulty getting the right video type\n# you can override the automatic identification with \"series\" or \"movie\"",
   "MINLENGTH": "# Minimum length of track for ARM rip (in seconds)",
   "MAXLENGTH": "# Maximum length of track for ARM rip (in seconds)\n# Use \"99999\" to indicate no maximum length",
+  "BONUS_MINLENGTH": "# Minimum length of track for a bonus disc (in seconds)\n# A disc marked in the ui as the bonus disc of an earlier job (\"Bonus Disc\" on the job) is ripped with this\n# minimum instead of MINLENGTH, in one pass over every title, and every title is filed in that film's\n# EXTRAS_SUB folder: featurettes are often a few minutes long",
   "MANUAL_WAIT": "# Wait for manual identification",
   "MANUAL_WAIT_TIME": "# Wait time for manual identification (in seconds)",
   "DRIVE_READY_TIMEOUT": "# How long to wait (in seconds) for the drive to report a readable disc after udev starts ARM.\n# udev fires when the tray closes; slow drives need another 15-20 seconds to spin the disc up.",

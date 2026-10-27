@@ -1,0 +1,16 @@
+{# Link from the title forms to the bonus disc page, for a disc that is the extras of a film ripped earlier. Expects `job`. #}
+{% if job and job.status and not job.finished %}
+<div class="container mb-3">
+    <div class="row justify-content-center">
+        <div class="col-auto text-center">
+            {% if job.bonus_of_job_id %}
+                <small>This disc is marked as the bonus disc of job {{ job.bonus_of_job_id }}.</small>
+                <a href="bonusdisc?job_id={{ job.job_id }}" class="btn btn-sm btn-outline-secondary ml-2">Change</a>
+            {% else %}
+                <small>A bonus or supplemental disc of a film ripped earlier?</small>
+                <a href="bonusdisc?job_id={{ job.job_id }}" class="btn btn-sm btn-outline-secondary ml-2">Bonus disc of&hellip;</a>
+            {% endif %}
+        </div>
+    </div>
+</div>
+{% endif %}

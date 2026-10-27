@@ -19,6 +19,7 @@
 **Web Page Overview**
   - _Coming Soon_
   - [Jobs](Web-Jobs)
+    - [Bonus Discs](Bonus-Discs)
   - [Settings](Web-Settings)
     - [Drive Management](Web-Settings-Drives)
     - [UI Settings](Web-Settings-UI)
