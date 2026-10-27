@@ -355,9 +355,22 @@ def get_video_details(job):
         logging.info(f"Identification failed with the error: {error}. Continuing...")
 
 
+def _fold_accents(text) -> str:
+    """The text with accents dropped from their letters: "Pokémon" is "Pokemon", as clean_upc_title folds it."""
+    text = unicodedata.normalize("NFKD", str(text or ""))
+    return "".join(ch for ch in text if not unicodedata.combining(ch))
+
+
+def _title_words(text) -> list:
+    """The lower case runs of letters and digits, accents folded: "Thomas & Friends: Best of James" is
+    thomas, friends, best, of, james."""
+    return re.findall(r"[a-z0-9]+", _fold_accents(text).lower())
+
+
 def _normalise_title(text) -> str:
-    """Lower case letters and digits only, so "Coal Miner's Daughter" and "COAL MINERS DAUGHTER" agree."""
-    return re.sub(r"[^a-z0-9]", "", str(text or "").lower())
+    """Lower case letters and digits only, so "Coal Miner's Daughter" and "COAL MINERS DAUGHTER" agree,
+    and accents folded, so "Pokémon: The First Movie" and "Pokemon The First Movie" do too."""
+    return "".join(_title_words(text))
 
 
 def best_search_result(results, title=None, year=None, exact_only=False):
@@ -390,14 +403,16 @@ def best_search_result(results, title=None, year=None, exact_only=False):
         exact = same_year or exact
     if not exact:
         return None if exact_only else results[0]
+    return max(exact, key=_rank_search_result)
 
-    def rank(result):
-        try:
-            votes = int(result.get("vote_count") or 0)
-        except (TypeError, ValueError):
-            votes = 0
-        return votes, bool(str(result.get("Year") or "").strip())
-    return max(exact, key=rank)
+
+def _rank_search_result(result):
+    """Vote count, then whether the result has a year at all: the order among equally good titles."""
+    try:
+        votes = int(result.get("vote_count") or 0)
+    except (TypeError, ValueError):
+        votes = 0
+    return votes, bool(str(result.get("Year") or "").strip())
 
 
 def update_job(job, search_results, title=None, year=None):
@@ -527,9 +542,14 @@ def search_and_update(job, title=None, year=None, cache=None):
 
 
 def provider_search(provider, title, year):
-    """Search the metadata provider ("tmdb" or "omdb"); the results are in OMDB format, or None."""
+    """
+    Search the metadata provider ("tmdb" or "omdb"); the results are in OMDB format, or None.
+
+    An unreachable TMDB raises MetadataUnavailable rather than looking like "no results", so
+    identify_loop's fallback searches stop at the first one instead of each waiting out the timeout.
+    """
     if provider == "tmdb":
-        return ui_utils.tmdb_search(title, year)
+        return ui_utils.tmdb_search(title, year, raise_unreachable=True)
     return ui_utils.call_omdb_api(str(title), str(year))
 
 
@@ -729,6 +749,9 @@ def identify_from_photo(job):
     for candidate in candidates:
         try:
             response = search_with_year_retries(job, candidate, year)
+        except ui_metadata.MetadataUnavailable as error:
+            logging.info(f"Metadata provider unreachable, not trying the other OCR candidates: {error}")
+            return False
         except Exception as error:
             logging.debug(f"Metadata lookup for OCR candidate '{candidate}' failed: {error}")
             response = None
@@ -779,6 +802,71 @@ def search_film(title, year=None):
             best = best_search_result(response['Search'], title, attempt, exact_only=True)
             if best:
                 return best
+    return None
+
+
+_SUBTITLE_SEPARATOR_RE = re.compile(r"\s+-\s+|:\s+")
+
+
+def split_brand_subtitle(title):
+    """
+    A product title's brand prefix and subtitle, when it has both.
+
+    ``"Thomas the Tank Engine and Friends - Best of James"`` is ``("Thomas", "Best of James")``: the
+    first word of the prefix that is not an article, and everything after the first " - " or ": ".
+
+    :return: ``(brand word, subtitle)`` or None when the title has no such separator
+    """
+    parts = _SUBTITLE_SEPARATOR_RE.split(str(title or ""), maxsplit=1)
+    if len(parts) != 2:
+        return None
+    prefix, subtitle = parts[0].strip(), parts[1].strip()
+    words = [word for word in re.findall(r"[A-Za-z0-9]+", _fold_accents(prefix))
+             if word.lower() not in ("a", "an", "the")]
+    if not words or not _title_words(subtitle):
+        return None
+    return words[0], subtitle
+
+
+def search_film_by_subtitle(title, year=None):
+    """
+    The provider's result for a product title whose brand prefix is worded differently online.
+
+    A case barcode gives "Thomas the Tank Engine and Friends - Best of James" where TMDB has
+    "Thomas & Friends: Best of James", so no title is exactly the product title (see search_film).
+    When the product title splits into a brand prefix and a subtitle, the subtitle alone is
+    searched and a result counts when its title's last words are the subtitle's words and one of
+    its words is the prefix's first word: "The Best of Mickie James" and "James Last: Best of the
+    70's" do not qualify, and neither does a title where the brand ("Ed") or the subtitle ("Ice")
+    only turns up inside a longer word ("Remastered", "Justice"). Several such results rank as
+    best_search_result ranks exact matches: the year when one is known, then the vote count.
+
+    :return: one search result in OMDB style, or None
+    """
+    split = split_brand_subtitle(title)
+    if not split:
+        return None
+    brand, subtitle = split
+    wanted_brand, wanted_subtitle = brand.lower(), _title_words(subtitle)
+
+    def qualifies(result):
+        found = _title_words(result.get("Title") or result.get("title"))
+        return found[-len(wanted_subtitle):] == wanted_subtitle and wanted_brand in found
+
+    attempts = [str(year), str(int(year) - 1)] if year and str(year).isdigit() else []
+    attempts.append(None)
+    for attempt in attempts:
+        try:
+            response = _provider_search(subtitle, attempt)
+        except Exception as error:
+            logging.debug(f"Metadata lookup for '{subtitle}' ({attempt}) failed: {error}")
+            response = None
+        matches = [r for r in (response or {}).get('Search') or [] if qualifies(r)]
+        if attempt:
+            same_year = [r for r in matches if str(r.get("Year") or "")[:4] == attempt[:4]]
+            matches = same_year or matches
+        if matches:
+            return max(matches, key=_rank_search_result)
     return None
 
 
@@ -930,6 +1018,17 @@ def _identify_video_from_barcode(job):
         if best:
             apply_search_result(job, best)
             logging.info(f"Identified disc from barcode as '{job.title}' ({job.year}) via '{candidate['title']}'")
+            return True
+    # The provider may word the brand differently ("Thomas & Friends" for "Thomas the Tank Engine
+    # and Friends"): a result that ends with the product title's subtitle and names the brand is it.
+    for candidate in candidates[:3]:
+        best = search_film_by_subtitle(candidate['title'], candidate['year'])
+        if best:
+            brand, subtitle = split_brand_subtitle(candidate['title'])
+            apply_search_result(job, best)
+            logging.info(f"Identified disc from barcode as '{job.title}' ({job.year}): no title online is "
+                         f"exactly '{candidate['title']}', but this one ends with its subtitle "
+                         f"'{subtitle}' and names '{brand}'")
             return True
     logging.info("No title online is exactly the barcode's product title; "
                  "leaving the disc to its CRC64 record and label")
