@@ -236,6 +236,11 @@ function pingReadNotify(toastId) {
     });
 }
 
+function escapeHtml(text) {
+    // Notification titles and bodies carry disc labels and typed titles, so they are text, not markup
+    return $("<div>").text(text == null ? "" : String(text)).html();
+}
+
 function addToast(title, body, toastId) {
     // Get the toast timeout from UISettings
     const toast_timeout = getNotifyTimeout();
@@ -244,14 +249,14 @@ function addToast(title, body, toastId) {
     const toast = `<div id="toast${toastId}" class="toast" role="alert" aria-live="assertive" aria-atomic="true" data-autohide="true" data-animation="true" data-delay="${parseInt(toast_timeout)}" style="z-index:1000">
         <div class="toast-header">
             <img src="static/img/success.png" class="rounded mr-2" alt="arm message" height="20px" width="20px">
-                <strong class="mr-auto">${title}</strong>
+                <strong class="mr-auto">${escapeHtml(title)}</strong>
                 <small class="text-muted">just now</small>
                 <button type="button" class="ml-2 mb-1 close" data-dismiss="toast" aria-label="Close">
                     <span aria-hidden="true">&times;</span>
                 </button>
         </div>
         <div class="toast-body">
-            ${body}
+            ${escapeHtml(body)}
         </div>
     </div>`;
     $("#toastHolder").append(toast);
