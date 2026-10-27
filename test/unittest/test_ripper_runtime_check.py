@@ -480,7 +480,7 @@ class TestRetitleFinalDirectory(unittest.TestCase):
                    mock.patch.object(arm_ripper, "check_runtime", side_effect=switch),
                    mock.patch.object(arm_ripper, "start_transcode"),
                    mock.patch.object(arm_ripper, "move_files_post",
-                                     side_effect=lambda path, job: filed_in.append(job.path)),
+                                     side_effect=lambda path, job, *_: filed_in.append(job.path)),
                    mock.patch.object(arm_ripper, "notify_exit"),
                    mock.patch.object(arm_ripper.utils, "save_disc_poster", side_effect=poster),
                    mock.patch.dict(arm_ripper.utils.cfg.arm_config, {"DELRAWFILES": False})]

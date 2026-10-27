@@ -1,0 +1,123 @@
+{% extends "base.html" %}
+{% block title %}Double Feature{% endblock %}
+
+{% block nav %}{{ super() }}{% endblock %}
+
+{% block content %}
+<div class="container">
+    <div class="row text-center justify-content-center">
+        <div class="col">
+            <h4>Double feature</h4>
+            <p>
+                Job {{ job.job_id }}: disc <strong>{{ job.label }}</strong> in {{ job.devpath }}
+                ({{ job.disctype }}, {{ job.status }}).
+                Add the films on this disc in the order they are on it. With two or more, the job is named after
+                the first film; after the rip each title whose length fits a film's runtime is filed as that film,
+                the first in the job's folder, the others in their own folders. Titles no film claims are extras.
+            </p>
+            {% if job.disc_photo %}
+                <a href="discphoto?job_id={{ job.job_id }}" target="_blank" title="Photo of the disc taken as the tray closed">
+                    <img src="discphoto?job_id={{ job.job_id }}" width="240px" class="img-thumbnail mb-3" alt="Disc photo"></a>
+            {% endif %}
+            {% if job.disc_barcode_title %}
+                <p><small class="text-muted">Case barcode: {{ job.disc_barcode_title }}</small></p>
+            {% endif %}
+            {% if reason %}
+                <div class="alert alert-warning" role="alert">{{ reason }}</div>
+            {% endif %}
+        </div>
+    </div>
+
+    <div class="table-responsive">
+        <table class="table table-striped table-sm" aria-label="Films on this disc">
+            <thead class="bg-secondary">
+            <tr>
+                <th scope="col" style="text-align:left">#</th>
+                <th scope="col" style="text-align:left">Film</th>
+                <th scope="col" style="text-align:left">IMDb</th>
+                <th scope="col" style="text-align:left">Runtime</th>
+                <th scope="col"></th>
+            </tr>
+            </thead>
+            <tbody>
+            {% for film in films %}
+                <tr>
+                    <td style="text-align:left">{{ film.position }}</td>
+                    <td style="text-align:left"><strong>{{ film_label(film.title, film.year) }}</strong>
+                        {% if loop.first and films|length > 1 %}<small class="text-muted ml-1">job folder</small>{% endif %}</td>
+                    <td style="text-align:left">{% if film.imdb_id %}<a href="https://www.imdb.com/title/{{ film.imdb_id }}" target="_blank">{{ film.imdb_id }}</a>{% endif %}</td>
+                    <td style="text-align:left">{{ (film.runtime // 60) ~ ' min' if film.runtime else 'unknown' }}</td>
+                    <td style="text-align:right">
+                        {% if not reason %}
+                        <form method="post" action="doublefeature" class="d-inline">
+                            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                            <input type="hidden" name="job_id" value="{{ job.job_id }}">
+                            <input type="hidden" name="film_id" value="{{ film.film_id }}">
+                            {% if not loop.first %}
+                                <button class="btn btn-sm btn-outline-secondary" type="submit" name="action" value="up" title="Move up">&uarr;</button>
+                            {% endif %}
+                            <button class="btn btn-sm btn-outline-danger" type="submit" name="action" value="remove">Remove</button>
+                        </form>
+                        {% endif %}
+                    </td>
+                </tr>
+            {% else %}
+                <tr><td colspan="5">No films yet: search for the first film on the disc below.</td></tr>
+            {% endfor %}
+            </tbody>
+        </table>
+    </div>
+    {% if films|length == 1 %}
+        <p class="text-center"><small>One film is not a double feature yet: add the second.</small></p>
+    {% endif %}
+    {% if films and not reason %}
+        <form method="post" action="doublefeature" class="text-center mb-4">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <input type="hidden" name="job_id" value="{{ job.job_id }}">
+            <button class="btn btn-outline-danger" type="submit" name="action" value="clear">Not a double feature</button>
+        </form>
+    {% endif %}
+
+    {% if not reason %}
+    <div class="container d-flex justify-content-center">
+        <form method="get" action="doublefeature" novalidate>
+            <input type="hidden" name="job_id" value="{{ job.job_id }}">
+            <div class="input-group mb-3">
+                <div class="input-group-prepend"><span class="input-group-text" id="dftitle">Title</span></div>
+                <input type="text" class="form-control" name="title" value="{{ query }}" aria-describedby="dftitle">
+                <div class="input-group-prepend"><span class="input-group-text" id="dfyear">Year</span></div>
+                <input type="text" class="form-control" name="year" value="{{ year }}" aria-describedby="dfyear">
+                <div class="input-group-append">
+                    <button class="btn btn-info" type="submit">Search</button>
+                </div>
+            </div>
+        </form>
+    </div>
+    <div class="row">
+        {% for res in results %}
+            <div class="col-md-3 text-center mb-3">
+                <div class="card text-center h-100">
+                    <div class="card-header">
+                        {% if res["Poster"] %}<img src="{{ res["Poster"] }}" width="120px" class="img-thumbnail" alt="Poster image">{% endif %}
+                    </div>
+                    <div class="card-body">
+                        <strong>{{ res["Title"] }}</strong> ({{ res["Year"] }})
+                        <form method="post" action="doublefeature" class="mt-2">
+                            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                            <input type="hidden" name="job_id" value="{{ job.job_id }}">
+                            <input type="hidden" name="title" value="{{ res["Title"] }}">
+                            <input type="hidden" name="year" value="{{ res["Year"] }}">
+                            <input type="hidden" name="imdb_id" value="{{ res["imdbID"] or '' }}">
+                            <input type="hidden" name="tmdb_id" value="{{ res["id"] or '' }}">
+                            <input type="hidden" name="poster" value="{{ res["Poster"] or '' }}">
+                            <button class="btn btn-sm btn-primary" type="submit" name="action" value="add">
+                                Add as film {{ films|length + 1 }}</button>
+                        </form>
+                    </div>
+                </div>
+            </div>
+        {% endfor %}
+    </div>
+    {% endif %}
+</div>
+{% endblock %}

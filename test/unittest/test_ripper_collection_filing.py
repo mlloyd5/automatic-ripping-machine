@@ -189,6 +189,52 @@ class TestFileCollection(unittest.TestCase):
                                                     os.listdir(self.raw_path)))
         self.assertEqual(os.listdir(self.raw_path), ["title_t00.mkv"])
 
+    def test_lifted_mainfeature_files_the_films_without_extras(self):
+        tracks = [_track(0, 5065, chapters=9), _track(1, 4656, chapters=8), _track(2, 1500, chapters=1)]
+        job = self._job(tracks, _films())
+        self.assertTrue(arm_ripper.file_collection(self.raw_path, job, os.listdir(self.raw_path),
+                                                   main_features_only=True))
+        self.assertTrue(os.path.isfile(self._file("Stuart-Little (1999)", "Stuart-Little (1999).mkv")))
+        self.assertTrue(os.path.isfile(self._file("Stuart-Little-2 (2002)", "Stuart-Little-2 (2002).mkv")))
+        self.assertFalse(os.path.exists(self._file("Stuart-Little (1999)", "extras")))
+        self.assertEqual(os.listdir(self.raw_path), ["title_t02.mkv"])
+
+
+@unittest.skipIf(IMPORT_ERROR is not None, f"ARM could not be imported here: {IMPORT_ERROR}")
+class TestApplyCollectionSettings(unittest.TestCase):
+    """With MAINFEATURE on only one title is ripped, so a double feature's other films would be lost"""
+
+    def setUp(self):
+        patch = mock.patch.object(arm_ripper.utils, "database_updater", side_effect=_fake_updater)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    @staticmethod
+    def _job(films, mainfeature=True, video_type="movie"):
+        return SimpleNamespace(job_id=27, video_type=video_type, films=films,
+                               config=SimpleNamespace(MAINFEATURE=mainfeature))
+
+    def test_lifts_mainfeature_for_a_double_feature(self):
+        job = self._job(_films())
+        self.assertTrue(arm_ripper.apply_collection_settings(job))
+        self.assertFalse(job.config.MAINFEATURE)
+
+    def test_leaves_other_jobs_alone(self):
+        for job in (self._job(_films(), mainfeature=False), self._job(_films()[:1]), self._job([]),
+                    self._job(_films(), video_type="series")):
+            before = job.config.MAINFEATURE
+            self.assertFalse(arm_ripper.apply_collection_settings(job))
+            self.assertEqual(job.config.MAINFEATURE, before)
+
+    def test_move_files_post_passes_main_features_only_on(self):
+        job = self._job(_films())
+        job.tracks = _Tracks([])
+        with mock.patch.object(arm_ripper.utils, "is_bonus_disc", return_value=False), \
+                mock.patch.object(arm_ripper.os, "listdir", return_value=[]), \
+                mock.patch.object(arm_ripper, "file_collection", return_value=True) as filing:
+            arm_ripper.move_files_post("/raw", job, True)
+        filing.assert_called_once_with("/raw", job, [], True)
+
 
 if __name__ == "__main__":
     unittest.main()

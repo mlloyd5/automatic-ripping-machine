@@ -20,6 +20,7 @@
   - _Coming Soon_
   - [Jobs](Web-Jobs)
     - [Bonus Discs](Bonus-Discs)
+    - [Double Features](Double-Features)
   - [Settings](Web-Settings)
     - [Drive Management](Web-Settings-Drives)
     - [UI Settings](Web-Settings-UI)

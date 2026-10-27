@@ -10,6 +10,7 @@ Covers
 - activerips [GET]
 - changeparams [GET]
 - bonusdisc [GET, POST]
+- doublefeature [GET, POST]
 - list_titles [GET]
 - json [JSON GET]
 """
@@ -30,6 +31,7 @@ from arm.ui.forms import TitleSearchForm, ChangeParamsForm, TrackFormDynamic
 from arm.ripper import disc_photo
 from arm.ripper import disc_vision
 from arm.ui.jobs import bonus
+from arm.ui.jobs import double_feature
 
 route_jobs = Blueprint('route_jobs', __name__,
                        template_folder='templates',
@@ -229,6 +231,8 @@ def customtitle():
         db.session.add(notification)
         ui_utils.database_updater(args, job)
         flash(f'Custom title changed. Title={job.title}, Year={job.year}.', "success")
+        if double_feature.clear_for_title_fix(job, title=ui_utils.clean_for_filename(job.title)):
+            flash(f"Job {job.job_id} is no longer a double feature", "info")
         return redirect(url_for('home'))
     return render_template('customTitle.html', title='Change Title', form=form, job=job,
                            ocr=ocr_suggestion(job))
@@ -255,6 +259,44 @@ def bonusdisc():
         return redirect(url_for('home'))
     return render_template('bonusdisc.html', title='Bonus Disc', job=job,
                            candidates=bonus.bonus_candidates(job), film_label=bonus.film_label)
+
+
+@route_jobs.route('/doublefeature', methods=['GET', 'POST'])
+@login_required
+def doublefeature():
+    """
+    Mark the disc of a job as a double feature: pick its films one by one from a title search, so each
+    is filed in its own folder (see arm/ui/jobs/double_feature.py)
+    """
+    job_id = str(request.values.get('job_id') or '').strip()
+    if not job_id.isdigit() or (job := Job.query.get(int(job_id))) is None:
+        abort(404)
+    if request.method == 'POST':
+        action = request.form.get('action')
+        if action == "add":
+            success, message = double_feature.add_film(job, request.form)
+        elif action == "remove":
+            success, message = double_feature.remove_film(job, request.form.get('film_id'))
+        elif action == "up":
+            success, message = double_feature.move_film_up(job, request.form.get('film_id'))
+        elif action == "clear":
+            success, message = double_feature.clear_films(job)
+        else:
+            success, message = False, "Unknown action"
+        if success:
+            db.session.add(Notifications(f"Job: {job.job_id} was updated", message))
+            db.session.commit()
+        flash(message, "success" if success else "danger")
+        return redirect(url_for('route_jobs.doublefeature', job_id=job.job_id))
+    query = str(request.args.get('title') or '').strip()
+    year = str(request.args.get('year') or '').strip()
+    results = double_feature.search(query, year) if query else []
+    if query and not results:
+        flash(f"No films found for {query}", "danger")
+    return render_template('doublefeature.html', title='Double Feature', job=job,
+                           films=double_feature.films_of(job), reason=double_feature.check_editable(job),
+                           query=query or job.title or '', year=year, results=results,
+                           searched=bool(query), film_label=bonus.film_label)
 
 
 @route_jobs.route('/gettitle')
@@ -322,6 +364,8 @@ def updatetitle():
     job.poster_url = job.poster_url_manual = request.args.get('poster')
 
     job.hasnicetitle = True
+    if double_feature.clear_for_title_fix(job, imdb_id=job.imdb_id, title=job.title):
+        flash(f"Job {job.job_id} is no longer a double feature", "info")
     notification = Notifications(f"Job: {job.job_id} was updated",
                                  f'Title: {old_title} ({old_year}) was updated to '
                                  f'{request.args.get("title")} ({request.args.get("year")})')

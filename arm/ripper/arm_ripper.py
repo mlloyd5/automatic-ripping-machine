@@ -49,6 +49,8 @@ def rip_visual_media(have_dupes, job, logfile, protection):
     """
     # A bonus disc rips every short title and files them all as the film's extras
     bonus = apply_bonus_settings(job)
+    # A double feature rips every film, even with MAINFEATURE on (which still keeps its extras out)
+    main_features_only = not bonus and apply_collection_settings(job)
     # Fix the sub-folder type - (movie|tv|unknown)
     type_sub_folder = utils.convert_job_type(job.video_type)
     # Fix the job title - Title (Year) | Title
@@ -128,7 +130,7 @@ def rip_visual_media(have_dupes, job, logfile, protection):
         final_directory = retitle_final_directory(have_dupes, job, final_directory, type_sub_folder, job_title)
 
     # Move to final folder
-    move_files_post(transcode_out_path, job)
+    move_files_post(transcode_out_path, job, main_features_only)
     if bonus:
         # Beside the film's own disc.jpg; the case barcode and poster are the film's already
         utils.copy_disc_photo(final_directory, job, bonus_photo_name(job))
@@ -310,7 +312,7 @@ def notify_exit(job):
             utils.notify(job, constants.NOTIFY_TITLE, f"{job.title} {constants.PROCESS_COMPLETE}")
 
 
-def move_files_post(transcode_out_path, job):
+def move_files_post(transcode_out_path, job, main_features_only=False):
     """
     Logic for moving files post transcoding\n
     if series move all to 1 folder\n
@@ -318,6 +320,8 @@ def move_files_post(transcode_out_path, job):
     if a bonus disc, everything is an extra of the film it belongs to (file_bonus)\n
     :param transcode_out_path: This should either be the RAW_PATH from MakeMKV, /dev/srX or TRANSCODE_PATH
     :param job: current job
+    :param main_features_only: a double feature whose MAINFEATURE apply_collection_settings lifted: file
+        the films only, no extras
     :return: None
     """
     tracks = job.tracks.filter_by(ripped=True)  # .order_by(job.tracks.length.desc())
@@ -326,7 +330,7 @@ def move_files_post(transcode_out_path, job):
     elif job.video_type == "series":
         for track in tracks:
             utils.move_files(transcode_out_path, track.filename, job, False)
-    elif file_collection(transcode_out_path, job, os.listdir(transcode_out_path)):
+    elif file_collection(transcode_out_path, job, os.listdir(transcode_out_path), main_features_only):
         pass  # a double feature: each film went to its own folder
     else:
         for track in tracks:
@@ -462,6 +466,26 @@ def remove_empty_dir(path):
         logging.info(f"Removed empty folder {path}")
     except OSError:
         pass
+
+
+def apply_collection_settings(job):
+    """
+    Settings for a double feature (collection_films: identified by identify.identify_collection or marked in
+    the ui): with MAINFEATURE on only one title would be ripped (makemkv rip_mainfeature, or HandBrake's
+    main feature), and every other film of the disc would be lost. This job's config gets MAINFEATURE off,
+    so every title of at least MINLENGTH is ripped and file_collection can match them to the films; the
+    titles no film claims are then left out as MAINFEATURE would have left them\n
+    A disc marked as a double feature after the rip started is ripped with the settings it started with\n
+    :param job: Current job
+    :return: True when MAINFEATURE was lifted, so the rip is to be filed without extras
+    """
+    films = collection_films(job)
+    if job.video_type != "movie" or len(films) < 2 or not job.config.MAINFEATURE:
+        return False
+    logging.info(f"Disc carries {len(films)} films: ripping every title instead of the main feature only, "
+                 "and filing the films without extras")
+    utils.database_updater({'MAINFEATURE': False}, job.config)
+    return True
 
 
 def collection_films(job):
@@ -689,7 +713,7 @@ def file_film(out_path, filename, film, job):
     return film_path
 
 
-def file_collection(out_path, job, files):
+def file_collection(out_path, job, files, main_features_only=False):
     """
     File the rip of a disc that carries several films (identify.identify_collection)\n
     Each ripped title whose runtime matches a film becomes that film's main feature: the first film's
@@ -700,6 +724,7 @@ def file_collection(out_path, job, files):
     :param out_path: RAW_PATH or TRANSCODE_PATH holding the ripped files
     :param job: Current job
     :param files: os.listdir(out_path)
+    :param main_features_only: file no extras (apply_collection_settings lifted MAINFEATURE for the rip)
     :return: True when the job is a collection and was filed here, False to file it the usual way
     """
     films = collection_films(job)
@@ -730,8 +755,8 @@ def file_collection(out_path, job, files):
             file_film(out_path, track.filename, film, job)
         utils.database_updater({'track_number': track.track_number}, film)
     for track in leftover:
-        if job.config.MAINFEATURE:
-            logging.info(f"MAINFEATURE IS {job.config.MAINFEATURE} - Skipping move of {track.filename}")
+        if job.config.MAINFEATURE or main_features_only:
+            logging.info(f"MAINFEATURE IS {job.config.MAINFEATURE or 'lifted'} - Skipping move of {track.filename}")
         elif str(job.config.EXTRAS_SUB).lower() != "none":
             utils.move_files(out_path, track.filename, job, False)
         else:

@@ -98,6 +98,8 @@
                                             Title</a>
                                         <a href="bonusdisc?job_id={{ jobs.job_id }}" class="btn btn-primary">Bonus
                                             Disc</a>
+                                        <a href="doublefeature?job_id={{ jobs.job_id }}" class="btn btn-primary">Double
+                                            Feature</a>
                                         <a id="plot" class="btn btn-primary">Plot</a>
                                     </div>
                                 {% endif %}
@@ -119,6 +121,8 @@
                                             Title</a>
                                         <a href="bonusdisc?job_id={{ jobs.job_id }}" class="btn btn-primary">Bonus
                                             Disc</a>
+                                        <a href="doublefeature?job_id={{ jobs.job_id }}" class="btn btn-primary">Double
+                                            Feature</a>
                                         <a id="plot" class="btn btn-primary">Plot</a>
                                     </div>
                                 {% endif %}
@@ -250,6 +254,7 @@
                                     <td style="text-align:left"><strong>films</strong></td>
                                     <td style="text-align:left">
                                         <small class="text-muted">This disc carries {{ films|length }} films. The first is filed in the job folder, the others in their own folders.</small>
+                                        {% if not jobs.finished %}<a href="doublefeature?job_id={{ jobs.job_id }}" class="ml-1"><small>change</small></a>{% endif %}
                                         <ol class="mb-0 pl-3">
                                         {% for film in films %}
                                             <li>{{ film.title }} ({{ film.year }})
