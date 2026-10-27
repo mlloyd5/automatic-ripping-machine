@@ -149,6 +149,17 @@ class TestBestSearchResult(unittest.TestCase):
             identify.update_job(job, {"Search": CARTOONS_D3}, "CARTOONS_D3")
         self.assertEqual(job.title, "Greatest-Cartoons-of-the-Golden-Era-Vol.-3")
 
+    def test_update_job_guesses_when_the_product_title_names_nothing(self):
+        """A product title that is all packaging cannot name the disc, so the label search may still guess."""
+        for packaging in ("DVD", "Blu-ray Disc"):
+            job = _job(label="CARTOONS_D3", disc_barcode_title=packaging)
+            with mock.patch.object(identify.utils, "database_updater", side_effect=_fake_updater):
+                identify.update_job(job, {"Search": CARTOONS_D3}, "CARTOONS_D3")
+            self.assertEqual(job.title, "Greatest-Cartoons-of-the-Golden-Era-Vol.-3", packaging)
+            job = _job(label="CARTOONS_D3", title="CARTOONS_D3", disc_barcode_title=packaging)
+            self.assertFalse(identify.title_from_barcode_product(job))
+            self.assertEqual(job.title, "CARTOONS_D3")
+
 
 @unittest.skipIf(IMPORT_ERROR is not None, f"ARM could not be imported here: {IMPORT_ERROR}")
 class TestBarcodeComesFirst(unittest.TestCase):
@@ -411,6 +422,164 @@ class TestIdentifyFromPhotoVision(unittest.TestCase):
             self.assertFalse(identify.identify_from_photo_vision(job))
         search.assert_not_called()
         self.assertIsNone(job.disc_photo_vision)
+
+
+class _Response:
+    def __init__(self, body):
+        self.body = body
+
+    def read(self):
+        return self.body
+
+
+CARTOONS_PRODUCT = [{"title": "59 Cartoon Classics", "year": None, "raw": "59 Cartoon Classics (DVD)"}]
+# bdmt_eng.xml as a Blu-ray carries it, and one broken beyond repair_bluray_xml
+BDMT_XML = (b'<?xml version="1.0" encoding="utf-8"?><disclib><di:discinfo xmlns:di="urn:BDA:bdmv;discinfo">'
+            b'<di:title><di:name>Cartoon Classics Collection</di:name></di:title></di:discinfo></disclib>')
+BDMT_BROKEN = b'<disclib><di:discinfo><di:title><di:name>Cartoon'
+
+
+@unittest.skipIf(IMPORT_ERROR is not None, f"ARM could not be imported here: {IMPORT_ERROR}")
+class TestIdentifyEndToEnd(unittest.TestCase):
+    """
+    identify() with the real barcode lookup, identify_dvd, identify_bluray and get_video_details:
+    only the network, the CRC64 hash, lsdvd and the database are stand-ins. Job 34 on the ts140:
+    upcitemdb knew the release, TMDB has no title like it, the label is CARTOONS_D3.
+    """
+
+    def setUp(self):
+        os.environ["ARM_CONFIG_FILE"] = _CONFIG
+        if cfg.arm_config_path != _CONFIG:
+            importlib.reload(cfg)
+        cfg.arm_config.update({"GET_VIDEO_TITLE": True, "BARCODE_LOOKUP": True, "METADATA_PROVIDER": "tmdb"})
+        self.mountpoint = tempfile.mkdtemp(prefix="arm_mount_", dir=_TMP)
+        self.searched = []
+        crc_miss = _Response(b'{"success": false, "mode": "s", "results": {}}')
+        self.patches = [
+            mock.patch.object(identify, "check_mount", return_value=True),
+            mock.patch.object(identify, "unmount_disc"),
+            mock.patch.object(identify.utils, "find_file", return_value=False),
+            mock.patch.object(identify.db.session, "commit"),
+            mock.patch.object(identify.utils, "database_updater", side_effect=_fake_updater),
+            mock.patch.object(identify.disc_photo, "lookup_upc", return_value=CARTOONS_PRODUCT),
+            mock.patch.object(identify.pydvdid, "compute", return_value="7f3d5c9a1b2e4d60"),
+            mock.patch.object(identify.urllib.request, "urlopen", return_value=crc_miss),
+            mock.patch.object(identify, "arm_subprocess", return_value=None),
+            mock.patch.object(identify.ui_utils, "tmdb_search",
+                              side_effect=lambda title, year=None: self.searched.append((title, year))
+                              or {"Search": CARTOONS_D3}),
+        ]
+        for patch in self.patches:
+            patch.start()
+
+    def tearDown(self):
+        for patch in self.patches:
+            patch.stop()
+
+    def _job(self, disctype):
+        job = _job(disctype=disctype, disc_barcode="096009736194", label="CARTOONS_D3", title=None, year=None,
+                   devpath="/dev/sr1", mountpoint=self.mountpoint, video_type="movie", crc_id=None)
+        job.get_disc_type = lambda found: None
+        job.pretty_table = lambda: ""
+        return job
+
+    def _bdmt(self, body):
+        folder = os.path.join(self.mountpoint, "BDMV", "META", "DL")
+        os.makedirs(folder, exist_ok=True)
+        with open(os.path.join(folder, "bdmt_eng.xml"), "wb") as handle:
+            handle.write(body)
+
+    def test_dvd_is_named_after_the_product(self):
+        job = self._job("dvd")
+        identify.identify(job)
+        self.assertEqual(self.searched, [("59 Cartoon Classics", None), ("CARTOONS_D3", None),
+                                         ("CARTOONS+D3", None)])
+        self.assertEqual((job.title, job.title_auto, job.year, job.hasnicetitle),
+                         ("59-Cartoon-Classics", "59-Cartoon-Classics", "", False))
+        self.assertEqual(job.crc_id, "7f3d5c9a1b2e4d60")
+
+    def test_bluray_without_metadata_is_named_after_the_product(self):
+        """identify_bluray title-cases the label ("Cartoons D3") when there is no bdmt_eng.xml."""
+        job = self._job("bluray")
+        identify.identify(job)
+        self.assertEqual(self.searched, [("59 Cartoon Classics", None), ("Cartoons+D3", None)])
+        self.assertEqual((job.title, job.title_auto, job.year, job.hasnicetitle),
+                         ("59-Cartoon-Classics", "59-Cartoon-Classics", "", False))
+
+    def test_bluray_with_unreadable_metadata_drops_the_files_year(self):
+        """A broken bdmt_eng.xml leaves the cleaned label and the file's year: neither names the disc."""
+        self._bdmt(BDMT_BROKEN)
+        job = self._job("bluray")
+        identify.identify(job)
+        self.assertEqual((job.title, job.year, job.year_auto, job.hasnicetitle),
+                         ("59-Cartoon-Classics", "", "", False))
+
+    def test_bluray_metadata_title_is_kept(self):
+        self._bdmt(BDMT_XML)
+        job = self._job("bluray")
+        identify.identify(job)
+        self.assertEqual((job.title, job.hasnicetitle), ("Cartoon-Classics-Collection", False))
+        self.assertTrue(job.year.isdigit())
+
+    def test_without_a_barcode_the_label_search_still_guesses(self):
+        job = self._job("dvd")
+        job.disc_barcode = None
+        identify.identify(job)
+        self.assertEqual((job.title, job.year, job.hasnicetitle),
+                         ("Greatest-Cartoons-of-the-Golden-Era-Vol.-3", "2024", True))
+
+
+@unittest.skipIf(IMPORT_ERROR is not None, f"ARM could not be imported here: {IMPORT_ERROR}")
+class TestIdentifyFromPhoto(unittest.TestCase):
+    """The OCR fallback after identify(): success means a title was taken, not that the provider answered."""
+
+    def setUp(self):
+        os.environ["ARM_CONFIG_FILE"] = _CONFIG
+        if cfg.arm_config_path != _CONFIG:
+            importlib.reload(cfg)
+        cfg.arm_config.update({"DISC_PHOTO_OCR": True, "METADATA_PROVIDER": "tmdb"})
+        os.makedirs(cfg.arm_config["DISC_PHOTO_PATH"], exist_ok=True)
+        Path(cfg.arm_config["DISC_PHOTO_PATH"], "sr1_test.jpg").write_bytes(b"jpeg")
+        self.patches = [
+            mock.patch.object(identify.utils, "database_updater", side_effect=_fake_updater),
+            mock.patch.object(identify, "ocr_disc_photo", return_value="GREATEST CARTOONS\n"),
+            mock.patch.object(identify.disc_photo, "clean_ocr_text", return_value=(["GREATEST CARTOONS"], None)),
+        ]
+        for patch in self.patches:
+            patch.start()
+
+    def tearDown(self):
+        for patch in self.patches:
+            patch.stop()
+        cfg.arm_config["DISC_PHOTO_OCR"] = False
+
+    def _job(self, **overrides):
+        return _job(label="CARTOONS_D3", disc_photo="sr1_test.jpg", **overrides)
+
+    def test_near_miss_is_not_reported_once_the_barcode_named_the_disc(self):
+        job = self._job(title="59-Cartoon-Classics", disc_barcode_title="59 Cartoon Classics (DVD)")
+        with mock.patch.object(identify.ui_utils, "tmdb_search", return_value={"Search": CARTOONS_D3}), \
+                self.assertLogs(level="INFO") as logs:
+            self.assertFalse(identify.identify_from_photo(job))
+        self.assertEqual((job.title, job.hasnicetitle), ("59-Cartoon-Classics", False))
+        self.assertEqual(job.disc_photo_ocr, "GREATEST CARTOONS\n")
+        self.assertFalse([line for line in logs.output if "Identified disc from photo" in line])
+
+    def test_exact_match_still_identifies_with_a_barcode(self):
+        job = self._job(title="59-Cartoon-Classics", disc_barcode_title="59 Cartoon Classics (DVD)")
+        exact = CARTOONS_D3 + [_result("Greatest Cartoons", "1999", 4)]
+        with mock.patch.object(identify.ui_utils, "tmdb_search", return_value={"Search": exact}):
+            self.assertTrue(identify.identify_from_photo(job))
+        self.assertEqual((job.title, job.year, job.hasnicetitle), ("Greatest-Cartoons", "1999", True))
+
+    def test_without_a_barcode_the_first_result_is_taken(self):
+        job = self._job()
+        with mock.patch.object(identify.ui_utils, "tmdb_search", return_value={"Search": CARTOONS_D3}):
+            self.assertTrue(identify.identify_from_photo(job))
+        self.assertEqual(job.title, "Greatest-Cartoons-of-the-Golden-Era-Vol.-3")
+        job = self._job()
+        with mock.patch.object(identify.ui_utils, "tmdb_search", return_value={"Search": []}):
+            self.assertFalse(identify.identify_from_photo(job))
 
 
 @unittest.skipIf(IMPORT_ERROR is not None, f"ARM could not be imported here: {IMPORT_ERROR}")

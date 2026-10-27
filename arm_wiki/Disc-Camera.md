@@ -13,7 +13,7 @@ ARM itself only wakes up on the udev `change` event, which fires after the tray 
 3. When a tray goes from **open** to anything else, it saves the frame from `CAMERA_LEAD_SECONDS` earlier, i.e. the disc sitting in the open tray just before it retracted, as `DISC_PHOTO_PATH/<srN>_<YYYYmmdd-HHMMSS>.jpg`.
 4. A few seconds later udev starts the ripper for that drive. The ripper looks for the newest photo of that drive taken within `DISC_PHOTO_MAX_AGE` seconds and stores its filename on the job.
 5. If the case barcode did not identify the disc and `DISC_PHOTO_VISION_URL` is set, the ripper sends the photo to a vision model and searches for the title it reads (see [Vision model](#vision-model)). What the model read is kept on the job and offered on the Title Search / Custom Title pages, and names the disc when nothing online matches it.
-6. If identification still fails and `DISC_PHOTO_OCR` is on, the ripper runs `tesseract` over the photo and tries the largest lines of text as title searches. The raw OCR text is kept on the job and offered on the same pages.
+6. If identification still fails and `DISC_PHOTO_OCR` is on, the ripper runs `tesseract` over the photo and tries the largest lines of text as title searches. The raw OCR text is kept on the job and offered on the same pages. When a [case barcode](Barcode-Scanner) named the product, a line only counts if a provider has a title that is exactly that line; otherwise the disc keeps the product title.
 7. After the rip, the photo is copied to the completed folder as `disc.jpg`.
 
 Photos that no job claims (empty-tray closes, ejects) are deleted after `DISC_PHOTO_RETENTION_DAYS`.

@@ -421,8 +421,10 @@ def update_job(job, search_results, title=None, year=None):
         return None
     # Once the case barcode has named the product, a label search is only a guess at the real
     # title: a page of near misses ("Cartoons D3" finds only "Greatest Cartoons of the Golden
-    # Era Vol. 3") must not outrank the product title (see title_from_barcode_product).
-    product = getattr(job, 'disc_barcode_title', None)
+    # Era Vol. 3") must not outrank the product title (see title_from_barcode_product). Only a
+    # product title that can name the disc counts: one that is all packaging ("DVD") leaves the
+    # label search guessing as before, since nothing would take the guess's place.
+    product, _ = barcode_product_title(job)
     best = best_search_result(search_results['Search'], title, year, exact_only=bool(product))
     if best is None:
         logging.info(f"Search for '{title}' found nothing titled exactly that; the case barcode says the disc "
@@ -653,7 +655,10 @@ def identify_from_photo(job):
     Only runs for video discs that the normal identification could not match
     (``hasnicetitle`` is False), when DISC_PHOTO_OCR is enabled and the job has a photo.
     The raw OCR text is kept on the job so the UI can show it on the title fix page even
-    when no online match is found.
+    when no online match is found. Once the case barcode has named the product the OCR
+    candidates are held to the same rule as the label search (see update_job): only a result
+    titled exactly like a candidate is taken, so a misread photo cannot replace the product
+    title the disc was named after.
 
     :return: True when a title was found from the photo
     """
@@ -681,7 +686,9 @@ def identify_from_photo(job):
         except Exception as error:
             logging.debug(f"Metadata lookup for OCR candidate '{candidate}' failed: {error}")
             response = None
-        if response and 'Search' in response:
+        # A response is not a match: update_job may have refused every result (a barcode named
+        # the product and none is exactly the candidate), so only the job itself can say.
+        if response and job.hasnicetitle:
             logging.info(f"Identified disc from photo as '{job.title}' ({job.year}) via '{candidate}'")
             return True
     logging.info("OCR text did not match any title online")
@@ -962,34 +969,59 @@ def _identify_video_from_barcode(job):
     return False
 
 
+def barcode_product_title(job):
+    """
+    The title and year the case barcode's product title gives a video disc, cleaned of packaging
+    words (``disc_photo.clean_upc_title``).
+
+    :return: ``(title, year)``; ``(None, None)`` when the job has no product title or it is all
+             packaging ("DVD", "Blu-ray Disc")
+    """
+    raw = getattr(job, 'disc_barcode_title', None)
+    if not raw:
+        return None, None
+    return disc_photo.clean_upc_title(raw)
+
+
+def _label_titles(job):
+    """
+    Every title the disc's own identification makes from its label when it finds nothing better:
+    identify_dvd's failsafe keeps the label, identify_bluray without a bdmt_eng.xml title-cases it
+    ("Cartoons D3") and with an unreadable one runs it through the filename cleaner.
+    """
+    label = str(job.label)
+    ascii_label = unicodedata.normalize('NFKD', label).encode('ascii', 'ignore').decode()
+    return {label, label.replace('_', ' ').title(), utils.clean_for_filename(ascii_label)}
+
+
 def title_from_barcode_product(job):
     """
     Name a disc nothing online matched after its case barcode's product title.
 
     Runs last in :func:`identify` for video discs still without a nice title, after
-    :func:`title_from_disc_photo` (the disc's own label, when a vision model read it). A DVD whose
+    :func:`title_from_disc_photo` (the disc's own label, when a vision model read it). A disc whose
     barcode resolved to a product (``disc_barcode_title``) but whose title no provider has, and
     whose label found nothing exact either, would otherwise be filed under its label
-    (``CARTOONS_D3``); the product title ("59 Cartoon Classics") is the better name for the
-    unidentified folder and the title fix page. A title the disc itself supplied (a Blu-ray's
-    bdmt_eng.xml) is kept. ``hasnicetitle`` stays False: this is a name, not an identification.
+    (``CARTOONS_D3``, or ``Cartoons D3`` for a Blu-ray); the product title ("59 Cartoon
+    Classics") is the better name for the unidentified folder and the title fix page. A title
+    the disc itself supplied (a Blu-ray's bdmt_eng.xml) is kept. The year goes with the title:
+    the product's, or none, never the date of a Blu-ray's metadata file. ``hasnicetitle`` stays
+    False: this is a name, not an identification.
 
     :return: True when the title was set from the product title
     """
-    raw = getattr(job, 'disc_barcode_title', None)
-    if job.hasnicetitle or not raw:
+    if job.hasnicetitle or not getattr(job, 'disc_barcode_title', None):
         return False
-    if job.title not in (None, "", "not identified") and str(job.title) != str(job.label):
+    if job.title not in (None, "", "not identified") and str(job.title) not in _label_titles(job):
         return False
-    title, year = disc_photo.clean_upc_title(raw)
+    title, year = barcode_product_title(job)
     if not title:
         return False
     title = utils.clean_for_filename(title)
-    args = {'title': title, 'title_auto': title}
-    if year:
-        args.update({'year': year, 'year_auto': year})
+    year = year or ""
+    args = {'title': title, 'title_auto': title, 'year': year, 'year_auto': year}
     logging.info(f"Nothing online matched the disc; naming it after its case barcode's product title: "
-                 f"'{title}' ({year})")
+                 f"'{title}' ({year or 'no year'})")
     utils.database_updater(args, job)
     return True
 
