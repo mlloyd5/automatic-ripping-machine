@@ -585,10 +585,13 @@ class TestIdentifyEndToEnd(unittest.TestCase):
         return mock.patch.object(identify, "identify_from_photo_vision", side_effect=vision)
 
     def test_dvd_vision_runs_after_the_crc64_miss_and_before_the_label_search(self):
+        crc_miss = _Response(b'{"success": false, "mode": "s", "results": {}}')
         job = self._job("dvd")
-        with self._vision(TOON_TIME):
+        with self._vision(TOON_TIME), \
+                mock.patch.object(identify.urllib.request, "urlopen",
+                                  side_effect=lambda url: self.searched.append("crc64") or crc_miss):
             identify.identify(job)
-        self.assertEqual(self.searched, [("59 Cartoon Classics", None), "vision", ("CARTOONS_D3", None),
+        self.assertEqual(self.searched, [("59 Cartoon Classics", None), "crc64", "vision", ("CARTOONS_D3", None),
                                          ("CARTOONS+D3", None)])
         self.assertEqual((job.title, job.year, job.hasnicetitle), ("Toon-Time--Ultimate-Cartoon-Collection", "2011",
                                                                    False))
@@ -616,10 +619,12 @@ class TestIdentifyEndToEnd(unittest.TestCase):
         job = self._job("bluray")
         with self._vision(TOON_TIME):
             identify.identify(job)
-        # then get_video_details searches the cleaned label (the metadata file's year, the year
-        # before, no year: every page of near misses is refused once the barcode named the product)
-        self.assertEqual(self.searched[:2], [("59 Cartoon Classics", None), "vision"])
-        self.assertEqual({title for title, year in self.searched[2:]}, {"CARTOONS+D3"})
+        # then get_video_details searches the cleaned label with the metadata file's year, the year
+        # before, then no year: every page of near misses is refused once the barcode named the product
+        file_year = datetime.fromtimestamp(
+            os.path.getmtime(os.path.join(self.mountpoint, "BDMV", "META", "DL", "bdmt_eng.xml"))).year
+        self.assertEqual(self.searched, [("59 Cartoon Classics", None), "vision", ("CARTOONS+D3", str(file_year)),
+                                         ("CARTOONS+D3", str(file_year - 1)), ("CARTOONS+D3", None)])
         self.assertEqual((job.title, job.year, job.year_auto, job.hasnicetitle),
                          ("Toon-Time--Ultimate-Cartoon-Collection", "2011", "2011", False))
         self.searched.clear()
@@ -650,6 +655,61 @@ class TestIdentifyEndToEnd(unittest.TestCase):
                        disc_photo_vision=json.dumps(dict(TOON_TIME, year=None)))
             self.assertTrue(identify.title_from_disc_photo(job), label_title)
             self.assertEqual((job.title, job.year, job.year_auto), ("Toon-Time--Ultimate-Cartoon-Collection", "", ""))
+
+    def _read_by_vision(self, answer, label_search):
+        """
+        The real identify_from_photo_vision with only the model stubbed. Every search finds the
+        near misses; a search for the volume label also finds ``label_search`` results.
+        """
+        def tmdb(title, year=None):
+            self.searched.append((title, year))
+            if title.replace("+", "_").upper() == "CARTOONS_D3":
+                return {"Search": CARTOONS_D3 + label_search}
+            return {"Search": CARTOONS_D3}
+
+        cfg.arm_config["DISC_PHOTO_VISION_URL"] = "http://llm:11434"
+        self.addCleanup(cfg.arm_config.__setitem__, "DISC_PHOTO_VISION_URL", "")
+        return [mock.patch.object(identify.disc_vision, "read_disc_photo", return_value=dict(answer)),
+                mock.patch.object(identify.ui_utils, "tmdb_search", side_effect=tmdb)]
+
+    def _identify_without_a_barcode(self, disctype, label_search=()):
+        job = self._job(disctype)
+        job.disc_barcode = None
+        job.disc_photo = "sr1_20261026-120000.jpg"
+        patches = self._read_by_vision(TOON_TIME, list(label_search))
+        for patch in patches:
+            patch.start()
+        try:
+            identify.identify(job)
+        finally:
+            for patch in patches:
+                patch.stop()
+        return job
+
+    def test_without_a_barcode_a_confident_read_is_not_replaced_by_the_label_search(self):
+        """The label search's near miss used to win when no barcode made it exact-only."""
+        for disctype in ("dvd", "bluray"):
+            self.searched.clear()
+            job = self._identify_without_a_barcode(disctype)
+            searched = [title for title, year in self.searched]
+            self.assertEqual(searched[:6], ["Toon Time"] * 3 + ["Toon Time: Ultimate Cartoon Collection"] * 3,
+                             disctype)
+            self.assertTrue(searched[6:], disctype)  # then the label search, which is refused
+            self.assertEqual((job.title, job.year, job.hasnicetitle),
+                             ("Toon-Time--Ultimate-Cartoon-Collection", "2011", False), disctype)
+
+    def test_without_a_barcode_an_exact_label_match_still_wins_over_the_read(self):
+        for disctype in ("dvd", "bluray"):
+            job = self._identify_without_a_barcode(disctype, [_result("Cartoons D3", "2009", 3)])
+            self.assertEqual((job.title, job.year, job.hasnicetitle), ("Cartoons-D3", "2009", True), disctype)
+
+    def test_without_a_barcode_or_a_read_the_label_search_still_guesses(self):
+        self.assertIsNone(identify.disc_label_read_title(_job()))
+        job = _job(label="CARTOONS_D3", disc_barcode=None,
+                   disc_photo_vision=json.dumps(dict(TOON_TIME, confidence=0.3)))
+        with mock.patch.object(identify.utils, "database_updater", side_effect=_fake_updater):
+            identify.update_job(job, {"Search": CARTOONS_D3}, "CARTOONS_D3")
+        self.assertEqual((job.title, job.hasnicetitle), ("Greatest-Cartoons-of-the-Golden-Era-Vol.-3", True))
 
     def test_without_a_barcode_the_first_answer_ends_the_year_retries(self):
         job = self._job("bluray")

@@ -428,7 +428,9 @@ def update_job(job, search_results, title=None, year=None):
     :param job: job obj
     :param search_results: json returned from metadata provider
     :param title: the title that was searched for, to prefer an exact match (see best_search_result);
-                  when the job carries a product title from its case barcode only an exact match counts
+                  when the job carries a product title from its case barcode, or a title the vision
+                  model read off the disc photo surely enough to name the disc, only an exact match
+                  counts
     :param year: the year that was searched for
     :return: None if error or nothing acceptable
     """
@@ -439,12 +441,16 @@ def update_job(job, search_results, title=None, year=None):
     # title: a page of near misses ("Cartoons D3" finds only "Greatest Cartoons of the Golden
     # Era Vol. 3") must not outrank the product title (see title_from_barcode_product). Only a
     # product title that can name the disc counts: one that is all packaging ("DVD") leaves the
-    # label search guessing as before, since nothing would take the guess's place.
+    # label search guessing as before, since nothing would take the guess's place. A title the
+    # vision model read off the disc label counts the same way (see title_from_disc_photo): with
+    # neither, the label search takes the provider's first result as it always has.
     product, _ = barcode_product_title(job)
-    best = best_search_result(search_results['Search'], title, year, exact_only=bool(product))
+    read = disc_label_read_title(job)
+    best = best_search_result(search_results['Search'], title, year, exact_only=bool(product or read))
     if best is None:
-        logging.info(f"Search for '{title}' found nothing titled exactly that; the case barcode says the disc "
-                     f"is '{product}', so '{search_results['Search'][0]['Title']}' is not taken")
+        source = f"the disc label reads '{read}'" if read else f"the case barcode says the disc is '{product}'"
+        logging.info(f"Search for '{title}' found nothing titled exactly that; {source}, "
+                     f"so '{search_results['Search'][0]['Title']}' is not taken")
         return None
     if best is not search_results['Search'][0]:
         logging.info(f"Search for '{title}' returned '{search_results['Search'][0]['Title']}' first; "
@@ -682,7 +688,7 @@ def identify_from_photo(job):
         return False
     if job.disctype not in ["dvd", "bluray"] or not job.disc_photo or job.hasnicetitle:
         return False
-    vision_title, _ = disc_vision.label_title(disc_vision.parse_answer(getattr(job, 'disc_photo_vision', None)))
+    vision_title = disc_label_read_title(job)
     if vision_title:
         logging.info(f"The vision model read the disc label as '{vision_title}'; not running OCR on the photo")
         return False
@@ -712,6 +718,15 @@ def identify_from_photo(job):
             return True
     logging.info("OCR text did not match any title online")
     return False
+
+
+def disc_label_read_title(job):
+    """
+    The title the vision model read off the disc photo, when it was sure enough of it to name the
+    disc (:data:`disc_vision.NAME_CONFIDENCE`, see :func:`title_from_disc_photo`), else None.
+    """
+    title, _ = disc_vision.label_title(disc_vision.parse_answer(getattr(job, 'disc_photo_vision', None)))
+    return title
 
 
 def identify_vision_step(job):
