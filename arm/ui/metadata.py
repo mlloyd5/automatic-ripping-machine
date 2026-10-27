@@ -73,13 +73,18 @@ def get_omdb_poster(title=None, year=None, imdb_id=None, plot="short"):
         str_url = f"https://www.omdbapi.com/?i={imdb_id}&plot={plot}&r=json&apikey={omdb_api_key}"
         str_url_2 = ""
     elif title:
-        str_url = f"https://www.omdbapi.com/?s={title}&y={year}&plot={plot}&r=json&apikey={omdb_api_key}"
-        str_url_2 = f"https://www.omdbapi.com/?t={title}&y={year}&plot={plot}&r=json&apikey={omdb_api_key}"
+        # urlencode so a title with "&", "#", "+" or "?" is one parameter rather than a cut-off query
+        params = {"plot": plot, "r": "json", "apikey": omdb_api_key}
+        if year:
+            # left out when unknown; urlencode would otherwise send the literal string "y=None"
+            params["y"] = year
+        str_url = "https://www.omdbapi.com/?" + urllib.parse.urlencode({"s": title, **params})
+        str_url_2 = "https://www.omdbapi.com/?" + urllib.parse.urlencode({"t": title, **params})
     else:
         app.logger.debug("no params")
         return None, None
     try:
-        title_info_json = urllib.request.urlopen(requests.utils.requote_uri(str_url)).read()
+        title_info_json = urllib.request.urlopen(str_url).read()
     except Exception as error:
         app.logger.debug(f"Failed to reach OMdb - {error}")
     else:
@@ -89,7 +94,7 @@ def get_omdb_poster(title=None, year=None, imdb_id=None, plot="short"):
             return title_info['Search'][0]['Poster'], title_info['Search'][0]['imdbID']
 
         try:
-            title_info_json2 = urllib.request.urlopen(requests.utils.requote_uri(str_url_2)).read()
+            title_info_json2 = urllib.request.urlopen(str_url_2).read()
             title_info2 = json.loads(title_info_json2.decode())
             # app.logger.debug("omdb - " + str(title_info2))
             if 'Error' not in title_info2:
