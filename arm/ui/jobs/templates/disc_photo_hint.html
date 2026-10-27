@@ -1,4 +1,4 @@
-{# Disc photo, barcode and OCR hints shown above the title forms. Expects `job` and optional `ocr` (dict with candidates/year/barcode). #}
+{# Disc photo, vision model, barcode and OCR hints shown above the title forms. Expects `job` and optional `ocr` (dict with candidates/year/barcode/vision). #}
 {% if job and (job.disc_photo or ocr) %}
 <div class="container mb-3">
     <div class="row justify-content-center">
@@ -13,6 +13,16 @@
         {% if ocr %}
         <div class="col-md-5">
             <div class="alert alert-secondary mb-0" role="alert">
+                {% if ocr.vision %}
+                    <strong>Disc label:</strong>
+                    <a href="#" class="ocr-candidate" data-title="{{ ocr.vision.titles[-1] }}"
+                       title="Read off the disc photo by the vision model{% if ocr.vision.studio %}, {{ ocr.vision.studio }}{% endif %}">{{ ocr.vision.titles[-1] }}</a>
+                    {% if ocr.vision.year %}({{ ocr.vision.year }}){% endif %}
+                    <small class="text-muted">
+                        {{ (ocr.vision.confidence * 100) | round | int }}% sure{% if ocr.vision.disc_number %}, {{ ocr.vision.disc_number }}{% endif %}
+                    </small>
+                    <br/>
+                {% endif %}
                 {% if ocr.barcode %}
                     <strong>Case barcode:</strong> <code>{{ ocr.barcode.code }}</code>
                     {% if ocr.barcode.title %}
