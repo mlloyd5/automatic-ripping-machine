@@ -25,6 +25,7 @@ import io
 import json
 import logging
 import re
+import unicodedata
 from typing import List, Optional, Tuple
 
 import requests
@@ -203,8 +204,15 @@ def parse_answer(text) -> Optional[dict]:
 
 
 def _words(text) -> List[str]:
-    """The lower-case words and numbers in a text: "Jimmy Neutron: Boy Genius" -> jimmy neutron boy genius."""
-    return re.findall(r"[a-z0-9]+", str(text or "").lower())
+    """
+    The lower-case words and numbers in a text: "Jimmy Neutron: Boy Genius" -> jimmy neutron boy genius.
+    Accents are folded away ("Amélie" -> amelie, "Pokémon" -> pokemon), so a title spelled with one
+    in one field and without in the other still matches, and a letter with no ASCII form ("ø") is
+    kept as it is rather than dropped.
+    """
+    decomposed = unicodedata.normalize("NFKD", str(text or ""))
+    folded = "".join(char for char in decomposed if not unicodedata.combining(char)).casefold()
+    return re.findall(r"[^\W_]+", folded)
 
 
 def _words_legible(text, legible) -> bool:

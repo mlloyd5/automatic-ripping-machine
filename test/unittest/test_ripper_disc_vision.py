@@ -361,6 +361,16 @@ class TestReadOffLabel(unittest.TestCase):
         self.assertFalse(disc_vision.read_off_label(disc_vision.parse_answer(men_in_black)))
         self.assertTrue(disc_vision.read_off_label(disc_vision.parse_answer(_label("Up", 0.9))))
 
+    def test_accents_fold_before_the_words_are_compared(self):
+        amelie = _label("Amélie", 0.9, legible_text=["AMELIE", "Miramax"])
+        self.assertTrue(disc_vision.read_off_label(disc_vision.parse_answer(amelie)))
+        pokemon = _label("Pokemon: The First Movie", 0.9, legible_text=["POKéMON", "THE", "FIRST", "MOVIE"])
+        self.assertTrue(disc_vision.read_off_label(disc_vision.parse_answer(pokemon)))
+        self.assertEqual(disc_vision._words("Léon: The Professional"), ["leon", "the", "professional"])
+        # a title of accented letters only still counts its letters (not 0) against MIN_TITLE_CHARACTERS
+        self.assertTrue(disc_vision.read_off_label(disc_vision.parse_answer(_label("Ôé", 0.9, legible_text=["OE"]))))
+        self.assertEqual(disc_vision._words("Ø_snake"), ["ø", "snake"])
+
     def test_scene_of(self):
         self.assertEqual(disc_vision.scene_of('{"scene": " Empty_Tray "}'), "empty_tray")
         self.assertEqual(disc_vision.scene_of({"scene": "blurry"}), "blurry")
