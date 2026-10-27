@@ -47,9 +47,13 @@ DUPLICATE_DURATION_TOLERANCE = 2  # [s]
 DUPLICATE_FILESIZE_TOLERANCE = 0.02
 """Titles whose sizes differ by more than this fraction of the larger one are never treated as duplicates"""
 DISC_OPEN_ATTEMPTS = 3
-"""How often makemkvcon info, or a rip, is run before a disc it cannot open is given up on"""
+"""How often makemkvcon info is run before a disc it cannot open is given up on"""
 DISC_OPEN_RETRY_WAIT = 30  # [s]
 """Pause between those attempts"""
+RIP_OPEN_ATTEMPTS = 5
+"""How often a rip (makemkvcon mkv or backup) is started before a disc it cannot open is given up on"""
+RIP_OPEN_RETRY_WAIT = 120  # [s]
+"""Pause before each rip retry, on top of waiting for another drive's info scan to finish"""
 MAKEMKV_INFO_LOCK = os.path.join(tempfile.gettempdir(), "arm-makemkv-info.lock")
 """Held by the running makemkvcon info scan; the rippers of all drives share it"""
 MAKEMKV_INFO_LOCK_TIMEOUT = 900  # [s]
@@ -1414,24 +1418,39 @@ def run_rip(cmd):
     so the rip is started again, as get_track_info does for the scan. A rip that fails after the
     disc opened is not retried: MakeMKV cannot resume it.
 
+    "Failed to open disc" (MSG:5010) decides it, whatever makemkvcon exits with: it can print it
+    and still exit 0, and that run has ripped nothing. Another drive being busy is what makes it
+    fail, which can last minutes, so the attempts are spread over several minutes and each retry
+    also waits for any other drive's info scan to finish (see info_scan_lock). The lock is only
+    waited for, not held during the rip, so other drives can still scan while this one rips.
+
     Parameters:
         cmd (list): makemkvcon cli options
     Raises:
-        MakeMkvRuntimeError when makemkvcon fails for another reason or after the last attempt
+        MakeMkvRuntimeError when makemkvcon fails for another reason, or still cannot open the
+        disc on the last attempt
     """
-    for attempt in range(1, DISC_OPEN_ATTEMPTS + 1):
+    for attempt in range(1, RIP_OPEN_ATTEMPTS + 1):
+        if attempt > 1:
+            logging.warning(f"MakeMKV could not open the disc to rip it (attempt {attempt - 1} of "
+                            f"{RIP_OPEN_ATTEMPTS}); trying again in {RIP_OPEN_RETRY_WAIT}s")
+            sleep(RIP_OPEN_RETRY_WAIT)
+            with info_scan_lock():
+                # only wait until no other drive is scanning; the rip itself runs outside the lock
+                pass
         open_failed = False
         try:
             for message in run(cmd, OutputType.MSG):
                 if isinstance(message, MakeMKVMessage) and message.code == MessageID.RIP_DISC_OPEN_ERROR:
                     open_failed = True
-            return
         except MakeMkvRuntimeError:
-            if not open_failed or attempt == DISC_OPEN_ATTEMPTS:
+            if not open_failed or attempt == RIP_OPEN_ATTEMPTS:
                 raise
-        logging.warning(f"MakeMKV could not open the disc to rip it (attempt {attempt} of {DISC_OPEN_ATTEMPTS}); "
-                        f"trying again in {DISC_OPEN_RETRY_WAIT}s")
-        sleep(DISC_OPEN_RETRY_WAIT)
+            continue
+        if not open_failed:
+            return
+    logging.error(f"MakeMKV could not open the disc to rip it after {RIP_OPEN_ATTEMPTS} attempts")
+    raise MakeMkvRuntimeError(0, cmd)
 
 
 def run(options, select):

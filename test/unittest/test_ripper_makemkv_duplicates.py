@@ -5,6 +5,7 @@ Importing ``arm.ripper.makemkv`` pulls in the whole of ARM (config, Flask app, d
 throwaway arm.yaml is written first and pointed at with ARM_CONFIG_FILE. Needs the Linux
 dependencies ARM itself needs (libdiscid, pyudev); skipped when they are missing.
 """
+import contextlib
 import fcntl
 import importlib
 import os
@@ -325,45 +326,95 @@ class TestRipRetry(unittest.TestCase):
                     '"Failed to save title %1 to file %2","0","t00.mkv"']
     CMD = ["mkv", "dev:/dev/sr1", "all", "/raw"]
 
-    def _rip(self, *outputs):
-        """Run run_rip against makemkvcon runs that print these lines; a run with a 5010 or 5003 exits 11."""
+    def _fake_run(self, outputs, events=None):
+        """
+        A stand-in for makemkv.run: each call prints the next (lines, exit code) of `outputs`,
+        and a non-zero exit code raises MakeMkvRuntimeError as run does
+        """
         runs = iter(outputs)
 
         def run(options, select):
-            lines = next(runs)
+            if events is not None:
+                events.append("run")
+            lines, returncode = next(runs)
             for line in lines:
                 msg_type, data = makemkv.parse_line(line)
                 if msg_type in select:
                     yield data
-            if lines is not self.RIPPED:
-                raise makemkv.MakeMkvRuntimeError(11, options)
+            if returncode:
+                raise makemkv.MakeMkvRuntimeError(returncode, options)
+        return run
 
-        with mock.patch.object(makemkv, "run", side_effect=run) as rip, \
-                mock.patch.object(makemkv, "sleep") as pause:
-            try:
+    def _rip(self, *outputs, rip=None):
+        """Run `rip` (run_rip by default) against these makemkvcon runs; returns (runs, pauses, failed)."""
+        if rip is None:
+            def rip():
                 makemkv.run_rip(list(self.CMD))
+        with mock.patch.object(makemkv, "run", side_effect=self._fake_run(outputs)) as run, \
+                mock.patch.object(makemkv, "sleep") as pause, \
+                mock.patch.object(makemkv, "info_scan_lock"):
+            try:
+                rip()
                 failed = False
             except makemkv.MakeMkvRuntimeError:
                 failed = True
-        return rip.call_count, pause.call_count, failed
+        return run.call_count, pause.call_count, failed
 
     def test_opens_on_the_second_try(self):
-        self.assertEqual(self._rip(self.OPEN_FAILED, self.RIPPED), (2, 1, False))
+        self.assertEqual(self._rip((self.OPEN_FAILED, 11), (self.RIPPED, 0)), (2, 1, False))
 
     def test_gives_up_after_the_last_attempt(self):
-        self.assertEqual(self._rip(*[self.OPEN_FAILED] * makemkv.DISC_OPEN_ATTEMPTS),
-                         (makemkv.DISC_OPEN_ATTEMPTS, makemkv.DISC_OPEN_ATTEMPTS - 1, True))
+        self.assertEqual(self._rip(*[(self.OPEN_FAILED, 11)] * makemkv.RIP_OPEN_ATTEMPTS),
+                         (makemkv.RIP_OPEN_ATTEMPTS, makemkv.RIP_OPEN_ATTEMPTS - 1, True))
+
+    def test_open_failure_with_a_clean_exit_is_retried(self):
+        # makemkvcon can print "Failed to open disc" and still exit 0; that run ripped nothing
+        self.assertEqual(self._rip((self.OPEN_FAILED, 0), (self.RIPPED, 0)), (2, 1, False))
+
+    def test_open_failure_with_a_clean_exit_on_the_last_attempt_fails_the_job(self):
+        self.assertEqual(self._rip(*[(self.OPEN_FAILED, 0)] * makemkv.RIP_OPEN_ATTEMPTS),
+                         (makemkv.RIP_OPEN_ATTEMPTS, makemkv.RIP_OPEN_ATTEMPTS - 1, True))
+
+    def test_failure_without_an_open_error_is_not_retried(self):
+        # makemkvcon exits non-zero without a 5010: not an open failure, so the job fails at once
+        self.assertEqual(self._rip(([], 11)), (1, 0, True))
 
     def test_failure_after_the_disc_opened_is_not_retried(self):
         # A drive that resets halfway through the film: MakeMKV cannot resume, so the job fails
-        self.assertEqual(self._rip(self.TITLE_FAILED), (1, 0, True))
+        self.assertEqual(self._rip((self.TITLE_FAILED, 11)), (1, 0, True))
 
-    def test_mainfeature_rip_is_retried(self):
+    def test_retry_waits_for_other_drives_scans_but_does_not_hold_the_lock(self):
+        events = []
+
+        @contextlib.contextmanager
+        def lock():
+            events.append("lock")
+            yield
+            events.append("unlock")
+
+        run = self._fake_run([(self.OPEN_FAILED, 11), (self.RIPPED, 0)], events)
+        with mock.patch.object(makemkv, "run", side_effect=run), \
+                mock.patch.object(makemkv, "sleep", side_effect=lambda _: events.append("sleep")), \
+                mock.patch.object(makemkv, "info_scan_lock", side_effect=lock):
+            makemkv.run_rip(list(self.CMD))
+        self.assertEqual(events, ["run", "sleep", "lock", "unlock", "run"])
+
+    def test_every_rip_is_retried(self):
         track = _track(0, 5587, 0, 20)
-        with mock.patch.object(makemkv, "run_rip") as rip, \
-                mock.patch.object(makemkv, "progress_log", return_value="/tmp/progress.log"):
-            makemkv.rip_mainfeature(_job([track]), track, "/raw")
-        rip.assert_called_once()
+        progress = os.path.join(_TMP, "progress.log")
+        entry_points = {
+            "mainfeature": lambda: makemkv.rip_mainfeature(_job([track]), track, "/raw"),
+            "backup": lambda: makemkv.makemkv_backup(_job([track]), "/raw"),
+            "mkv all": lambda: makemkv.makemkv_mkv(_job([track], SKIP_DUPLICATE_TITLES=False), "/raw"),
+            "single tracks": lambda: makemkv.process_single_tracks(_job([track]), "/raw", "auto"),
+        }
+        for name, rip in entry_points.items():
+            with self.subTest(name), \
+                    mock.patch.object(makemkv, "progress_log", return_value=progress), \
+                    mock.patch.object(makemkv.utils, "get_drive_mode", return_value="auto"), \
+                    mock.patch.object(makemkv, "get_track_info"), \
+                    mock.patch.object(makemkv.db.session, "commit"):
+                self.assertEqual(self._rip((self.OPEN_FAILED, 11), (self.RIPPED, 0), rip=rip), (2, 1, False))
 
 
 @unittest.skipIf(IMPORT_ERROR is not None, f"ARM could not be imported here: {IMPORT_ERROR}")
