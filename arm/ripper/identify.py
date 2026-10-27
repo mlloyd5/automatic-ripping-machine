@@ -293,7 +293,9 @@ def identify_dvd(job, title_known=False):
         logging.info(f"Title already identified from the case barcode: {job.title} ({job.year})")
     else:
         try:
-            dvd_info_xml = metadata_selector(job, dvd_title, year)
+            dvd_info_xml, refused = search_and_update(job, dvd_title, year)
+            if refused and year:
+                dvd_info_xml = None  # the exact title may be filed under another year, or none
             logging.debug(f"DVD_INFO_XML: {dvd_info_xml}")
             identify_loop(job, dvd_info_xml, dvd_title, year)
         except Exception:
@@ -465,6 +467,17 @@ def metadata_selector(job, title=None, year=None):
 
     :return: json/dict object or None
     """
+    return search_and_update(job, title, year)[0]
+
+
+def search_and_update(job, title=None, year=None):
+    """
+    :func:`metadata_selector`, also saying whether update_job refused every result the provider
+    returned (only an exact match counts once a case barcode has named the product, see
+    update_job). A refused response is an answer, but not one the job took.
+
+    :return: ``(search results or None, refused)``
+    """
     # A disc whose label could not be read is given the placeholder
     # "not identified" in identify_dvd(). Searching for that string finds real
     # films with unhelpful names -- TMDB matches a 2018 Brazilian film titled
@@ -474,22 +487,24 @@ def metadata_selector(job, title=None, year=None):
     # placeholder. Refuse the search here instead, where every caller passes.
     if title is None or str(title).strip().lower() in ("", "not identified"):
         logging.info(f"Not searching for placeholder title: {title!r}")
-        return None
+        return None, False
     search_results = None
+    applied = None
     if cfg.arm_config['METADATA_PROVIDER'].lower() == "tmdb":
         logging.debug("provider tmdb")
         search_results = ui_utils.tmdb_search(title, year)
         if search_results is not None:
-            update_job(job, search_results, title, year)
+            applied = update_job(job, search_results, title, year)
     elif cfg.arm_config['METADATA_PROVIDER'].lower() == "omdb":
         logging.debug("provider omdb")
         search_results = ui_utils.call_omdb_api(str(title), str(year))
         if search_results is not None:
-            update_job(job, search_results, title, year)
+            applied = update_job(job, search_results, title, year)
     else:
         logging.debug(cfg.arm_config['METADATA_PROVIDER'])
         logging.debug("unknown provider - doing nothing, saying nothing. Getting Kryten")
-    return search_results
+    refused = applied is None and bool((search_results or {}).get('Search'))
+    return search_results, refused
 
 
 def identify_loop(job, response, title, year):
@@ -504,10 +519,8 @@ def identify_loop(job, response, title, year):
     # this is a little kludgy, but it kind of works...
     logging.debug(f"Response = {response}")
     if response is None:
-        # try with year first
-        response = try_with_year(job, response, title, year)
-        # try submitting without the year
-        response = try_without_year(job, response, title)
+        # with the year, the year before, then without a year
+        response = search_with_year_retries(job, title, year)
 
         if response is None:
             while response is None and title.find("-") > 0:
@@ -528,43 +541,30 @@ def identify_loop(job, response, title, year):
                     response = metadata_selector(job, title)
 
 
-def try_without_year(job, response, title):
+def search_with_year_retries(job, title, year=None):
     """
+    Search a title with the year, the year before it (a disc often comes out the year after the
+    film), then without a year, stopping at the first attempt the provider answers. An answer
+    whose every result update_job refused (exact matches only once a case barcode has named the
+    product) does not stop the retries: the exact title may only turn up under another year, or
+    none (a Blu-ray's metadata file gives its own date, not the film's).
 
-    :param job:
-    :param response:
-    :param title:
-    :return:
+    :return: the response that was taken, else the last refused one, else None (no attempt got
+             an answer, so callers may shorten the title and try again)
     """
-    if response is None:
-        logging.debug("Removing year...")
-        response = metadata_selector(job, title)
+    attempts = [str(year), str(int(year) - 1)] if year and str(year).isdigit() else []
+    attempts.append(None)
+    refused_response = None
+    for attempt in attempts:
+        logging.debug(f"Trying title: {title} year: {attempt}")
+        response, refused = search_and_update(job, title, attempt)
         logging.debug(f"response: {response}")
-    return response
-
-
-def try_with_year(job, response, title, year):
-    """
-
-    :param job:
-    :param response:
-    :param title:
-    :param year:
-    :return:
-    """
-    # If we have a response don't overwrite it
-    if response is not None:
-        return response
-    if year:
-        response = metadata_selector(job, title, str(year))
-        logging.debug(f"response: {response}")
-    # If we still don't have a response try removing a year off
-    if response is None and year:
-        # This accounts for when
-        # the dvd release date is the year following the movie release date
-        logging.debug("Subtracting 1 year...")
-        response = metadata_selector(job, title, str(int(year) - 1))
-    return response
+        if response is None:
+            continue
+        if not refused:
+            return response
+        refused_response = response
+    return refused_response
 
 
 def repair_bluray_xml(xml_data):
@@ -673,8 +673,7 @@ def identify_from_photo(job):
 
     for candidate in candidates:
         try:
-            response = try_with_year(job, None, candidate, year)
-            response = try_without_year(job, response, candidate)
+            response = search_with_year_retries(job, candidate, year)
         except Exception as error:
             logging.debug(f"Metadata lookup for OCR candidate '{candidate}' failed: {error}")
             response = None
