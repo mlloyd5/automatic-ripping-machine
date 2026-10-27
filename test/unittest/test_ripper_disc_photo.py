@@ -227,6 +227,15 @@ class TestCleanUpcTitle(unittest.TestCase):
                          ("Thomas & Friends - Best of James", "2002"))
         self.assertEqual(disc_photo.clean_upc_title("Breaking Bad \u2013 Season 2 (DVD)"), ("Breaking Bad", None))
 
+    def test_unspaced_en_dash_joins_like_a_hyphen(self):
+        """A year range is not a trailing year: "1941\u20131945" must not become the title "... 1941" from 1945."""
+        self.assertEqual(disc_photo.clean_upc_title("The War 1941\u20131945 (DVD)"), ("The War 1941-1945", None))
+        self.assertEqual(disc_photo.clean_upc_title("Beatles Anthology 1962\u20131970"),
+                         ("Beatles Anthology 1962-1970", None))
+        self.assertEqual(disc_photo.clean_upc_title("Rolling Stones \u2013 Live 1969\u20131970 [DVD]"),
+                         ("Rolling Stones - Live 1969-1970", None))
+        self.assertEqual(disc_photo.clean_upc_title("X\u2013Men (DVD, 2000)"), ("X-Men", "2000"))
+
     def test_nothing_left(self):
         self.assertEqual(disc_photo.clean_upc_title("DVD"), (None, None))
         self.assertEqual(disc_photo.clean_upc_title(""), (None, None))
