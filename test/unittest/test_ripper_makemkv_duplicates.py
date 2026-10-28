@@ -324,7 +324,7 @@ class TestRipRetry(unittest.TestCase):
                     '"Failed to save title %1 to file %2","0","t00.mkv"']
     CMD = ["mkv", "dev:/dev/sr1", "all", "/raw"]
 
-    def _fake_run(self, outputs, events=None):
+    def _fake_run(self, outputs):
         """
         A stand-in for makemkv.run: each call prints the next (lines, exit code) of `outputs`,
         and a non-zero exit code raises MakeMkvRuntimeError as run does
@@ -332,8 +332,6 @@ class TestRipRetry(unittest.TestCase):
         runs = iter(outputs)
 
         def run(options, select):
-            if events is not None:
-                events.append("run")
             lines, returncode = next(runs)
             for line in lines:
                 msg_type, data = makemkv.parse_line(line)
@@ -396,6 +394,37 @@ class TestRipRetry(unittest.TestCase):
                     mock.patch.object(makemkv, "get_track_info"), \
                     mock.patch.object(makemkv.db.session, "commit"):
                 self.assertEqual(self._rip((self.OPEN_FAILED, 11), (self.RIPPED, 0), rip=rip), (2, 1, False))
+
+
+@unittest.skipIf(IMPORT_ERROR is not None, f"ARM could not be imported here: {IMPORT_ERROR}")
+class TestMakemkvInfo(unittest.TestCase):
+    """makemkv_info runs one makemkvcon info scan and sets the job's status around it."""
+
+    def setUp(self):
+        self.job = SimpleNamespace(status="", config=SimpleNamespace(MINLENGTH="600", MANUAL_WAIT_TIME=60))
+        patches = [
+            mock.patch.object(makemkv, "run", return_value=iter(())),
+            mock.patch.object(makemkv.utils, "sleep_check_process"),
+            mock.patch.dict(makemkv.cfg.arm_config, {"MAX_CONCURRENT_MAKEMKVINFO": 0}),
+        ]
+        self.run_mock, self.wait_mock, _ = [patch.start() for patch in patches]
+        for patch in patches:
+            self.addCleanup(patch.stop)
+
+    def test_runs_makemkvcon_info(self):
+        with mock.patch.object(makemkv.db.session, "commit"):
+            list(makemkv.makemkv_info(self.job, index=0))
+        self.run_mock.assert_called_once_with(["info", "--cache=1", "disc:0", "--minlength=600"], mock.ANY)
+        self.assertEqual(self.job.status, makemkv.JobState.VIDEO_RIPPING.value)
+
+    def test_failed_status_commit_is_raised_as_is(self):
+        # "database is locked" with two rippers writing at once: the scan has not started, so the
+        # clean-up after it does not run (it would fail on the broken session and hide this error)
+        with mock.patch.object(makemkv.db.session, "commit", side_effect=[None, RuntimeError("database is locked")]), \
+                self.assertRaisesRegex(RuntimeError, "database is locked"):
+            list(makemkv.makemkv_info(self.job, index=0))
+        self.run_mock.assert_not_called()
+        self.wait_mock.assert_called_once()
 
 
 if __name__ == '__main__':

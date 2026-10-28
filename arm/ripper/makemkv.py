@@ -622,9 +622,9 @@ def makemkv_info(job, select=None, index=9999, options=None):
     job.status = JobState.VIDEO_WAITING.value
     db.session.commit()
     utils.sleep_check_process("makemkvcon", max_processes, sleep=(10, wait_time, 10))
+    job.status = JobState.VIDEO_INFO.value
+    db.session.commit()
     try:
-        job.status = JobState.VIDEO_INFO.value
-        db.session.commit()
         yield from run(info_options, select)
     finally:
         logging.info("MakeMKV info exits.")
