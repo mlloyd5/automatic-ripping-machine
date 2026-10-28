@@ -1225,9 +1225,10 @@ def _titles_match(kept, candidate, disctype=None):
     if abs(int(kept.length or 0) - int(candidate.length or 0)) > DUPLICATE_DURATION_TOLERANCE:
         return False
     kept_size, candidate_size = int(kept.filesize or 0), int(candidate.filesize or 0)
-    if abs(kept_size - candidate_size) > max(kept_size, candidate_size) * DUPLICATE_FILESIZE_TOLERANCE:
-        return False
-    if disctype == "dvd" and not (kept_size > 0 and kept_size == candidate_size):
+    if disctype == "dvd":
+        if not (kept_size > 0 and kept_size == candidate_size):
+            return False
+    elif abs(kept_size - candidate_size) > max(kept_size, candidate_size) * DUPLICATE_FILESIZE_TOLERANCE:
         return False
     kept_map = (kept.segment_map or "").strip()
     candidate_map = (candidate.segment_map or "").strip()
