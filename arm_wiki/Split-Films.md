@@ -23,7 +23,9 @@ Title Search pages link there too.
 **Side B (the continuation).** While the disc waits for manual identification (`MANUAL_WAIT`), or
 while it rips, pick the job of side A from the list (the latest successful DVD and Blu-ray rips that
 are not series, bonus discs or continuations, newest first) and save. The job takes side A's title,
-year and metadata id, a title fixed by hand included. **Not a continuation** clears the choice.
+year and metadata id, a title fixed by hand included. **Not a continuation** clears the choice, and
+with it side A's `continues` mark, as picking another job or marking the disc as a bonus disc does:
+mark side A again if its film does go on.
 
 **Side A (optional, but recommended).** If you know the disc is a flipper when it goes in, press
 **Continues on another side or disc** on side A's page while it rips. Its main title is then not
@@ -58,9 +60,12 @@ Side B's other titles are side A's film's extras, named `<disc label>_<title fil
 No `completed/movies/<Title (Year)>` folder is made for side B. Once the film is whole, side A's
 `continues` mark is cleared, and the shipper takes the folder on its next run.
 
-A third disc is the continuation of the first disc's job too, ripped after the second has been
-joined. Mark the first disc **continues** again before the second one finishes, or the shipper may
-take the film in between.
+A third disc is the continuation of the first disc's job too. Rip it after the second has been
+joined: on another drive while the second still rips, it is joined first if it finishes first. The
+second disc's join clears the first disc's mark (it is kept only while another disc marked as the
+film's continuation has not finished), so as soon as the second disc has finished, mark the third
+disc as the continuation, or the first disc **continues** again. Otherwise the shipper may take the
+film on its next run, before the third disc is joined.
 
 ### When the two cannot be joined
 
@@ -77,6 +82,12 @@ take the film in between.
 
   Replace `<Title (Year)>.mkv` with `joined.mkv`, delete the continuation folder, and clear the mark
   with **Clear the mark** on side A's Split Film page.
+- **A.R.M. stopped while mkvmerge ran** (a container restart): side A's file is left as it was, held
+  on the ripper, with a half-written `.<Title (Year)>.joining.mkv` beside it. Rip side B again (the
+  next join removes the leftover first), or delete the dot file before you clear the mark, or it is
+  shipped with the film.
+- **Nothing was ripped from side B** (every title shorter than `MINLENGTH`): side A stays held, and
+  a notification says so. Rip side B again, or clear the mark to ship side A as it is.
 
 ## The runtime check
 

@@ -7,6 +7,7 @@ until the rest has been joined onto it.
 """
 from markupsafe import escape
 
+import arm.ripper.utils as ripper_utils
 from arm.ui import db
 from arm.models.job import Job, JobState
 from arm.ui.jobs.bonus import CANDIDATE_DISCTYPES, film_label
@@ -58,14 +59,33 @@ def parse_choice(choice):
     return None, None
 
 
+def drop_continuation(job):
+    """
+    Clear a job's continuation mark (not committed), and the ``continues`` mark that marking it set on the film's
+    job, so the completed-rip shipper does not hold that film for good. The film's mark stays while another disc
+    still to be ripped continues it too (ripper_utils.continuation_pending). A mark set by hand on the film's job
+    cannot be told from one set by marking this disc: it is cleared as well, and the message says so.
+
+    :param job: the job of the disc in the drive
+    :return: a clause for the message when the film's mark was cleared, else ""
+    """
+    previous = Job.query.get(job.continuation_of_job_id) if job.continuation_of_job_id else None
+    job.continuation_of_job_id = None
+    if previous is None or not previous.continues or ripper_utils.continuation_pending(previous, job):
+        return ""
+    previous.continues = False
+    return (f"; job {previous.job_id}'s folder is no longer held for another side or disc (if its film goes on, "
+            "mark it again on its Split Film page)")
+
+
 def set_continuation_of(job, choice):
     """
     Store the continuation choice on a job that has not finished yet.
 
     Marking it gives the job the film's title, year, metadata id and poster, as a title fix would (the
     ripper does the same when it picks the choice up), clears a bonus disc mark, and marks the film's job
-    as ``continues``, so the completed-rip shipper holds the film's folder from now on. Clearing it clears
-    that mark again and leaves the title alone.
+    as ``continues``, so the completed-rip shipper holds the film's folder from now on. Clearing or changing
+    it clears that mark on the film it was (drop_continuation); clearing it leaves the title alone.
 
     :param job: the job of the disc in the drive
     :param choice: see parse_choice
@@ -77,18 +97,16 @@ def set_continuation_of(job, choice):
     if kind is None:
         return False, "Pick a job from the list"
     if kind == "none":
-        previous = Job.query.get(job.continuation_of_job_id) if job.continuation_of_job_id else None
-        if previous is not None:
-            previous.continues = False
-        job.continuation_of_job_id = None
+        released = drop_continuation(job)
         db.session.commit()
-        return True, f"Job {job.job_id} no longer continues another job's film"
+        return True, f"Job {job.job_id} no longer continues another job's film{released}"
     parent = Job.query.get(ident)
     if parent is None or parent.job_id == job.job_id:
         return False, "That job cannot be the film this disc continues"
     if not is_candidate(parent):
         return False, (f"Job {parent.job_id} is not a finished DVD or Blu-ray film rip of its own "
                        f"({parent.disctype} {parent.video_type}, {parent.status})")
+    released = drop_continuation(job) if job.continuation_of_job_id != parent.job_id else ""
     job.continuation_of_job_id = parent.job_id
     job.bonus_of_job_id = job.bonus_of_film_id = None
     job.title, job.year, job.imdb_id = parent.title_manual or parent.title, parent.year, parent.imdb_id
@@ -99,7 +117,7 @@ def set_continuation_of(job, choice):
     db.session.commit()
     # Flashed with |safe: a title fixed by hand, or a disc label, is shown as typed
     return True, (f"Job {job.job_id} continues {escape(film_label(job.title, job.year))} (job {parent.job_id}, "
-                  f"disc {escape(parent.label)}): its main title is joined onto the film's")
+                  f"disc {escape(parent.label)}): its main title is joined onto the film's{released}")
 
 
 def set_continues(job, continues):

@@ -48,6 +48,7 @@ try:
     from arm.models.film import Film
     from arm.models.notifications import Notifications
     from arm.ui.jobs import continuation
+    from arm.ripper import utils as ripper_utils
     IMPORT_ERROR = None
 except Exception as error:  # pragma: no cover - depends on the host
     IMPORT_ERROR = error
@@ -170,17 +171,51 @@ class TestSplitFilmPage(unittest.TestCase):
         self._post(continuation_of=f"job:{self.side_a.job_id}")
         job = Job.query.get(self.side_b.job_id)
         self.assertEqual((job.bonus_of_job_id, job.continuation_of_job_id), (None, self.side_a.job_id))
-        self.client.post("/bonusdisc", data={"job_id": job.job_id, "bonus_of": f"job:{self.heat.job_id}"})
+        self.assertTrue(Job.query.get(self.side_a.job_id).continues)
+        html = self.client.post("/bonusdisc", data={"job_id": job.job_id, "bonus_of": f"job:{self.heat.job_id}"},
+                                follow_redirects=True).data.decode()
         job = Job.query.get(self.side_b.job_id)
         self.assertEqual((job.bonus_of_job_id, job.continuation_of_job_id), (self.heat.job_id, None))
+        # Side A no longer waits for this disc: the shipper may take it
+        self.assertFalse(Job.query.get(self.side_a.job_id).continues)
+        self.assertIn(f"job {self.side_a.job_id}'s folder is no longer held", html)
 
     def test_clear_the_choice(self):
         self._post(continuation_of=f"job:{self.side_a.job_id}")
-        self._post(continuation_of="none")
+        html = self._post(continuation_of="none")
         job = Job.query.get(self.side_b.job_id)
         self.assertIsNone(job.continuation_of_job_id)
         self.assertIsNone(job.continuation_of)
         self.assertFalse(Job.query.get(self.side_a.job_id).continues)
+        # A mark set on side A by hand cannot be told from this one, so the message says it is gone
+        self.assertIn(f"job {self.side_a.job_id}'s folder is no longer held", html)
+        self.assertIn("mark it again on its Split Film page", html)
+
+    def test_picking_another_film_clears_the_first_ones_mark(self):
+        self._post(continuation_of=f"job:{self.side_a.job_id}")
+        html = self._post(continuation_of=f"job:{self.heat.job_id}")
+        self.assertEqual(Job.query.get(self.side_b.job_id).continuation_of_job_id, self.heat.job_id)
+        self.assertFalse(Job.query.get(self.side_a.job_id).continues, "held by the shipper for good otherwise")
+        self.assertTrue(Job.query.get(self.heat.job_id).continues)
+        self.assertIn(f"job {self.side_a.job_id}'s folder is no longer held", html)
+        # Saving the same choice again leaves the mark alone
+        html = self._post(continuation_of=f"job:{self.heat.job_id}")
+        self.assertTrue(Job.query.get(self.heat.job_id).continues)
+        self.assertNotIn("no longer held", html)
+
+    def test_the_films_mark_stays_while_another_disc_continues_it(self):
+        third = make_job(status="ripping", stop_time=None, label="DVD_VIDEO_3",
+                         continuation_of_job_id=self.side_a.job_id)
+        self._post(continuation_of=f"job:{self.side_a.job_id}")
+        self.assertTrue(ripper_utils.continuation_pending(self.side_a, self.side_b))
+        html = self._post(continuation_of="none")
+        self.assertTrue(Job.query.get(self.side_a.job_id).continues)
+        self.assertNotIn("no longer held", html)
+        self.assertFalse(ripper_utils.continuation_pending(self.side_a, third), "side B is no longer marked")
+        # Once the other disc has finished (joined, or failed) the film no longer waits for it
+        third.status = "success"
+        db.session.commit()
+        self.assertFalse(ripper_utils.continuation_pending(self.side_a, self.side_b))
 
     def test_refusals(self):
         self.assertIn("Pick a job from the list", self._post(continuation_of=""))

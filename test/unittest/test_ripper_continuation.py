@@ -121,7 +121,8 @@ class ContinuationFixture(unittest.TestCase):
                                       title_manual=None, continues=True, films=[])
         self.patches = [mock.patch.object(utils, "database_updater", side_effect=_fake_updater),
                         mock.patch.object(utils, "set_permissions"),
-                        mock.patch.object(utils, "notify")]
+                        mock.patch.object(utils, "notify"),
+                        mock.patch.object(utils, "continuation_pending", return_value=False)]
         for patch in self.patches:
             patch.start()
 
@@ -279,6 +280,23 @@ class TestJoinFeature(ContinuationFixture):
             self.assertIsNone(arm_ripper.join_feature(self.feature, self.part))
         self.assertEqual(sorted(os.listdir(self.film_path)), [f"{FILM}.mkv", "extras"])
 
+    def test_leftover_of_an_interrupted_join_is_removed_first(self):
+        joined = os.path.join(self.film_path, f".{FILM}.joining.mkv")
+        with open(joined, "w") as handle:
+            handle.write("half of an earlier join\n")
+        left = []
+
+        def run(command, **kwargs):
+            left.append(os.path.exists(command[2]))
+            return _fake_mkvmerge()(command, **kwargs)
+
+        with mock.patch.object(arm_ripper.shutil, "which", return_value="/usr/bin/mkvmerge"), \
+                mock.patch.object(arm_ripper.subprocess, "run", side_effect=run):
+            self.assertEqual(arm_ripper.join_feature(self.feature, self.part), self.feature)
+        self.assertEqual(left, [False])
+        self.assertEqual(_read(self.feature), "side A\nside B\n")
+        self.assertEqual(sorted(os.listdir(self.film_path)), [f"{FILM}.mkv", "extras"])
+
     def test_without_mkvmerge(self):
         with mock.patch.object(arm_ripper.shutil, "which", return_value=None), \
                 mock.patch.object(arm_ripper.subprocess, "run") as run:
@@ -346,7 +364,14 @@ class TestFileContinuation(ContinuationFixture):
                          ["DVD_VIDEO_title_t01.mkv", "title_t01.mkv"])
         self.assertEqual(_read(os.path.join(self.film_path, "extras", "title_t01.mkv")), "side A's extra\n")
         self.assertFalse(self.parent.continues, "the film is whole: the shipper may take it")
+        utils.continuation_pending.assert_called_once_with(self.parent, job)
         utils.notify.assert_not_called()
+
+    def test_joined_film_stays_held_for_a_further_disc(self):
+        utils.continuation_pending.return_value = True
+        job = self._side_b()
+        self.assertEqual(self._file(job), self.feature)
+        self.assertTrue(self.parent.continues, "a third disc marked as its continuation is still ripping")
 
     def test_mainfeature_files_no_extras(self):
         job = self._side_b(mainfeature=True)
@@ -390,6 +415,12 @@ class TestFileContinuation(ContinuationFixture):
         self.assertIsNone(self._file(job))
         self.assertEqual(_read(self.feature), "side A\n")
         self.assertTrue(self.parent.continues)
+        message = utils.notify.call_args.args[2]
+        self.assertIn("no title of the second part was ripped", message)
+        self.assertIn('held on the ripper until "continues" is cleared on job 76', message)
+        self.parent.continues = False
+        self._file(job)
+        self.assertNotIn("held", utils.notify.call_args.args[2])
 
     def test_move_files_never_files_a_continuation_as_the_film(self):
         job = self._side_b()

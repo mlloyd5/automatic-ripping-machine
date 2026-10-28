@@ -253,6 +253,19 @@ def is_continuation(job):
     return continuation_parent(job) is not None
 
 
+def continuation_pending(parent, job):
+    """
+    True when a disc other than ``job`` is marked as the continuation of ``parent``'s film and has not finished
+    (the third disc of a film, ripping on another drive): the film's ``continues`` mark is still needed for it,
+    so the completed-rip shipper does not take the film before that is joined onto it too\n
+    :param parent: the film's job
+    :param job: the continuation that no longer needs the mark (joined, or no longer marked)
+    :return: bool
+    """
+    return Job.query.filter(Job.continuation_of_job_id == parent.job_id, Job.job_id != job.job_id,
+                            ~Job.finished).first() is not None
+
+
 def bonus_tag(job):
     """
     What a bonus disc's files are prefixed with, so they never collide with the extras already in the

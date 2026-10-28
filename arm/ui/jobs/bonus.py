@@ -67,8 +67,9 @@ def set_bonus_of(job, choice):
     Store the bonus disc choice on a job that has not finished yet.
 
     Marking it also gives the job the film's title, year, metadata id and poster, as a title fix would
-    (the ripper does the same when it picks the choice up), and clears a continuation mark (see
-    continuation.py); clearing it leaves the title alone.
+    (the ripper does the same when it picks the choice up), and clears a continuation mark, with the
+    ``continues`` mark it set on its film's job (continuation.drop_continuation); clearing it leaves the
+    title alone.
 
     :param job: the job of the disc in the drive
     :param choice: see parse_choice
@@ -100,14 +101,16 @@ def set_bonus_of(job, choice):
     if not is_candidate(parent):
         return False, (f"Job {parent.job_id} is not a finished DVD or Blu-ray film rip "
                        f"({parent.disctype} {parent.video_type}, {parent.status})")
+    # Imported here: continuation.py imports this module
+    from arm.ui.jobs.continuation import drop_continuation
     source = film if film is not None and int(film.position or 1) > 1 else parent
     job.bonus_of_job_id = parent.job_id
     job.bonus_of_film_id = film.film_id if film is not None else None
-    job.continuation_of_job_id = None
+    released = drop_continuation(job)
     job.title, job.year, job.imdb_id = source.title, source.year, source.imdb_id
     job.poster_url = source.poster_url or parent.poster_url
     job.video_type = "movie"
     job.hasnicetitle = True
     db.session.commit()
     return True, (f"Job {job.job_id} is the bonus disc of {film_label(source.title, source.year)} "
-                  f"(job {parent.job_id}, disc {parent.label}): every title it rips is filed as an extra")
+                  f"(job {parent.job_id}, disc {parent.label}): every title it rips is filed as an extra{released}")

@@ -629,6 +629,10 @@ def join_feature(feature, part):
         return None
     folder, name = os.path.split(feature)
     joined = os.path.join(folder, f".{os.path.splitext(name)[0]}.joining.mkv")
+    if os.path.exists(joined):
+        # Left by a join that never ended (ARM stopped while mkvmerge ran)
+        logging.info(f"Removing {joined}, left by an earlier join that did not finish")
+        os.remove(joined)
     command = [mkvmerge, "-o", joined, feature, "+", part]
     logging.info(f"Joining {part} onto {feature}: {' '.join(command)}")
     try:
@@ -661,8 +665,10 @@ def file_continuation(out_path, job, files):
     and the user is told to join it by hand. Its other titles are extras of the same folder, named
     ``<disc label>_<file>`` like a bonus disc's, unless MAINFEATURE is on or EXTRAS_SUB is none.\n
     The parent job's ``continues`` mark, which holds the film's folder back from the completed-rip
-    shipper, is cleared once the film is whole, or once its main feature has left the ripper; after a
-    failed join it is kept, so the film waits on the ripper beside the part to be joined by hand\n
+    shipper, is cleared once the film is whole, or once its main feature has left the ripper, unless
+    another disc marked as the film's continuation has still to finish (a third disc on another drive).
+    After a failed join, or when nothing was ripped, it is kept, so the film waits on the ripper (beside
+    the part to be joined by hand) and the user is told\n
     :param out_path: RAW_PATH or TRANSCODE_PATH holding the ripped files
     :param job: Current job (a continuation)
     :param files: os.listdir(out_path)
@@ -670,10 +676,18 @@ def file_continuation(out_path, job, files):
     """
     videos = sorted(name for name in files if name.lower().endswith(VIDEO_EXTENSIONS)
                     and not name.startswith(".") and os.path.isfile(os.path.join(out_path, name)))
+    parent = utils.continuation_parent(job)
     if not videos:
         logging.warning(f"Continuation: no video files in {out_path}; nothing to join")
+        if parent.continues:
+            held = (f"The film's folder is held on the ripper until \"continues\" is cleared on job {parent.job_id}: "
+                    "rip the disc again, or clear the mark to ship the film as it is.")
+        else:
+            held = "Rip the disc again to join it."
+        utils.notify(job, constants.NOTIFY_TITLE,
+                     f"{utils.fix_job_title(parent)}: no title of the second part was ripped (all shorter than "
+                     f"MINLENGTH?), so nothing was joined onto the film. {held}")
         return None
-    parent = utils.continuation_parent(job)
     main = continuation_main_title(out_path, job, videos)
     feature = continuation_feature(job) if job.path == continuation_target_folder(job) else None
     joined = join_feature(feature, os.path.join(out_path, main)) if feature else None
@@ -705,7 +719,11 @@ def file_continuation(out_path, job, files):
         else:
             logging.info(f"Not moving extra: \"{name}\" - Sub folder is not set or named incorrectly")
     if joined is not None or feature is None:
-        utils.database_updater({'continues': False}, parent)
+        if utils.continuation_pending(parent, job):
+            logging.info(f"Job {parent.job_id} stays marked \"continues\": another disc marked as the film's "
+                         "continuation has still to finish")
+        else:
+            utils.database_updater({'continues': False}, parent)
     return joined
 
 
