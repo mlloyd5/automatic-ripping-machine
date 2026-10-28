@@ -663,7 +663,7 @@ def check_runtime(job):
     # A re-rip has the earlier job's title and year but not its IMDb id: then only the id changes
     renamed = f"{utils.clean_for_filename(best['Title'])} ({best['Year']})" != identified
     logging.info(f"Identifying the disc as {best['Title']} ({best['Year']}) instead of {identified}")
-    identify.apply_search_result(job, best)
+    identify.apply_search_result(job, best, check_series=False)
     if renamed:
         utils.notify(job, constants.NOTIFY_TITLE,
                      f"Identified as {best['Title']} ({best['Year']}) instead of {identified} by runtime")

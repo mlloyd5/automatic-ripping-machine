@@ -252,7 +252,7 @@ def tmdb_process_results(poster_base, return_results, search_results, media_type
         app.logger.debug(result)
         result['poster_path'] = result['poster_path'] if result['poster_path'] is not None else None
         result['release_date'] = '0000-00-00' if 'release_date' not in result else result['release_date']
-        result['imdbID'] = tmdb_get_imdb(result['id'])
+        result['imdbID'] = tmdb_get_imdb(result['id'], media_type)
         result['Year'] = re.sub(TMDB_YEAR_REGEX, "", result['first_air_date']) if 'first_air_date' in result else \
             re.sub(TMDB_YEAR_REGEX, "", result['release_date'])
         result['Title'] = result['title'] if 'title' in result else result['name']  # This isn't great
@@ -264,10 +264,12 @@ def tmdb_process_results(poster_base, return_results, search_results, media_type
     return return_results
 
 
-def tmdb_get_imdb(tmdb_id):
+def tmdb_get_imdb(tmdb_id, media_type="movie"):
     """
     Queries api.themoviedb.org for imdb_id by TMDB id\n
     :param tmdb_id: tmdb id of media
+    :param media_type: "series" for a TV id: films and TV entries are numbered apart, so TV id
+        132011 asked for as a film is whichever film has that number
     :return: str of imdb_id
     """
     # https://api.themoviedb.org/3/movie/78?api_key=
@@ -276,19 +278,66 @@ def tmdb_get_imdb(tmdb_id):
     url = f"https://api.themoviedb.org/3/movie/{tmdb_id}?api_key={tmdb_api_key}&" \
           f"append_to_response=alternative_titles,credits,images,keywords,releases,reviews,similar,videos,external_ids"
     url_tv = f"https://api.themoviedb.org/3/tv/{tmdb_id}/external_ids?api_key={tmdb_api_key}"
-    # Making a get request
-    response = requests.get(url)
-    search_results = json.loads(response.text)
-    # 'status_code' means id wasn't found
+    if media_type != "series":
+        # Making a get request
+        response = requests.get(url)
+        search_results = json.loads(response.text)
+        # 'status_code' means id wasn't found
+        if 'status_code' not in search_results:
+            return search_results['external_ids']['imdb_id']
+    # Try tv series
+    response = requests.get(url_tv)
+    tv_json = json.loads(response.text)
+    app.logger.debug(tv_json)
+    if 'status_code' not in tv_json:
+        return tv_json['imdb_id']
+    return None
+
+
+def tmdb_tv_search(search_query, wanted=None):
+    """
+    TMDB's TV entries for a title, in the shape tmdb_search returns them (``Type`` "series").
+
+    :param wanted: when given, only the raw TMDB results (``name``, ``first_air_date``) it accepts
+        are kept; each one kept costs a lookup of its IMDb id
+    :return: list of results, empty when TMDB has none or could not be asked
+    """
+    tmdb_api_key = cfg.arm_config['TMDB_API_KEY']
+    search_results, response = tmdb_search_request("tv", search_query, None, tmdb_api_key)
     if 'status_code' in search_results:
-        # Try tv series
-        response = requests.get(url_tv)
-        tv_json = json.loads(response.text)
-        app.logger.debug(tv_json)
-        if 'status_code' not in tv_json:
-            return tv_json['imdb_id']
+        app.logger.debug(f"tmdb tv search failed with error -  {search_results['status_message']}")
+        return []
+    results = [result for result in search_results.get('results') or [] if wanted is None or wanted(result)]
+    if not results:
+        return []
+    poster_base = "https://image.tmdb.org/t/p/original"
+    return tmdb_process_results(poster_base, {}, {'results': results}, "series")['Search']
+
+
+def tmdb_tv_details(tmdb_id):
+    """
+    How long a TMDB TV entry's episodes run and how many it has\n
+    :param tmdb_id: tmdb id of the series
+    :return: dict of ``episode_runtimes`` (seconds, possibly empty) and ``episodes``, or None when
+        TMDB could not be asked
+    """
+    tmdb_api_key = cfg.arm_config['TMDB_API_KEY']
+    url = f"https://api.themoviedb.org/3/tv/{tmdb_id}?api_key={tmdb_api_key}"
+    try:
+        response = requests.get(url, timeout=30)
+        details = json.loads(response.text)
+    except (requests.RequestException, ValueError) as error:
+        app.logger.debug(f"tmdb_tv_details failed for {tmdb_id}: {error}")
         return None
-    return search_results['external_ids']['imdb_id']
+    if 'status_code' in details:
+        return None
+    # episode_run_time is often empty on newer entries; the latest episode's own runtime stands in
+    minutes = list(details.get('episode_run_time') or [])
+    for episode in (details.get('last_episode_to_air'), details.get('next_episode_to_air')):
+        if episode and episode.get('runtime'):
+            minutes.append(episode['runtime'])
+    return {'episode_runtimes': [int(minute) * 60 for minute in minutes if minute],
+            'episodes': int(details.get('number_of_episodes') or 0)}
 
 
 def tmdb_runtime(tmdb_id):
