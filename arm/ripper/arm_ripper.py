@@ -123,9 +123,10 @@ def rip_visual_media(have_dupes, job, logfile, protection):
     bonus, final_directory, bonus_transcode_path = recheck_bonus(
         job, bonus, final_directory, transcode_folder, bonus_transcode_path, type_sub_folder, job_title)
 
-    # Update final path if user has set a custom/manual title, or check_runtime found a better match.
+    # Update final path if user has set a custom/manual title or type, or check_runtime found a better match.
+    # recheck_bonus refreshed the job, so this sees changes made in the ui during the rip.
     # Not for a bonus disc: its titles go to the film's folder whatever the job is called
-    logging.debug(f"Job title status: [{job.title_manual}]")
+    logging.debug(f"Job title status: [{job.title_manual}], video type: [{job.video_type}]")
     if not bonus:
         final_directory = retitle_final_directory(have_dupes, job, final_directory, type_sub_folder, job_title)
 
@@ -189,22 +190,31 @@ def recheck_bonus(job, bonus, final_directory, transcode_folder, bonus_transcode
 
 def retitle_final_directory(have_dupes, job, final_directory, type_sub_folder, job_title):
     """
-    Give the completed folder the job's title when it changed during the rip: a title set by hand
-    in the meantime, or another film taken by check_runtime. The new folder goes through the same
-    duplicate check as the first one, so a film ripped before keeps its folder (RED (2010) is
-    already there when a disc first taken for Red (2017) turns out to be RED); the first folder,
-    which holds no more than the disc's poster at this point, is removed whatever DELRAWFILES says\n
+    Give the completed folder the job's title and type when they changed during the rip: a title
+    or video type set by hand in the meantime, or another film taken by check_runtime. A series
+    set by hand on a disc identified as a movie goes to completed/tv, not completed/movies (and
+    the other way round), so the completed-rip shipper files it with the right library. The new
+    folder goes through the same duplicate check as the first one, so a film ripped before keeps
+    its folder (RED (2010) is already there when a disc first taken for Red (2017) turns out to be
+    RED); the first folder, which holds no more than the disc's poster at this point, is removed
+    whatever DELRAWFILES says\n
     :param have_dupes: Does this disc already exist in the database
     :param final_directory: the completed folder made for the title the rip started with
+    :param type_sub_folder: the type folder the rip started with (utils.convert_job_type)
     :param job_title: that title (utils.fix_job_title at the start of the rip)
     :return: the completed folder to file the rip in
     """
     new_title = utils.fix_job_title(job)
-    if new_title == job_title:
+    new_type_sub_folder = utils.convert_job_type(job.video_type)
+    if new_title == job_title and new_type_sub_folder == type_sub_folder:
         return final_directory
-    logging.info(f"Job title changed from {job_title} to {new_title}; renaming the completed folder")
+    if new_title != job_title:
+        logging.info(f"Job title changed from {job_title} to {new_title}; renaming the completed folder")
+    if new_type_sub_folder != type_sub_folder:
+        logging.info(f"Job type changed from {type_sub_folder} to {new_type_sub_folder}; "
+                     "moving the completed folder")
     new_directory = utils.check_for_dupe_folder(
-        have_dupes, os.path.join(job.config.COMPLETED_PATH, type_sub_folder, new_title), job)
+        have_dupes, os.path.join(job.config.COMPLETED_PATH, new_type_sub_folder, new_title), job)
     remove_superseded_folder(final_directory, new_directory)
     utils.database_updater({'path': new_directory}, job)
     return new_directory
