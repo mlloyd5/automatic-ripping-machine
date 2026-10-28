@@ -36,11 +36,12 @@ one with chapters and one with none or one. Ripping with `MAINFEATURE: false` wo
 titles that play the same segment map (or, when MakeMKV reports no segment map, have the same duration within 2 seconds
 and the same size within 2 %). On DVDs the segment map only numbers the cells of each title's own program chain, so
 two different episodes of the same length both show up as e.g. `1-12`; there a title only counts as a copy when its
-size also matches to the byte (copies play the same cells), and titles that differ by even a few hundred KB, such as a
-widescreen and a full-screen version of a film, are both ripped. Blu-ray segment maps list the disc's m2ts clips, so
-an equal map there is enough. The skipped titles are logged and shown with their `duplicate_of` track in the job
-details; extras are still ripped as usual. In manual drive mode the duplicates are only pre-unticked, you can still
-select them.
+size also matches to the byte (copies play the same cells). The trade-off: two versions of a film whose program chains
+differ by a single short cell (a logo or a black cell of under a second) have the same length and map and sizes only a
+few hundred KB apart, and from what MakeMKV reports they cannot be told apart from two episodes of the same length, so
+on a DVD both are ripped. Blu-ray segment maps list the disc's m2ts clips, so an equal map there is enough. The
+skipped titles are logged and shown with their `duplicate_of` track in the job details; extras are still ripped as
+usual. In manual drive mode the duplicates are only pre-unticked, you can still select them.
 
 ### Profiles
 MakeMKV can also use the concept of profiles to decide which audio tracks and which subtitle tracks to include in the 

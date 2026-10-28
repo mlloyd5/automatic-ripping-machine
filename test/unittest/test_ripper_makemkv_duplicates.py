@@ -209,9 +209,9 @@ class TestFindDuplicateTitlesDvd(unittest.TestCase):
 
     def test_same_map_near_equal_size_is_not_a_duplicate(self):
         # ts140 job 81 (Maid in Manhattan): titles 0 and 1, 6296 s each, 854016 bytes apart
-        widescreen = _track(0, 6296, 4_100_854_016, 28, "1-28")
-        full_screen = _track(1, 6296, 4_100_000_000, 28, "1-28")
-        self.assertEqual(makemkv.find_duplicate_titles([widescreen, full_screen], "dvd"), [])
+        title_0 = _track(0, 6296, 4_100_854_016, 28, "1-28")
+        title_1 = _track(1, 6296, 4_100_000_000, 28, "1-28")
+        self.assertEqual(makemkv.find_duplicate_titles([title_0, title_1], "dvd"), [])
 
     def test_different_maps_with_the_same_size_are_not_duplicates(self):
         episode_1 = _track(0, 1420, 1_000_000_000, 5, "1-5")
