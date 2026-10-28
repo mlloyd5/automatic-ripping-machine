@@ -16,6 +16,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
+import yaml
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 _TMP = tempfile.mkdtemp(prefix="arm_makemkv_test_")
@@ -419,13 +421,14 @@ class TestRipRetry(unittest.TestCase):
 
 @unittest.skipIf(IMPORT_ERROR is not None, f"ARM could not be imported here: {IMPORT_ERROR}")
 class TestInfoScanLock(unittest.TestCase):
-    """Only one makemkvcon info scan runs at a time (two at once failed to open RED 2 on the t620)."""
+    """With SERIALIZE_MAKEMKV_INFO on, only one makemkvcon info scan runs at a time."""
 
     def setUp(self):
         self.lock_path = os.path.join(_TMP, "makemkv-info.lock")
-        patch = mock.patch.object(makemkv, "MAKEMKV_INFO_LOCK", self.lock_path)
-        patch.start()
-        self.addCleanup(patch.stop)
+        for patch in (mock.patch.object(makemkv, "MAKEMKV_INFO_LOCK", self.lock_path),
+                      mock.patch.dict(makemkv.cfg.arm_config, {"SERIALIZE_MAKEMKV_INFO": True})):
+            patch.start()
+            self.addCleanup(patch.stop)
 
     def _is_locked(self):
         with open(self.lock_path, "a") as other:
@@ -482,20 +485,29 @@ class TestInfoScanLock(unittest.TestCase):
         self.assertTrue(any(line.startswith("INFO:") and "Waited" in line for line in logs.output))
 
     def test_lock_is_taken_when_serialize_is_on(self):
-        with mock.patch.dict(makemkv.cfg.arm_config, {"SERIALIZE_MAKEMKV_INFO": True}):
-            with makemkv.info_scan_lock():
-                self.assertTrue(self._is_locked())
+        with makemkv.info_scan_lock():
+            self.assertTrue(self._is_locked())
         self.assertFalse(self._is_locked())
 
-    def test_lock_is_skipped_when_serialize_is_off(self):
+    def _assert_no_lock(self):
         self._hold_lock()
-        with mock.patch.dict(makemkv.cfg.arm_config, {"SERIALIZE_MAKEMKV_INFO": False}), \
-                mock.patch.object(makemkv.fcntl, "flock") as flock, \
+        with mock.patch.object(makemkv.fcntl, "flock") as flock, \
                 mock.patch.object(makemkv, "sleep") as pause:
             with makemkv.info_scan_lock():
                 pass
         flock.assert_not_called()
         pause.assert_not_called()
+
+    def test_lock_is_skipped_when_serialize_is_off(self):
+        makemkv.cfg.arm_config["SERIALIZE_MAKEMKV_INFO"] = False
+        self._assert_no_lock()
+
+    def test_lock_is_off_by_default(self):
+        with open(os.path.join(REPO_ROOT, "setup", "arm.yaml")) as template:
+            self.assertIs(yaml.safe_load(template)["SERIALIZE_MAKEMKV_INFO"], False)
+        # an arm.yaml without the key (no setup/arm.yaml template merged in) gets the code's fallback
+        del makemkv.cfg.arm_config["SERIALIZE_MAKEMKV_INFO"]
+        self._assert_no_lock()
 
     def test_makemkv_info_runs_makemkvcon_inside_the_lock(self):
         locked_while_running = []

@@ -583,13 +583,14 @@ def info_scan_lock():
     """
     Let only one makemkvcon info scan run at a time, whichever drive it is for
 
-    Two discs scanned at once can make MakeMKV fail to open one of them ("Failed to open disc"),
-    seen on the t620 when Blu-rays went into two drives within seconds. Only the scans wait for
-    each other; rips (makemkvcon mkv) still run side by side. A scan that holds the lock longer
-    than MAKEMKV_INFO_LOCK_TIMEOUT is taken to hang and is not waited for any longer.
-    With SERIALIZE_MAKEMKV_INFO false (drives that can scan side by side) no lock is taken.
+    Only taken with SERIALIZE_MAKEMKV_INFO true (off by default). It was added after one t620 scan
+    failed to open a Blu-ray ("Failed to open disc") while another drive scanned, but the same
+    drive later failed that way with no other scan running, so concurrent scans are not proven to
+    be the cause. Only the scans wait for each other; rips (makemkvcon mkv) still run side by side.
+    A scan that holds the lock longer than MAKEMKV_INFO_LOCK_TIMEOUT is taken to hang and is not
+    waited for any longer.
     """
-    if not cfg.arm_config.get("SERIALIZE_MAKEMKV_INFO", True):
+    if not cfg.arm_config.get("SERIALIZE_MAKEMKV_INFO", False):
         yield
         return
     try:
