@@ -175,6 +175,33 @@ class TestRetitleFinalDirectoryType(TypeChangeFixture):
         self.assertEqual(new, f"{existing}_{job.stage}")
         self.assertEqual(os.listdir(existing), ["A1_t00.mkv"])
 
+    def test_type_alone_changed_is_not_stopped_by_duplicate_rips_disabled(self):
+        # A re-rip of a disc ripped before: its title was checked when the rip started, so the
+        # finished rip is filed beside the series' folder instead of failing
+        existing = self._folder("tv", "Pride and Prejudice (1980)", poster=False)
+        Path(existing, "A1_t00.mkv").write_bytes(b"side B")
+        job = self._job([], title="Pride and Prejudice", year="1980")
+        folder = self._folder("movies", "Pride and Prejudice (1980)")
+        job.video_type = "series"
+        with mock.patch.dict(cfg.arm_config, {"ALLOW_DUPLICATES": False}), \
+                mock.patch.object(utils, "notify") as notify:
+            new = arm_ripper.retitle_final_directory(True, job, folder, "movies", "Pride and Prejudice (1980)")
+        self.assertEqual(new, f"{existing}_{job.stage}")
+        self.assertEqual(job.path, new)
+        self.assertEqual(os.listdir(existing), ["A1_t00.mkv"])
+        self.assertFalse(os.path.exists(folder))
+        notify.assert_not_called()
+
+    def test_title_and_type_changed_with_duplicate_rips_disabled_stops(self):
+        # A new title is checked like the first folder (test_duplicate_rips_disabled_stops_at_the_existing_folder)
+        self._folder("tv", "Pride and Prejudice (1980)", poster=False)
+        job = self._job([])
+        folder = self._folder("movies", "Letters-O-P-and-R")
+        _set_to_series(job)
+        with mock.patch.dict(cfg.arm_config, {"ALLOW_DUPLICATES": False}), mock.patch.object(utils, "notify"):
+            with self.assertRaises(utils.RipperException):
+                arm_ripper.retitle_final_directory(True, job, folder, "movies", "Letters-O-P-and-R")
+
 
 class TestRipVisualMediaTypeChange(TypeChangeFixture):
     """rip_visual_media with the type changed in the ui while MakeMKV ripped (seen at db.session.refresh)."""

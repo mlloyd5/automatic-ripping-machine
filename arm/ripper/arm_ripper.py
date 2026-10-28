@@ -196,8 +196,10 @@ def retitle_final_directory(have_dupes, job, final_directory, type_sub_folder, j
     the other way round), so the completed-rip shipper files it with the right library. The new
     folder goes through the same duplicate check as the first one, so a film ripped before keeps
     its folder (RED (2010) is already there when a disc first taken for Red (2017) turns out to be
-    RED); the first folder, which holds no more than the disc's poster at this point, is removed
-    whatever DELRAWFILES says\n
+    RED). A type changed with the title kept is not stopped by ALLOW_DUPLICATES: this title was
+    checked when the rip started, and the finished rip goes to a _<stage> folder beside one already
+    there instead of failing. The first folder, which holds no more than the disc's poster at this
+    point, is removed whatever DELRAWFILES says\n
     :param have_dupes: Does this disc already exist in the database
     :param final_directory: the completed folder made for the title the rip started with
     :param type_sub_folder: the type folder the rip started with (utils.convert_job_type)
@@ -214,7 +216,8 @@ def retitle_final_directory(have_dupes, job, final_directory, type_sub_folder, j
         logging.info(f"Job type changed from {type_sub_folder} to {new_type_sub_folder}; "
                      "moving the completed folder")
     new_directory = utils.check_for_dupe_folder(
-        have_dupes, os.path.join(job.config.COMPLETED_PATH, new_type_sub_folder, new_title), job)
+        have_dupes and new_title != job_title,
+        os.path.join(job.config.COMPLETED_PATH, new_type_sub_folder, new_title), job)
     remove_superseded_folder(final_directory, new_directory)
     utils.database_updater({'path': new_directory}, job)
     return new_directory
