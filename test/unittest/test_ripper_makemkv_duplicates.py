@@ -194,6 +194,14 @@ class TestFindDuplicateTitlesDvd(unittest.TestCase):
         self.assertEqual([(kept.track_number, [t.track_number for t in dupes]) for kept, dupes in groups],
                          [("2", ["0"])])
 
+    def test_short_episodes_with_the_same_map_are_not_duplicates(self):
+        # ts140 job 146 (The Amazing World of Dinosaurs disc 1): three 22-minute episodes,
+        # all "1-2", lengths within 2 s and sizes within 0.4 %
+        episodes = [_track(0, 1319, 1_125_830_656, 2, "1-2"),
+                    _track(1, 1318, 1_124_900_864, 2, "1-2"),
+                    _track(2, 1317, 1_121_648_640, 2, "1-2")]
+        self.assertEqual(makemkv.find_duplicate_titles(episodes, "dvd"), [])
+
     def test_same_map_and_same_size_is_a_duplicate(self):
         main = _track(0, 6296, 4_100_000_000, 28, "1-28")
         copy = _track(1, 6296, 4_100_000_000, 1, "1-28")
