@@ -939,6 +939,84 @@ class BonusDisc(MediaBoxFixture):
                                                     {"job_id": 11, "bonus_of_job_id": 1}))
 
 
+class SplitFilm(MediaBoxFixture):
+    """A film split over two sides or discs stays on the ripper until ARM has joined the second part onto it."""
+
+    def setUp(self):
+        super().setUp()
+        conn = sqlite3.connect(self.db)
+        conn.execute("ALTER TABLE job ADD COLUMN continuation_of_job_id INTEGER")
+        conn.execute("ALTER TABLE job ADD COLUMN continues BOOLEAN")
+        conn.commit()
+        conn.close()
+
+    def _continuation(self, folder, files, status="success"):
+        """
+        A continuation's job (of Movie A, job 1) filed in ``folder`` (``{job_id}`` is its job id), with ``files``.
+        Returns (job id, folder name).
+        """
+        conn = sqlite3.connect(self.db)
+        cursor = conn.execute("INSERT INTO job (status, video_type, title, year, label, disctype, stop_time, "
+                              "continuation_of_job_id) VALUES (?, 'movie', 'Movie A', '2001', 'MOVIE_A_SIDE_B', "
+                              "'dvd', '2026-10-27 18:00:00', 1)", (status,))
+        job_id = cursor.lastrowid
+        folder = folder.format(job_id=job_id)
+        conn.execute("UPDATE job SET path = ? WHERE job_id = ?", (self._local("movies", folder), job_id))
+        conn.commit()
+        conn.close()
+        if files:
+            self._folder("movies", folder, files)
+        return job_id, folder
+
+    def test_film_that_continues_is_held(self):
+        self._set_job("Movie A (2001)", continues=1)
+        with self.assertLogs(shipper.log, "INFO") as logs:
+            self.assertEqual(self._run(), 0)
+        self.assertTrue(os.path.isfile(self._local("movies", "Movie A (2001)/Movie A (2001).mkv")))
+        self.assertNotIn("Movie A (2001)", self._dest_folders("Movies"))
+        self.assertIn("Show A (2010)", self._dest_folders("TV"), "the other folders ship as usual")
+        self.assertEqual(sum("continues on another side or disc" in line for line in logs.output), 1)
+
+    def test_film_waits_for_its_continuation_to_be_joined(self):
+        self._continuation("Movie A (2001)", None, status="ripping")
+        self.assertEqual(self._run(), 0)
+        self.assertTrue(os.path.isdir(self._local("movies", "Movie A (2001)")))
+        self.assertNotIn("Movie A (2001)", self._dest_folders("Movies"))
+
+    def test_joined_film_ships_as_the_films_rip(self):
+        self._set_job("Movie A (2001)", continues=0)
+        job_id, _ = self._continuation("Movie A (2001)", None)
+        self.assertEqual(self._run(), 0)
+        self.assertTrue(os.path.isfile(os.path.join(self._shipped("Movies", "Movie A (2001)"), "Movie A (2001).mkv")))
+        self.assertFalse(os.path.exists(self._local("movies", "Movie A (2001)")))
+        # Its record is the film's job's, not the continuation's
+        self.assertEqual([n for n in os.listdir(self.records) if f"-job{job_id}." in n], [])
+        name = next(n for n in os.listdir(self.records) if "-job1." in n)
+        top, _files = parse_record(self._read(os.path.join(self.records, name)))
+        self.assertEqual((top["job"], top["role"]), (1, "feature"))
+
+    def test_part_that_could_not_be_joined_never_ships(self):
+        self._plant("Movies", "Movie A (2001)", "Movie A (2001).mkv")
+        shutil.rmtree(self._local("movies", "Movie A (2001)"))
+        _, part = self._continuation("Movie A (2001) - continuation job{job_id}", ["Movie A (2001) - pt2.mkv"])
+        with self.assertLogs(shipper.log, "WARNING") as logs:
+            self.assertEqual(self._run(), 0)
+        self.assertTrue(os.path.isfile(os.path.join(self._local("movies", part), "Movie A (2001) - pt2.mkv")))
+        self.assertEqual(self._dest_folders("Movies"), ["Movie A (2001)"])
+        self.assertEqual(os.listdir(self._shipped("Movies", "Movie A (2001)")), ["Movie A (2001).mkv"])
+        self.assertEqual([c for c in self._calls() if part in c], [])
+        self.assertEqual(sum("could not join" in line for line in logs.output), 1)
+
+    def test_part_folder_needs_the_continuation_job_itself(self):
+        folder = self._local("movies", "Movie A (2001) - continuation job11")
+        self.assertTrue(shipper.held_for_continuation(folder, {"job_id": 11, "continuation_of_job_id": 1}))
+        self.assertFalse(shipper.held_for_continuation(folder, {"job_id": 11, "continuation_of_job_id": None}))
+        self.assertFalse(shipper.held_for_continuation(folder, {"job_id": 12, "continuation_of_job_id": 1}))
+        self.assertFalse(shipper.held_for_continuation(self._local("movies", "Movie A (2001)"),
+                                                       {"job_id": 11, "continuation_of_job_id": 1}))
+        self.assertFalse(shipper.held_for_continuation(self._local("movies", "Movie A (2001)"), {"job_id": 1}))
+
+
 class KeptNameWithoutRecords(ShipperFixture):
     """Records off: the destination name is still kept in the spool across an interrupted transfer."""
 

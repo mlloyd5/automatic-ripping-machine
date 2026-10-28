@@ -1,0 +1,93 @@
+{% extends "base.html" %}
+{% block title %}Split Film{% endblock %}
+
+{% block nav %}{{ super() }}{% endblock %}
+
+{% block content %}
+<div class="container">
+    <div class="row text-center justify-content-center">
+        <div class="col">
+            <h4>Split film</h4>
+            <p>
+                Job {{ job.job_id }}: disc <strong>{{ job.label }}</strong> in {{ job.devpath }}
+                ({{ job.disctype }}, {{ job.status }}).
+                A film split over two sides of a flipper disc, or over two discs, is joined into one file:
+                the second side's main title is appended to the first side's main feature with mkvmerge,
+                and the chapters run on.
+            </p>
+            {% if job.disc_photo %}
+                <a href="discphoto?job_id={{ job.job_id }}" target="_blank" title="Photo of the disc taken as the tray closed">
+                    <img src="discphoto?job_id={{ job.job_id }}" width="240px" class="img-thumbnail mb-3" alt="Disc photo"></a>
+            {% endif %}
+        </div>
+    </div>
+
+    <h5>This film continues on another side or disc</h5>
+    <p>
+        Mark the first side while it rips: its main title is then not checked against the film's runtime
+        (it is only part of the film), and the completed-rip shipper keeps its folder on the ripper until the
+        next side has been joined onto it. Marking the next side below marks this one too.
+    </p>
+    <form method="post" action="splitfilm" autocomplete="off" class="mb-4">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        <input type="hidden" name="job_id" value="{{ job.job_id }}">
+        {% if job.continues %}
+            <input type="hidden" name="continues" value="no">
+            <p><strong>Marked:</strong> this job's film continues on another side or disc.</p>
+            <button class="btn btn-outline-secondary" type="submit">Clear the mark (ship it as it is)</button>
+        {% else %}
+            <input type="hidden" name="continues" value="yes">
+            <button class="btn btn-outline-info" type="submit"
+                    {{ 'disabled' if job.bonus_of_job_id or job.continuation_of_job_id else '' }}>Continues on another side or disc</button>
+        {% endif %}
+    </form>
+
+    <h5>This disc continues the film of&hellip;</h5>
+    {% if job.finished %}
+        <div class="alert alert-warning" role="alert">
+            This job has finished, so its titles have been filed already.
+        </div>
+    {% endif %}
+    <form method="post" action="splitfilm" autocomplete="off">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        <input type="hidden" name="job_id" value="{{ job.job_id }}">
+        <div class="table-responsive">
+            <table class="table table-striped table-sm" aria-label="Recent rips">
+                <thead class="bg-secondary">
+                <tr>
+                    <th scope="col"></th>
+                    <th scope="col" style="text-align:left">Film</th>
+                    <th scope="col" style="text-align:left">Disc label</th>
+                    <th scope="col" style="text-align:left">Drive</th>
+                    <th scope="col" style="text-align:left">Finished</th>
+                    <th scope="col" style="text-align:left">Job</th>
+                </tr>
+                </thead>
+                <tbody>
+                <tr>
+                    <td><input type="radio" name="continuation_of" id="continuation_none" value="none"
+                               {{ 'checked' if not job.continuation_of_job_id else '' }}></td>
+                    <td colspan="5" style="text-align:left"><label for="continuation_none" class="mb-0">Not a continuation</label></td>
+                </tr>
+                {% for parent in candidates %}
+                    <tr>
+                        <td><input type="radio" name="continuation_of" id="continuation_job_{{ parent.job_id }}" value="job:{{ parent.job_id }}"
+                                   {{ 'checked' if job.continuation_of_job_id == parent.job_id else '' }}></td>
+                        <td style="text-align:left"><label for="continuation_job_{{ parent.job_id }}" class="mb-0">
+                            <strong>{{ film_label(parent.title_manual or parent.title, parent.year) }}</strong></label>
+                            {% if parent.continues %}<small class="ml-1">(continues)</small>{% endif %}</td>
+                        <td style="text-align:left">{{ parent.label }}</td>
+                        <td style="text-align:left">{{ parent.devpath }}</td>
+                        <td style="text-align:left">{{ parent.stop_time.strftime('%Y-%m-%d %H:%M') if parent.stop_time else '' }}</td>
+                        <td style="text-align:left"><a href="jobdetail?job_id={{ parent.job_id }}">{{ parent.job_id }}</a></td>
+                    </tr>
+                {% else %}
+                    <tr><td colspan="6">No successful rips to pick from.</td></tr>
+                {% endfor %}
+                </tbody>
+            </table>
+        </div>
+        <button class="btn btn-info btn-lg btn-block" type="submit" {{ 'disabled' if job.finished else '' }}>Save</button>
+    </form>
+</div>
+{% endblock %}

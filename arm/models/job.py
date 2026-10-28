@@ -211,6 +211,10 @@ class Job(db.Model):
     """Set when this disc is the bonus disc of an earlier job: its titles are filed as that film's extras"""
     bonus_of_film_id = db.Column(db.Integer)
     """With bonus_of_job_id: the film of a double feature (a box set's supplemental disc) the extras belong to"""
+    continuation_of_job_id = db.Column(db.Integer)
+    """Set when this disc is the second side or disc of an earlier job's film: its main title is appended to it"""
+    continues = db.Column(db.Boolean)
+    """The film goes on on another side or disc still to be ripped: the completed shipper holds the folder till then"""
     devpath = db.Column(db.String(15))
     mountpoint = db.Column(db.String(20))
     hasnicetitle = db.Column(db.Boolean)
@@ -234,6 +238,9 @@ class Job(db.Model):
     """The job whose film this bonus disc belongs to; None for an ordinary disc"""
     bonus_of_film = db.relationship('Film', primaryjoin='foreign(Job.bonus_of_film_id) == Film.film_id',
                                     viewonly=True)
+    continuation_of = db.relationship('Job', primaryjoin='foreign(Job.continuation_of_job_id) == remote(Job.job_id)',
+                                      viewonly=True)
+    """The job whose film this disc continues; None for an ordinary disc"""
 
     def __init__(self, devpath):
         """Return a disc object"""

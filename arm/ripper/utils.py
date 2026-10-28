@@ -232,6 +232,27 @@ def is_bonus_disc(job):
     return bonus_parent(job)[0] is not None
 
 
+def continuation_parent(job):
+    """
+    The job whose film this disc continues (marked in the ui: side B of a flipper, the second disc of a long
+    film), whose main feature the disc's main title is appended to\n
+    :param job: Current job
+    :return: parent Job, or None when the job is not a continuation (or is a bonus disc, which wins)
+    """
+    if not getattr(job, "continuation_of_job_id", None) or is_bonus_disc(job):
+        return None
+    parent = getattr(job, "continuation_of", None)
+    if parent is None:
+        logging.warning(f"Job {job.job_id} is marked as the continuation of job {job.continuation_of_job_id}, "
+                        "which no longer exists; ripping it as an ordinary disc")
+    return parent
+
+
+def is_continuation(job):
+    """True when the job was marked in the ui as the continuation of an earlier job's film (see continuation_parent)"""
+    return continuation_parent(job) is not None
+
+
 def bonus_tag(job):
     """
     What a bonus disc's files are prefixed with, so they never collide with the extras already in the
@@ -265,7 +286,8 @@ def move_files(base_path, filename, job, is_main_feature=False):
     """
     Run extra checks then move files from RAW_PATH or TRANSCODE_PATH to final media directory\n
     A bonus disc (see bonus_parent) has no main feature: every file goes to the film's extras folder
-    as ``<disc label>_<filename>``\n
+    as ``<disc label>_<filename>``. Nor has a continuation (see continuation_parent), whose main title
+    arm_ripper.file_continuation joins onto the film's: its extras are named the same way\n
     :param str base_path: Path to source directory\n
     :param str filename: name of file to be moved\n
     :param job: instance of Job class\n
@@ -282,10 +304,13 @@ def move_files(base_path, filename, job, is_main_feature=False):
 
     movie_path = job.path
     bonus = is_bonus_disc(job)
+    # Its titles share the film's folder with the first disc's, which have the same names
+    prefixed = bonus or is_continuation(job)
     logging.info(f"Moving {job.video_type} {filename} to {movie_path}")
-    if bonus:
+    if prefixed:
         # Named like the film's own file it would replace it, here or once shipped
         is_main_feature = False
+    if bonus:
         extras_path = os.path.join(movie_path, bonus_extras_sub(job))
     else:
         # For series there are no extras so always use the base path
@@ -299,7 +324,7 @@ def move_files(base_path, filename, job, is_main_feature=False):
     else:
         # Don't make the extra's path unless we need it
         make_dir(extras_path)
-        extra_name = unused_name(extras_path, f"{bonus_tag(job)}_{filename}") if bonus else filename
+        extra_name = unused_name(extras_path, f"{bonus_tag(job)}_{filename}") if prefixed else filename
         logging.info(f"Moving '{os.path.join(base_path, filename)}' to {os.path.join(extras_path, extra_name)}")
         # This also handles series - But it doesn't use the extras folder
         move_files_main(os.path.join(base_path, filename), os.path.join(extras_path, extra_name), extras_path)
@@ -1089,6 +1114,9 @@ def check_for_wait(job):
             db.session.refresh(job)
             if job.bonus_of_job_id:
                 logging.info(f"Marked as the bonus disc of job {job.bonus_of_job_id}.")
+                break
+            if job.continuation_of_job_id:
+                logging.info(f"Marked as the continuation of job {job.continuation_of_job_id}.")
                 break
             if job.title_manual:
                 logging.info("Manual override found.  Overriding auto identification values.")
