@@ -271,6 +271,7 @@ def tmdb_get_imdb(tmdb_id, media_type="movie"):
     :param media_type: "series" for a TV id: films and TV entries are numbered apart, so TV id
         132011 asked for as a film is whichever film has that number
     :return: str of imdb_id
+    :raises requests.RequestException: when TMDB cannot be reached or does not answer within 30 seconds
     """
     # https://api.themoviedb.org/3/movie/78?api_key=
     # &append_to_response=alternative_titles,changes,credits,images,keywords,lists,releases,reviews,similar,videos
@@ -280,13 +281,13 @@ def tmdb_get_imdb(tmdb_id, media_type="movie"):
     url_tv = f"https://api.themoviedb.org/3/tv/{tmdb_id}/external_ids?api_key={tmdb_api_key}"
     if media_type != "series":
         # Making a get request
-        response = requests.get(url)
+        response = requests.get(url, timeout=30)
         search_results = json.loads(response.text)
         # 'status_code' means id wasn't found
         if 'status_code' not in search_results:
             return search_results['external_ids']['imdb_id']
     # Try tv series
-    response = requests.get(url_tv)
+    response = requests.get(url_tv, timeout=30)
     tv_json = json.loads(response.text)
     app.logger.debug(tv_json)
     if 'status_code' not in tv_json:

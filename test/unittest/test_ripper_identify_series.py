@@ -163,11 +163,12 @@ class TestSeriesInstead(unittest.TestCase):
         self.assertEqual(job.poster_url, "https://img/series.jpg")
         self.mocks[2].assert_called_once_with(132011)
 
-    def test_lsdvd_runs_once_for_the_series_check_and_the_track_99_detection(self):
+    def test_a_film_without_a_release_date_has_no_year_to_match(self):
+        """TMDB's film search gives a film without a release date the year "0000", which no series has."""
         job = _job()
-        identify.apply_search_result(job, dict(DINOSAURS_FILM))
-        self.assertEqual(len(identify.lsdvd_tracks(job)), 4)
-        self.run.assert_called_once_with(["lsdvd", "-Oy", "/dev/sr1"])
+        identify.apply_search_result(job, dict(DINOSAURS_FILM, Year="0000"))
+        self.assertEqual((job.video_type, job.imdb_id, job.year), ("series", "tt2185012", "2012"))
+        self.mocks[2].assert_called_once_with(132011)
 
     def test_a_series_of_another_year_is_not_the_films_twin(self):
         job = _job()
@@ -235,6 +236,92 @@ class TestSeriesInstead(unittest.TestCase):
         self.assertEqual((job.video_type, job.imdb_id, job.year), ("series", "tt2185012", "2012"))
 
 
+@unittest.skipIf(IMPORT_ERROR is not None, f"ARM could not be imported here: {IMPORT_ERROR}")
+class TestIdentifyDvdTracks(unittest.TestCase):
+    """
+    identify_dvd for job 146, its label search finding the film: the series check and the track 99
+    detection share one lsdvd run. The CRC64 hash, the network, lsdvd and the database are stand-ins.
+    """
+
+    def setUp(self):
+        os.environ["ARM_CONFIG_FILE"] = _CONFIG
+        if cfg.arm_config_path != _CONFIG:
+            importlib.reload(cfg)
+        self.prevent_99 = cfg.arm_config.get("PREVENT_99")
+        cfg.arm_config.update({"METADATA_PROVIDER": "tmdb", "PREVENT_99": False})
+        crc_miss = SimpleNamespace(read=lambda: b'{"success": false, "mode": "s", "results": {}}')
+        self.patches = [
+            mock.patch.object(identify.utils, "database_updater", side_effect=_fake_updater),
+            mock.patch.object(identify.pydvdid, "compute", return_value="7f3d5c9a1b2e4d60"),
+            mock.patch.object(identify.urllib.request, "urlopen", return_value=crc_miss),
+            mock.patch.object(identify.ui_utils, "tmdb_search", return_value={"Search": [dict(DINOSAURS_FILM)]}),
+            mock.patch.object(identify.ui_metadata, "tmdb_tv_search", return_value=[dict(DINOSAURS_SERIES)]),
+            mock.patch.object(identify.ui_metadata, "tmdb_tv_details", return_value=dict(SERIES_DETAILS)),
+            mock.patch.object(identify.ui_metadata, "tmdb_runtime", return_value=24 * 60),
+        ]
+        for patch in self.patches:
+            patch.start()
+        self.lsdvd = mock.patch.object(identify, "arm_subprocess", return_value=LSDVD_146)
+        self.run = self.lsdvd.start()
+
+    def tearDown(self):
+        self.lsdvd.stop()
+        for patch in self.patches:
+            patch.stop()
+        cfg.arm_config["PREVENT_99"] = self.prevent_99
+
+    @staticmethod
+    def _dvd_job():
+        job = _job(mountpoint="/mnt/dev/sr1", crc_id=None, has_track_99=False)
+        job.pretty_table = lambda: ""
+        return job
+
+    def _identify_dvd(self):
+        job = self._dvd_job()
+        self.assertTrue(identify.identify_dvd(job))
+        return job
+
+    def test_job_146_series_check_and_track_99_detection_run_lsdvd_once(self):
+        job = self._identify_dvd()
+        self.assertEqual((job.video_type, job.imdb_id, job.has_track_99), ("series", "tt2185012", False))
+        self.run.assert_called_once_with(["lsdvd", "-Oy", "/dev/sr1"])
+
+    def test_track_99_is_found_in_the_same_lsdvd_run(self):
+        self.run.return_value = _lsdvd(*[1319.0] * 99)
+        job = self._identify_dvd()
+        self.assertTrue(job.has_track_99)
+        self.run.assert_called_once_with(["lsdvd", "-Oy", "/dev/sr1"])
+
+    def test_prevent_99_stops_a_disc_with_99_titles(self):
+        cfg.arm_config["PREVENT_99"] = True
+        self.run.return_value = _lsdvd(*[1319.0] * 99)
+        job = self._dvd_job()
+        with self.assertRaisesRegex(identify.utils.RipperException, "PREVENT_99"):
+            identify.identify_dvd(job)
+        self.assertTrue(job.has_track_99)
+
+    def test_unparsable_lsdvd_output_is_no_titles(self):
+        """A DVD lsdvd could not read is judged like a Blu-ray, and the log says why the titles are unknown."""
+        self.run.return_value = "lsdvd = {\n  'track' : [ { 'ix' : 1, 'length' : nan } ],\n}\n"
+        with self.assertLogs(level="INFO") as logs:
+            job = self._identify_dvd()
+        self.assertEqual((job.video_type, job.has_track_99), ("series", False))
+        self.assertTrue(any("lsdvd listed none" in line for line in logs.output), logs.output)
+        self.run.assert_called_once()
+
+    def test_the_lsdvd_titles_stay_out_of_the_jobs_dumps(self):
+        """pretty_table is logged at every step: it would carry every title's audio, chapter and cell lists."""
+        with mock.patch.object(identify.Job, "parse_udev"), mock.patch.object(identify.Job, "get_pid"):
+            job = identify.Job("/dev/sr1")
+        job.disctype = "dvd"
+        self.assertEqual(len(identify.lsdvd_tracks(job)), 4)
+        self.assertNotIn("_lsdvd_tracks", job.get_d())
+        self.assertEqual(job.get_d()["devpath"], "/dev/sr1")
+        self.assertNotIn("_lsdvd_tracks", job.pretty_table())
+        self.assertNotIn("1319.04", job.pretty_table())
+        self.assertIn("/dev/sr1", job.pretty_table())
+
+
 def _response(payload):
     return SimpleNamespace(text=json.dumps(payload), status_code=200)
 
@@ -259,6 +346,13 @@ class TestTmdbTv(unittest.TestCase):
         self.assertIn("/search/tv", get.call_args_list[0].args[0])
         self.assertIn("/tv/132011/external_ids", get.call_args_list[1].args[0])
         self.assertEqual(get.call_count, 2)
+
+    def test_imdb_lookups_give_up_after_30_seconds(self):
+        """The series check asks for each twin's IMDb id: a stalled TMDB must not hold up the ripper."""
+        answers = [_response({"status_code": 34}), _response({"imdb_id": "tt2402123"})]
+        with mock.patch.object(metadata.requests, "get", side_effect=answers) as get:
+            self.assertEqual(metadata.tmdb_get_imdb(221236), "tt2402123")
+        self.assertEqual([call.kwargs.get("timeout") for call in get.call_args_list], [30, 30])
 
     def test_tv_search_failure_is_no_entries(self):
         with mock.patch.object(metadata.requests, "get", side_effect=metadata.requests.Timeout("slow")):

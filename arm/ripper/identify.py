@@ -533,6 +533,8 @@ def series_instead(job, best):
     if provider != "tmdb" or best.get('Type') != "movie" or not best.get('id'):
         return None
     wanted, year = _normalise_title(best.get('Title')), str(best.get('Year') or "")[:4]
+    if not year.isdigit() or not int(year):
+        year = ""  # tmdb_process_results makes a film without a release date "0000"
 
     def twin(result):
         return (_normalise_title(result.get('name')) == wanted
@@ -549,10 +551,15 @@ def series_instead(job, best):
         logging.debug(f"Looking for a series titled '{best.get('Title')}' failed: {error}")
         return None
     episodes = looks_like_episodes(lengths, film, details.get('episode_runtimes'), details.get('episodes'))
+    if lengths:
+        titles = f"{', '.join(str(length // 60) for length in sorted(lengths, reverse=True)[:8])} min"
+    elif getattr(job, 'disctype', None) == "dvd":
+        titles = "unknown (lsdvd listed none, judged like a Blu-ray)"
+    else:
+        titles = "not known before MakeMKV"
     logging.info(f"TMDB has '{series['Title']}' ({series['Year']}) as a series too "
                  f"({details.get('episodes') or 'unknown'} episodes); the film runs "
-                 f"{film // 60 if film else 'unknown'} min, the disc's titles "
-                 f"{', '.join(str(length // 60) for length in sorted(lengths, reverse=True)[:8]) or 'unknown'} min: "
+                 f"{film // 60 if film else 'unknown'} min, the disc's titles {titles}: "
                  f"{'episodes' if episodes else 'keeping the film'}")
     return series if episodes else None
 
@@ -560,7 +567,8 @@ def series_instead(job, best):
 def dvd_title_lengths(job):
     """
     The lengths in seconds of a DVD's titles, from lsdvd: identification runs before MakeMKV lists
-    the titles, so a Blu-ray's are not known yet (an empty list).
+    the titles, so a Blu-ray's are not known yet (an empty list). Nor are a DVD's when lsdvd failed
+    or its output could not be parsed: that DVD is then judged like a Blu-ray (looks_like_episodes).
     """
     if getattr(job, 'disctype', None) != "dvd" or not getattr(job, 'devpath', None):
         return []
@@ -615,9 +623,9 @@ def looks_like_episodes(lengths, film_runtime_seconds, episode_runtimes, episode
     With the disc's title lengths: a film longer than a short with a title that runs as long as it
     is on the disc, extras and second cuts beside it notwithstanding. Otherwise several titles of
     the same length are episodes when that length is the series' episode runtime, or when the film
-    runs no more than half as long as they do together. Without them (a Blu-ray before MakeMKV) only
-    TMDB can say: a film entry no longer than a short, beside a series of several episodes, is
-    taken for one of the episodes.
+    runs no more than half as long as they do together. Without them (a Blu-ray before MakeMKV, a
+    DVD lsdvd could not read) only TMDB can say: a film entry no longer than a short, beside a
+    series of several episodes, is taken for one of the episodes.
 
     :param lengths: the disc's title lengths in seconds, possibly empty
     :param film_runtime_seconds: the film's runtime, or None when TMDB has none
