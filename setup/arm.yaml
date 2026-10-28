@@ -103,6 +103,12 @@ MAX_CONCURRENT_TRANSCODES: 0
 # Set to 0 to disable
 MAX_CONCURRENT_MAKEMKVINFO: 0
 
+# Let only one makemkvcon info scan run at a time across all drives (rips still run side by side).
+# Two discs scanned at once can make MakeMKV fail to open one of them on some setups, such as
+# several Blu-ray drives behind one USB hub. Set to false when the drives can scan side by side,
+# so a disc does not wait up to 15 minutes for another drive's scan before its own starts.
+SERIALIZE_MAKEMKV_INFO: true
+
 # Additional parameters for dd. e.g. "conv=noerror,sync" for ignoring read errors
 # "status=progress" to log progress
 DATA_RIP_PARAMETERS: ""

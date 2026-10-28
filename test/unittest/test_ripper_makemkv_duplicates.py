@@ -463,6 +463,40 @@ class TestInfoScanLock(unittest.TestCase):
                 pass
         self.assertEqual(pause.call_count, 1)
 
+    def test_waiting_is_logged_once_at_info(self):
+        holder = self._hold_lock()
+        pauses = []
+
+        def pause(_):
+            pauses.append(None)
+            if len(pauses) == 2:
+                holder.close()
+
+        with mock.patch.object(makemkv, "sleep", side_effect=pause), \
+                self.assertLogs(level="INFO") as logs:
+            with makemkv.info_scan_lock():
+                pass
+        self.assertEqual(len(pauses), 2)
+        waiting = [line for line in logs.output if line.startswith("INFO:") and "is running; waiting" in line]
+        self.assertEqual(len(waiting), 1)
+        self.assertTrue(any(line.startswith("INFO:") and "Waited" in line for line in logs.output))
+
+    def test_lock_is_taken_when_serialize_is_on(self):
+        with mock.patch.dict(makemkv.cfg.arm_config, {"SERIALIZE_MAKEMKV_INFO": True}):
+            with makemkv.info_scan_lock():
+                self.assertTrue(self._is_locked())
+        self.assertFalse(self._is_locked())
+
+    def test_lock_is_skipped_when_serialize_is_off(self):
+        self._hold_lock()
+        with mock.patch.dict(makemkv.cfg.arm_config, {"SERIALIZE_MAKEMKV_INFO": False}), \
+                mock.patch.object(makemkv.fcntl, "flock") as flock, \
+                mock.patch.object(makemkv, "sleep") as pause:
+            with makemkv.info_scan_lock():
+                pass
+        flock.assert_not_called()
+        pause.assert_not_called()
+
     def test_makemkv_info_runs_makemkvcon_inside_the_lock(self):
         locked_while_running = []
 

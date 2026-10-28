@@ -587,7 +587,11 @@ def info_scan_lock():
     seen on the t620 when Blu-rays went into two drives within seconds. Only the scans wait for
     each other; rips (makemkvcon mkv) still run side by side. A scan that holds the lock longer
     than MAKEMKV_INFO_LOCK_TIMEOUT is taken to hang and is not waited for any longer.
+    With SERIALIZE_MAKEMKV_INFO false (drives that can scan side by side) no lock is taken.
     """
+    if not cfg.arm_config.get("SERIALIZE_MAKEMKV_INFO", True):
+        yield
+        return
     try:
         lock_file = open(MAKEMKV_INFO_LOCK, "a")
     except OSError as error:
@@ -595,12 +599,20 @@ def info_scan_lock():
         yield
         return
     with lock_file:
-        deadline = time() + MAKEMKV_INFO_LOCK_TIMEOUT
+        started = time()
+        deadline = started + MAKEMKV_INFO_LOCK_TIMEOUT
+        waited = False
         while True:
             try:
                 fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                if waited:
+                    logging.info(f"Waited {round(time() - started)}s for another drive's MakeMKV scan")
                 break
             except BlockingIOError:
+                if not waited:
+                    logging.info("Another drive's MakeMKV scan is running; waiting for it to finish "
+                                 f"(up to {MAKEMKV_INFO_LOCK_TIMEOUT}s)")
+                    waited = True
                 if time() >= deadline:
                     logging.warning(f"Another drive's MakeMKV scan has run for over {MAKEMKV_INFO_LOCK_TIMEOUT}s; "
                                     "scanning anyway")
