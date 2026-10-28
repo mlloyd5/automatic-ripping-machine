@@ -147,6 +147,12 @@ class TestMatchTracksToFilms(unittest.TestCase):
         self.assertEqual(matched, {})
         self.assertEqual(_numbers(arm_ripper.match_by_disc_order(tracks, films, matched)), {1: "0", 2: "1"})
 
+    def test_alike_films_take_the_first_titles_that_fit_in_disc_order(self):
+        # all three titles fit both 46 minute films; the closest two are not the first two on the disc
+        matched = arm_ripper.match_tracks_to_films([_track(0, 2700), _track(1, 2780), _track(2, 2760)],
+                                                   _cats_and_dogs())
+        self.assertEqual(_numbers(matched), {1: "0", 2: "1"})
+
 
 @unittest.skipIf(IMPORT_ERROR is not None, f"ARM could not be imported here: {IMPORT_ERROR}")
 class TestMatchByDiscOrder(unittest.TestCase):
@@ -175,12 +181,30 @@ class TestMatchByDiscOrder(unittest.TestCase):
         self.assertEqual(arm_ripper.match_by_disc_order([_track(0, 3152), _track(1, 2998), _track(2, 3300)],
                                                         films, {}), {})
 
-    def test_leaves_a_single_film_or_unknown_runtimes_to_the_main_feature_rule(self):
+    def test_titles_must_be_near_their_own_films_runtime(self):
+        # both titles are feature length next to the 46 minute film, but the second is no 90 minute film
+        films = [_film(1, "Short", "2001", 2760), _film(2, "Long", "2002", 5400)]
+        tracks = [_track(0, 3152), _track(1, 2998), _track(2, 620)]
+        with self.assertLogs(level="INFO") as logs:
+            self.assertEqual(arm_ripper.match_by_disc_order(tracks, films, {}), {})
+        self.assertTrue(any("too far off its 5400s runtime" in line for line in logs.output), logs.output)
+
+    def test_files_a_single_later_film(self):
+        # the first film's runtime places it; the second's is 392s off, and its title is the only one left
+        films = [_film(1, "The Secret Life of Dogs", "2013", 2998),
+                 _film(2, "The Secret Life of Cats", "2014", CATS_AND_DOGS)]
+        tracks = [_track(0, 2998), _track(1, 3152), _track(2, 620)]
+        matched = arm_ripper.match_tracks_to_films(tracks, films)
+        self.assertEqual(_numbers(matched), {1: "0"})
+        self.assertEqual(_numbers(arm_ripper.match_by_disc_order(tracks, films, matched)), {2: "1"})
+
+    def test_leaves_a_lone_first_film_or_unknown_runtimes_to_the_main_feature_rule(self):
         tracks = [_track(0, 3152), _track(1, 2998)]
         films = _cats_and_dogs()
         self.assertEqual(arm_ripper.match_by_disc_order(tracks, films, {2: tracks[1]}), {})
         films[1].runtime = None
         self.assertEqual(arm_ripper.match_by_disc_order(tracks, films, {}), {})
+        self.assertEqual(arm_ripper.match_by_disc_order(tracks, films, {1: tracks[0]}), {})
 
 
 @unittest.skipIf(IMPORT_ERROR is not None, f"ARM could not be imported here: {IMPORT_ERROR}")
@@ -257,6 +281,17 @@ class TestFileCollection(unittest.TestCase):
         self.assertEqual([film.track_number for film in job.films], ["0", "1"])
         self.assertFalse(any("main-feature rule" in line or "not filed" in line for line in logs.output),
                          logs.output)
+
+    def test_a_later_film_runtime_cannot_place_is_filed_by_disc_order(self):
+        tracks = [_track(0, 2998, chapters=6), _track(1, 3152, chapters=6), _track(2, 620, chapters=1)]
+        films = [_film(1, "The Secret Life of Dogs", "2013", 2998),
+                 _film(2, "The Secret Life of Cats", "2014", CATS_AND_DOGS)]
+        job = self._job(tracks, films, title="The Secret Life of Dogs", year="2013")
+        self.assertTrue(arm_ripper.file_collection(self.raw_path, job, os.listdir(self.raw_path)))
+        dogs, cats = "The Secret Life of Dogs (2013)", "The Secret Life of Cats (2014)"
+        self.assertTrue(os.path.isfile(self._file(cats, f"{cats}.mkv")))
+        self.assertEqual(os.listdir(self._file(dogs, "extras")), ["title_t02.mkv"])
+        self.assertEqual([film.track_number for film in films], ["0", "1"])
 
     def test_mainfeature_leaves_extras_in_place(self):
         tracks = [_track(0, 5065, chapters=9), _track(1, 4656, chapters=8), _track(2, 1500, chapters=1)]
