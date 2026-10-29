@@ -236,7 +236,9 @@ MKV_ARGS: ""
 # Many Blu-rays and 4K discs list the main film twice: two playlists with the same runtime and size,
 # one with chapters and one with none. With this enabled ARM keeps the title with the most chapters
 # (same segment map, or the same duration and size when MakeMKV gives no segment map) and skips the
-# other copies. Extras are not affected. Only applies to RIPMETHOD "mkv" with MAINFEATURE false;
+# other copies. On DVDs the segment map only numbers each title's own cells, so there a copy must also
+# have exactly the same size (episodes of a series often share a map like "1-12" and differ by a few
+# hundred KB). Extras are not affected. Only applies to RIPMETHOD "mkv" with MAINFEATURE false;
 # in manual drive mode the duplicates are shown unticked and you can still pick them.
 SKIP_DUPLICATE_TITLES: true
 

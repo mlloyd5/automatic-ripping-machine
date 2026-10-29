@@ -57,11 +57,11 @@ class _Tracks(list):
         return list(self)
 
 
-def _job(tracks, **config):
+def _job(tracks, disctype="bluray", **config):
     settings = dict(MAINFEATURE=False, MAXLENGTH="99999", MINLENGTH="600", MKV_ARGS="",
                     SKIP_DUPLICATE_TITLES=True, LOGPATH=_TMP)
     settings.update(config)
-    return SimpleNamespace(job_id=1, devpath="/dev/sr0", no_of_titles=len(tracks), status="",
+    return SimpleNamespace(job_id=1, devpath="/dev/sr0", no_of_titles=len(tracks), status="", disctype=disctype,
                            drive=SimpleNamespace(mdisc=0), config=SimpleNamespace(**settings),
                            tracks=_Tracks(tracks))
 
@@ -176,6 +176,61 @@ class TestFindDuplicateTitles(unittest.TestCase):
 
 
 @unittest.skipIf(IMPORT_ERROR is not None, f"ARM could not be imported here: {IMPORT_ERROR}")
+class TestFindDuplicateTitlesDvd(unittest.TestCase):
+    """DVD segment maps number each title's own cells, so "1-12" alone says nothing."""
+
+    def _anne_of_avonlea_disc_1(self):
+        # ts140 job 86: three different BBC episodes, two of them with the map "1-12"
+        return [_track(0, 3097, 2_297_769_984, 12, "1-12"),
+                _track(1, 3077, 2_283_321_344, 12, "1-7,8-12"),
+                _track(2, 3098, 2_298_404_864, 12, "1-12")]
+
+    def test_episodes_with_the_same_map_are_not_duplicates(self):
+        self.assertEqual(makemkv.find_duplicate_titles(self._anne_of_avonlea_disc_1(), "dvd"), [])
+
+    def test_same_titles_on_a_bluray_would_match(self):
+        # the Blu-ray rule is unchanged: same clips, sizes within 2 %
+        groups = makemkv.find_duplicate_titles(self._anne_of_avonlea_disc_1(), "bluray")
+        self.assertEqual([(kept.track_number, [t.track_number for t in dupes]) for kept, dupes in groups],
+                         [("2", ["0"])])
+
+    def test_short_episodes_with_the_same_map_are_not_duplicates(self):
+        # ts140 job 146 (The Amazing World of Dinosaurs disc 1): three 22-minute episodes,
+        # all "1-2", lengths within 2 s and sizes within 0.4 %
+        episodes = [_track(0, 1319, 1_125_830_656, 2, "1-2"),
+                    _track(1, 1318, 1_124_900_864, 2, "1-2"),
+                    _track(2, 1317, 1_121_648_640, 2, "1-2")]
+        self.assertEqual(makemkv.find_duplicate_titles(episodes, "dvd"), [])
+
+    def test_same_map_and_same_size_is_a_duplicate(self):
+        main = _track(0, 6296, 4_100_000_000, 28, "1-28")
+        copy = _track(1, 6296, 4_100_000_000, 1, "1-28")
+        self.assertEqual(makemkv.find_duplicate_titles([copy, main], "dvd"), [(main, [copy])])
+
+    def test_same_map_near_equal_size_is_not_a_duplicate(self):
+        # ts140 job 81 (Maid in Manhattan): titles 0 and 1, 6296 s each, 854016 bytes apart
+        title_0 = _track(0, 6296, 4_100_854_016, 28, "1-28")
+        title_1 = _track(1, 6296, 4_100_000_000, 28, "1-28")
+        self.assertEqual(makemkv.find_duplicate_titles([title_0, title_1], "dvd"), [])
+
+    def test_different_maps_with_the_same_size_are_not_duplicates(self):
+        episode_1 = _track(0, 1420, 1_000_000_000, 5, "1-5")
+        episode_2 = _track(1, 1420, 1_000_000_000, 5, "1-3,4-5")
+        self.assertEqual(makemkv.find_duplicate_titles([episode_1, episode_2], "dvd"), [])
+
+    def test_fallback_without_segment_maps_needs_the_exact_size(self):
+        main = _track(0, 6903, 4_000_000_000, 20)
+        copy = _track(1, 6904, 4_000_000_000, 0)
+        near = _track(2, 6903, 4_000_000_001, 0)
+        self.assertEqual(makemkv.find_duplicate_titles([main, copy, near], "dvd"), [(main, [copy])])
+
+    def test_unknown_sizes_are_not_duplicates(self):
+        main = _track(0, 6903, 0, 20, "1-20")
+        copy = _track(1, 6903, 0, 0, "1-20")
+        self.assertEqual(makemkv.find_duplicate_titles([main, copy], "dvd"), [])
+
+
+@unittest.skipIf(IMPORT_ERROR is not None, f"ARM could not be imported here: {IMPORT_ERROR}")
 class TestSkipDuplicateTitles(unittest.TestCase):
 
     def test_marks_duplicates_and_commits(self):
@@ -195,6 +250,23 @@ class TestSkipDuplicateTitles(unittest.TestCase):
         self.assertIsNone(extra.duplicate_of)
         commit.assert_called_once()
         self.assertTrue(any("Title 1" in line and "copy of title 0" in line and "same segment map" in line
+                            for line in logs.output), logs.output)
+
+    def test_dvd_episodes_are_all_ripped(self):
+        episodes = [_track(0, 3097, 2_297_769_984, 12, "1-12"), _track(2, 3098, 2_298_404_864, 12, "1-12")]
+        job = _job(episodes, disctype="dvd")
+        with mock.patch.object(makemkv.db.session, "commit") as commit:
+            self.assertEqual(makemkv.skip_duplicate_titles(job), [])
+        commit.assert_not_called()
+        self.assertEqual([track.duplicate_of for track in episodes], [None, None])
+
+    def test_dvd_copy_is_logged_with_the_size(self):
+        main = _track(0, 6296, 4_100_000_000, 28, "1-28")
+        copy = _track(1, 6296, 4_100_000_000, 1, "1-28")
+        job = _job([main, copy], disctype="dvd")
+        with mock.patch.object(makemkv.db.session, "commit"), self.assertLogs(level="INFO") as logs:
+            self.assertEqual(makemkv.skip_duplicate_titles(job), [copy])
+        self.assertTrue(any("copy of title 0" in line and "same segment map and size" in line
                             for line in logs.output), logs.output)
 
     def test_no_duplicates_no_commit(self):

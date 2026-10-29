@@ -1198,7 +1198,7 @@ def get_track_info(index, job):
         sleep(DISC_OPEN_RETRY_WAIT)
 
 
-def _titles_match(kept, candidate):
+def _titles_match(kept, candidate, disctype=None):
     """
     Decide whether `candidate` is a copy of `kept`: the same content listed as another title.
 
@@ -1208,16 +1208,27 @@ def _titles_match(kept, candidate):
     match (think of the episodes of a series). Without segment maps the duration and
     size are all there is to go on, so both sizes must actually be known.
 
+    On a DVD the segment map numbers the cells of each title's own program chain, so
+    "1-12" is the map of any title with 12 cells, and two episodes of the same length
+    have the same map (Anne of Avonlea, job 86 on the ts140). Copies of a DVD title play
+    the same cells and so have exactly the same size, so on a DVD the sizes must match
+    to the byte. Blu-ray segment maps list m2ts clip numbers, which are the same for the
+    whole disc, so there equal maps do mean the same content.
+
     Parameters:
         kept: arm.models.track.Track (or anything with length, filesize, segment_map)
         candidate: arm.models.track.Track
+        disctype: the job's disctype, e.g. "dvd" or "bluray"
     Returns:
         bool
     """
     if abs(int(kept.length or 0) - int(candidate.length or 0)) > DUPLICATE_DURATION_TOLERANCE:
         return False
     kept_size, candidate_size = int(kept.filesize or 0), int(candidate.filesize or 0)
-    if abs(kept_size - candidate_size) > max(kept_size, candidate_size) * DUPLICATE_FILESIZE_TOLERANCE:
+    if disctype == "dvd":
+        if not (kept_size > 0 and kept_size == candidate_size):
+            return False
+    elif abs(kept_size - candidate_size) > max(kept_size, candidate_size) * DUPLICATE_FILESIZE_TOLERANCE:
         return False
     kept_map = (kept.segment_map or "").strip()
     candidate_map = (candidate.segment_map or "").strip()
@@ -1226,16 +1237,18 @@ def _titles_match(kept, candidate):
     return kept_size > 0 and candidate_size > 0
 
 
-def find_duplicate_titles(tracks):
+def find_duplicate_titles(tracks, disctype=None):
     """
     Group titles that are copies of the same content.
 
     Many Blu-rays list the main film twice, e.g. one playlist with chapters and one
     without, with the same runtime and size. Within each group the title with the
     most chapters is kept (tie-break: larger file size, then lower track number).
+    On DVDs only titles of exactly the same size count as copies (see _titles_match).
 
     Parameters:
         tracks: iterable of arm.models.track.Track
+        disctype: the job's disctype, e.g. "dvd" or "bluray"
     Returns:
         list of (kept_track, [duplicate_tracks]) for every title that has duplicates
     """
@@ -1245,7 +1258,7 @@ def find_duplicate_titles(tracks):
     groups = []
     for track in ranked:
         for kept, duplicates in groups:
-            if _titles_match(kept, track):
+            if _titles_match(kept, track, disctype):
                 duplicates.append(track)
                 break
         else:
@@ -1267,9 +1280,12 @@ def skip_duplicate_titles(job):
         list of the skipped arm.models.track.Track
     """
     skipped = []
-    for kept, duplicates in find_duplicate_titles(job.tracks.all()):
+    for kept, duplicates in find_duplicate_titles(job.tracks.all(), job.disctype):
         for track in duplicates:
-            reason = "same segment map" if kept.segment_map and track.segment_map else "same duration and size"
+            if kept.segment_map and track.segment_map:
+                reason = "same segment map and size" if job.disctype == "dvd" else "same segment map"
+            else:
+                reason = "same duration and size"
             logging.info(f"Title {track.track_number} ({track.chapters} chapters, {track.length}s, "
                          f"{track.filesize} bytes, {track.source_file or 'unknown source'}) is a copy of "
                          f"title {kept.track_number} ({kept.chapters} chapters, "
