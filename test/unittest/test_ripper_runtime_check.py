@@ -158,7 +158,7 @@ class TestCheckRuntime(unittest.TestCase):
         self.mocks["candidates"].return_value = [RED_2010]
         job = _job("RED", "Red", "2017", RED_2017_SHORT["imdbID"], self.RED_DISC)
         self.assertTrue(arm_ripper.check_runtime(job))
-        self.mocks["apply"].assert_called_once_with(job, RED_2010)
+        self.mocks["apply"].assert_called_once_with(job, RED_2010, check_series=False)
         self.mocks["notify"].assert_called_once_with(
             job, mock.ANY, "Identified as RED (2010) instead of Red (2017) by runtime")
 
@@ -167,7 +167,7 @@ class TestCheckRuntime(unittest.TestCase):
         self.mocks["candidates"].return_value = [RED_2, RED_2010]
         job = _job("RED", "Red", "2017", RED_2017_SHORT["imdbID"], self.RED_DISC)
         arm_ripper.check_runtime(job)
-        self.mocks["apply"].assert_called_once_with(job, RED_2010)
+        self.mocks["apply"].assert_called_once_with(job, RED_2010, check_series=False)
 
     def test_fitting_film_is_kept_without_looking_further(self):
         job = _job("RED", "RED", "2010", RED_2010["imdbID"], self.RED_DISC)
@@ -180,7 +180,7 @@ class TestCheckRuntime(unittest.TestCase):
         disc = [_track(0, 89 * 60 + 40), _track(1, 600)]
         job = _job("Stagecoach", "Stagecoach", "1939", STAGECOACH_1939["imdbID"], disc)
         self.assertTrue(arm_ripper.check_runtime(job))
-        self.mocks["apply"].assert_called_once_with(job, TEXAS_JACK)
+        self.mocks["apply"].assert_called_once_with(job, TEXAS_JACK, check_series=False)
 
     def test_nothing_fits_keeps_the_title_and_tells_the_user(self):
         self.mocks["candidates"].return_value = [_result("Turning Red", "2022", 6100, "tt8097030")]
@@ -196,7 +196,7 @@ class TestCheckRuntime(unittest.TestCase):
         disc = [_track(0, 6949), _track(1, 2081), _track(2, 6949), _track(3, 811)]
         job = _job("RED_2", "High-and-Low-The-Red-Rain", "2016", HIGH_AND_LOW["imdbID"], disc)
         self.assertTrue(arm_ripper.check_runtime(job))
-        self.mocks["apply"].assert_called_once_with(job, RED_2)
+        self.mocks["apply"].assert_called_once_with(job, RED_2, check_series=False)
         self.mocks["notify"].assert_called_once()
 
     def test_loose_fit_stands_without_a_closer_one(self):
@@ -233,7 +233,7 @@ class TestCheckRuntime(unittest.TestCase):
         self.mocks["candidates"].return_value = [RED_2, RED_2010]
         job = _job("RED", "Red", "2017", "tt-unknown", self.RED_DISC)
         self.assertTrue(arm_ripper.check_runtime(job))
-        self.mocks["apply"].assert_called_once_with(job, RED_2010)
+        self.mocks["apply"].assert_called_once_with(job, RED_2010, check_series=False)
 
     def test_failed_lookup_leaves_the_identification_alone(self):
         # a network error or rate limit is no "unknown runtime": no candidate search, no switch
@@ -251,7 +251,7 @@ class TestCheckRuntime(unittest.TestCase):
         self.mocks["candidates"].return_value = [RED_2010]
         job = _job("RED", "RED", "2010", RED_2017_SHORT["imdbID"], self.RED_DISC)
         self.assertTrue(arm_ripper.check_runtime(job))
-        self.mocks["apply"].assert_called_once_with(job, RED_2010)
+        self.mocks["apply"].assert_called_once_with(job, RED_2010, check_series=False)
         self.mocks["notify"].assert_not_called()
 
     def test_unknown_runtime_stands_against_a_loose_fit(self):

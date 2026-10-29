@@ -333,21 +333,38 @@ def identify_dvd(job, title_known=False):
         job.year = None
 
     # Track 99 detection
+    tracks = lsdvd_tracks(job)
+    logging.debug(f"Detected {len(tracks)} tracks")
+    if len(tracks) == 99:
+        job.has_track_99 = True
+        if cfg.arm_config["PREVENT_99"]:
+            raise utils.RipperException("Track 99 found and PREVENT_99 is enabled")
+
+    return True
+
+
+def lsdvd_tracks(job):
+    """
+    The DVD's titles as lsdvd lists them (dicts with ``ix`` and ``length`` in seconds, among others).
+    lsdvd runs once per job: the series check (:func:`series_instead`) may need the titles before
+    the track 99 detection at the end of identify_dvd does.
+
+    :return: list, empty when lsdvd failed
+    """
+    cached = getattr(job, '_lsdvd_tracks', None)
+    if cached is not None:
+        return cached
+    tracks = []
     # -Oy means output a python dict
     output = arm_subprocess(["lsdvd", "-Oy", job.devpath])
     if output:
         try:
             # literal_eval only accepts literals so we have to adjust the output slightly
             tracks = literal_eval(re.sub(r"^.*\{", "{", output)).get("track", [])
-            logging.debug(f"Detected {len(tracks)} tracks")
-            if len(tracks) == 99:
-                job.has_track_99 = True
-                if cfg.arm_config["PREVENT_99"]:
-                    raise utils.RipperException("Track 99 found and PREVENT_99 is enabled")
-        except (SyntaxError, AttributeError) as e:
+        except (SyntaxError, ValueError, AttributeError) as e:
             logging.error("Failed to parse lsdvd output", exc_info=e)
-
-    return True
+    job._lsdvd_tracks = tracks
+    return tracks
 
 
 def get_video_details(job):
@@ -463,13 +480,22 @@ def update_job(job, search_results, title=None, year=None):
     return apply_search_result(job, best)
 
 
-def apply_search_result(job, best):
+def apply_search_result(job, best, check_series=True):
     """
     Make one search result the job's title, year, type, IMDb id and poster.
 
+    A film result gives way to a TV entry of the same title and year when the disc looks like that
+    series' episodes (see :func:`series_instead`).
+
     :param best: a search result in OMDB style (``Title``, ``Year``, ``Type``, ``imdbID``, ``Poster``)
+    :param check_series: False to take the film as it is (check_runtime picks a film by its runtime)
     :return: what ``utils.database_updater`` returns
     """
+    series = series_instead(job, best) if check_series else None
+    if series:
+        logging.info(f"TMDB has '{best['Title']}' ({best['Year']}) as both a film and a series; the disc "
+                     f"looks like episodes, so taking the series (TMDB tv {series.get('id')})")
+        best = series
     new_year = best['Year']
     title = utils.clean_for_filename(best['Title'])
     logging.debug(f"Webservice successful.  New title is {title}.  New Year is: {new_year}")
@@ -487,6 +513,138 @@ def apply_search_result(job, best):
         'hasnicetitle': True
     }
     return utils.database_updater(args, job)
+
+
+def series_instead(job, best):
+    """
+    The TV entry to take instead of a film search result: TMDB can have the same title as a film
+    and as a series, first dated the same day, and its film search finds only the film (tmdb_search
+    asks for TV entries only when there is no film at all). The Amazing World of Dinosaurs (2012) is
+    a 24 minute film on TMDB and a series of 6 episodes; its DVD (ts140 job 146) has three titles of
+    22 minutes and was filed as the film.
+
+    Only a TV entry titled exactly like the film, with the film's year when it has one, counts,
+    and only when the disc looks like its episodes (:func:`looks_like_episodes`).
+
+    :param best: a search result in OMDB style; only TMDB films are checked
+    :return: the TV entry in OMDB style (``Type`` "series"), or None to keep the film
+    """
+    provider = str(cfg.arm_config.get('METADATA_PROVIDER', '')).lower()
+    if provider != "tmdb" or best.get('Type') != "movie" or not best.get('id'):
+        return None
+    wanted, year = _normalise_title(best.get('Title')), str(best.get('Year') or "")[:4]
+    if not year.isdigit() or not int(year):
+        year = ""  # tmdb_process_results makes a film without a release date "0000"
+
+    def twin(result):
+        return (_normalise_title(result.get('name')) == wanted
+                and (not year or str(result.get('first_air_date') or "")[:4] == year))
+    try:
+        twins = ui_metadata.tmdb_tv_search(best['Title'], twin)
+        if not twins:
+            return None
+        series = max(twins, key=_rank_search_result)
+        details = ui_metadata.tmdb_tv_details(series['id']) or {}
+        film = film_runtime(best)
+        lengths = dvd_title_lengths(job)
+    except Exception as error:
+        logging.debug(f"Looking for a series titled '{best.get('Title')}' failed: {error}")
+        return None
+    episodes = looks_like_episodes(lengths, film, details.get('episode_runtimes'), details.get('episodes'))
+    if lengths:
+        titles = f"{', '.join(str(length // 60) for length in sorted(lengths, reverse=True)[:8])} min"
+    elif getattr(job, 'disctype', None) == "dvd":
+        titles = "unknown (lsdvd listed none, judged like a Blu-ray)"
+    else:
+        titles = "not known before MakeMKV"
+    logging.info(f"TMDB has '{series['Title']}' ({series['Year']}) as a series too "
+                 f"({details.get('episodes') or 'unknown'} episodes); the film runs "
+                 f"{film // 60 if film else 'unknown'} min, the disc's titles {titles}: "
+                 f"{'episodes' if episodes else 'keeping the film'}")
+    return series if episodes else None
+
+
+def dvd_title_lengths(job):
+    """
+    The lengths in seconds of a DVD's titles, from lsdvd: identification runs before MakeMKV lists
+    the titles, so a Blu-ray's are not known yet (an empty list). Nor are a DVD's when lsdvd failed
+    or its output could not be parsed: that DVD is then judged like a Blu-ray (looks_like_episodes).
+    """
+    if getattr(job, 'disctype', None) != "dvd" or not getattr(job, 'devpath', None):
+        return []
+    lengths = []
+    for track in lsdvd_tracks(job):
+        try:
+            lengths.append(int(float(track.get('length') or 0)))
+        except (TypeError, ValueError, AttributeError):
+            continue
+    return [length for length in lengths if length > 0]
+
+
+# A title shorter than this is a menu, a trailer or an extra, not an episode
+EPISODE_MIN_LENGTH = 5 * 60
+# Titles within this fraction of the shortest of them run as long as each other: one series' episodes
+EPISODE_LENGTH_SPREAD = 0.1
+# TMDB's episode runtime is the slot more than the episode (30 minutes for 22), so it fits loosely
+EPISODE_RUNTIME_TOLERANCE = 0.3
+# A film runs as long as a title within this fraction of its runtime (a PAL disc plays 4% fast)
+FILM_RUNTIME_TOLERANCE = 0.1
+# Never closer than this many seconds, as in arm_ripper's runtime check
+RUNTIME_TOLERANCE_MIN = 180
+# The longest a short film runs (the Academy's 40 minutes): a film entry no longer may be one episode
+SHORT_FILM_MAX = 40 * 60
+
+
+def _runs_about(runtime, length, fraction):
+    """Whether a title of ``length`` seconds runs as long as ``runtime`` seconds, within ``fraction`` of it"""
+    return abs(length - runtime) <= max(RUNTIME_TOLERANCE_MIN, runtime * fraction)
+
+
+def episode_titles(lengths):
+    """
+    The largest set of at least two titles that run as long as each other (within
+    EPISODE_LENGTH_SPREAD), shortest first, leaving out titles too short to be episodes.
+
+    :return: list of lengths, empty when no two titles are alike
+    """
+    titles = sorted(length for length in lengths if length >= EPISODE_MIN_LENGTH)
+    group = []
+    for start, shortest in enumerate(titles):
+        alike = [length for length in titles[start:] if length <= shortest * (1 + EPISODE_LENGTH_SPREAD)]
+        if len(alike) > len(group):
+            group = alike
+    return group if len(group) >= 2 else []
+
+
+def looks_like_episodes(lengths, film_runtime_seconds, episode_runtimes, episodes):
+    """
+    Whether a disc is a series' episodes rather than the film of the same title.
+
+    With the disc's title lengths: a film longer than a short with a title that runs as long as it
+    is on the disc, extras and second cuts beside it notwithstanding. Otherwise several titles of
+    the same length are episodes when that length is the series' episode runtime, or when the film
+    runs no more than half as long as they do together. Without them (a Blu-ray before MakeMKV, a
+    DVD lsdvd could not read) only TMDB can say: a film entry no longer than a short, beside a
+    series of several episodes, is taken for one of the episodes.
+
+    :param lengths: the disc's title lengths in seconds, possibly empty
+    :param film_runtime_seconds: the film's runtime, or None when TMDB has none
+    :param episode_runtimes: the series' episode runtimes in seconds, possibly empty
+    :param episodes: the number of episodes the series has, or None
+    """
+    titles = [length for length in lengths or [] if length >= EPISODE_MIN_LENGTH]
+    if not titles:
+        return bool(film_runtime_seconds and film_runtime_seconds <= SHORT_FILM_MAX and (episodes or 0) >= 2)
+    if film_runtime_seconds and film_runtime_seconds > SHORT_FILM_MAX and any(
+            _runs_about(film_runtime_seconds, length, FILM_RUNTIME_TOLERANCE) for length in titles):
+        return False
+    group = episode_titles(titles)
+    if not group:
+        return False
+    episode_length = group[len(group) // 2]
+    if any(_runs_about(runtime, episode_length, EPISODE_RUNTIME_TOLERANCE) for runtime in episode_runtimes or []):
+        return True
+    return bool(film_runtime_seconds and film_runtime_seconds * 2 <= sum(group))
 
 
 def metadata_selector(job, title=None, year=None):
