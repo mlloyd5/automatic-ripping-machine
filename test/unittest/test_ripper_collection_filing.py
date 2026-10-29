@@ -73,6 +73,18 @@ def _films(first_runtime=STUART_LITTLE[0], second_runtime=STUART_LITTLE[1]):
     return [_film(1, "Stuart-Little", "1999", first_runtime), _film(2, "Stuart-Little-2", "2002", second_runtime)]
 
 
+CATS_AND_DOGS = 2760  # TMDB gives both films of the Secret Life of Cats and Dogs DVD 46 minutes
+
+
+def _cats_and_dogs():
+    return [_film(1, "The Secret Life of Cats", "2014", CATS_AND_DOGS),
+            _film(2, "The Secret Life of Dogs", "2013", CATS_AND_DOGS)]
+
+
+def _numbers(matched):
+    return {position: track.track_number for position, track in matched.items()}
+
+
 def _fake_updater(args, obj):
     for key, value in args.items():
         setattr(obj, key, value)
@@ -105,6 +117,128 @@ class TestMatchTracksToFilms(unittest.TestCase):
         matched = arm_ripper.match_tracks_to_films([_track(0, 5065), _track(1, 4656), _track(2, None)], films)
         self.assertEqual({position: track.track_number for position, track in matched.items()}, {2: "1"})
 
+    def test_distinct_runtimes_decide_over_disc_order(self):
+        # Stuart Little's 84 and 78 minutes are told apart, even with the sequel first on the disc
+        self.assertEqual(arm_ripper.runtime_alike_films(_films()), [])
+        matched = arm_ripper.match_tracks_to_films([_track(0, 4656), _track(1, 5065)], _films())
+        self.assertEqual(_numbers(matched), {1: "1", 2: "0"})
+
+    def test_equal_runtimes_are_told_apart_by_disc_order(self):
+        # both titles fit both films; the second title is the closer fit, but not to the second film
+        films = _cats_and_dogs()
+        self.assertEqual([[film.position for film in group] for group in arm_ripper.runtime_alike_films(films)],
+                         [[1, 2]])
+        with self.assertLogs(level="INFO") as logs:
+            matched = arm_ripper.match_tracks_to_films([_track(0, 2700), _track(1, 2780)], films)
+        self.assertEqual(_numbers(matched), {1: "0", 2: "1"})
+        self.assertTrue(any("by disc order" in line for line in logs.output), logs.output)
+
+    def test_runtimes_less_than_a_minute_apart_are_told_apart_by_disc_order(self):
+        films = [_film(1, "First", "2001", 2760), _film(2, "Second", "2002", 2800)]
+        # by closeness the first title would be the second film
+        matched = arm_ripper.match_tracks_to_films([_track(0, 2805), _track(1, 2750)], films)
+        self.assertEqual(_numbers(matched), {1: "0", 2: "1"})
+
+    def test_runtimes_a_minute_or_more_apart_are_told_apart_by_runtime(self):
+        # two specials 140s apart, on the disc in the reverse of the order they are listed in
+        films = [_film(1, "First", "2001", 2760), _film(2, "Second", "2002", 2900)]
+        self.assertEqual(arm_ripper.runtime_alike_films(films), [])
+        self.assertEqual(arm_ripper.runtime_alike_films([films[0], _film(2, "Second", "2002", 2820)]), [])  # 1 min
+        matched = arm_ripper.match_tracks_to_films([_track(0, 2900), _track(1, 2760)], films)
+        self.assertEqual(_numbers(matched), {1: "1", 2: "0"})
+
+    def test_a_title_near_one_film_does_not_push_out_the_others_exact_titles(self):
+        # the first title is 150s off the second film and 290s off the first
+        films = [_film(1, "First", "2001", 2760), _film(2, "Second", "2002", 2900)]
+        matched = arm_ripper.match_tracks_to_films([_track(0, 3050), _track(1, 2760), _track(2, 2900)], films)
+        self.assertEqual(_numbers(matched), {1: "1", 2: "2"})
+
+    def test_three_films_a_little_apart_take_their_exact_titles(self):
+        # 2760, 2900 and 3050s: each runtime is within tolerance of the next
+        films = [_film(1, "First", "2001", 2760), _film(2, "Second", "2002", 2900), _film(3, "Third", "2003", 3050)]
+        self.assertEqual(arm_ripper.runtime_alike_films(films), [])
+        matched = arm_ripper.match_tracks_to_films([_track(0, 3050), _track(1, 2760), _track(2, 2900)], films)
+        self.assertEqual(_numbers(matched), {1: "1", 2: "2", 3: "0"})
+
+    def test_alike_films_not_all_matched_are_left_for_disc_order(self):
+        # only the second title fits a 46 minute film; it is no more one film than the other
+        films = _cats_and_dogs()
+        tracks = [_track(0, 3152), _track(1, 2900)]
+        matched = arm_ripper.match_tracks_to_films(tracks, films)
+        self.assertEqual(matched, {})
+        self.assertEqual(_numbers(arm_ripper.match_by_disc_order(tracks, films, matched)), {1: "0", 2: "1"})
+
+    def test_alike_films_take_the_first_titles_that_fit_in_disc_order(self):
+        # all three titles fit both 46 minute films; the closest two are not the first two on the disc
+        matched = arm_ripper.match_tracks_to_films([_track(0, 2700), _track(1, 2780), _track(2, 2760)],
+                                                   _cats_and_dogs())
+        self.assertEqual(_numbers(matched), {1: "0", 2: "1"})
+
+    def test_alike_films_take_another_title_only_when_it_fits_every_one_of_them(self):
+        # the first title is 175s off the second film but 215s off the first, so it is no title of theirs
+        films = [_film(1, "First", "2001", 2760), _film(2, "Second", "2002", 2800)]
+        matched = arm_ripper.match_tracks_to_films([_track(0, 2975), _track(1, 2760), _track(2, 2800)], films)
+        self.assertEqual(_numbers(matched), {1: "1", 2: "2"})
+
+    def test_alike_films_keep_the_closest_titles_when_disc_order_puts_one_outside_its_tolerance(self):
+        # in disc order the second film would take the second title, 205s off its runtime
+        films = [_film(1, "First", "2001", 2760), _film(2, "Second", "2002", 2800)]
+        matched = arm_ripper.match_tracks_to_films([_track(0, 2900), _track(1, 2595)], films)
+        self.assertEqual(_numbers(matched), {1: "1", 2: "0"})
+
+
+@unittest.skipIf(IMPORT_ERROR is not None, f"ARM could not be imported here: {IMPORT_ERROR}")
+class TestMatchByDiscOrder(unittest.TestCase):
+    def test_secret_life_of_cats_and_dogs(self):
+        # ts140 job 135: both titles run well over the 46 minutes TMDB gives the films
+        films = _cats_and_dogs()
+        tracks = [_track(0, 3152), _track(1, 2998), _track(2, 620)]
+        matched = arm_ripper.match_tracks_to_films(tracks, films)
+        self.assertEqual(matched, {})
+        with self.assertLogs(level="INFO") as logs:
+            paired = arm_ripper.match_by_disc_order(tracks, films, matched)
+        self.assertEqual(_numbers(paired), {1: "0", 2: "1"})
+        self.assertTrue(any("is The Secret Life of Dogs (2013) by disc order" in line for line in logs.output),
+                        logs.output)
+
+    def test_fills_in_around_films_runtime_placed(self):
+        films = _cats_and_dogs() + [_film(3, "Stuart-Little", "1999", STUART_LITTLE[0])]
+        tracks = [_track(0, 3152), _track(1, 5065), _track(2, 2998)]
+        matched = arm_ripper.match_tracks_to_films(tracks, films)
+        self.assertEqual(_numbers(matched), {3: "1"})
+        self.assertEqual(_numbers(arm_ripper.match_by_disc_order(tracks, films, matched)), {1: "0", 2: "2"})
+
+    def test_needs_as_many_feature_length_titles_as_films(self):
+        films = _cats_and_dogs()
+        self.assertEqual(arm_ripper.match_by_disc_order([_track(0, 3152), _track(1, 1200)], films, {}), {})
+        self.assertEqual(arm_ripper.match_by_disc_order([_track(0, 3152), _track(1, 2998), _track(2, 3300)],
+                                                        films, {}), {})
+
+    def test_titles_must_be_near_their_own_films_runtime(self):
+        # both titles are feature length next to the 46 minute film, but the second is no 90 minute film
+        films = [_film(1, "Short", "2001", 2760), _film(2, "Long", "2002", 5400)]
+        tracks = [_track(0, 3152), _track(1, 2998), _track(2, 620)]
+        with self.assertLogs(level="INFO") as logs:
+            self.assertEqual(arm_ripper.match_by_disc_order(tracks, films, {}), {})
+        self.assertTrue(any("too far off its 5400s runtime" in line for line in logs.output), logs.output)
+
+    def test_files_a_single_later_film(self):
+        # the first film's runtime places it; the second's is 392s off, and its title is the only one left
+        films = [_film(1, "The Secret Life of Dogs", "2013", 2998),
+                 _film(2, "The Secret Life of Cats", "2014", CATS_AND_DOGS)]
+        tracks = [_track(0, 2998), _track(1, 3152), _track(2, 620)]
+        matched = arm_ripper.match_tracks_to_films(tracks, films)
+        self.assertEqual(_numbers(matched), {1: "0"})
+        self.assertEqual(_numbers(arm_ripper.match_by_disc_order(tracks, films, matched)), {2: "1"})
+
+    def test_leaves_a_lone_first_film_or_unknown_runtimes_to_the_main_feature_rule(self):
+        tracks = [_track(0, 3152), _track(1, 2998)]
+        films = _cats_and_dogs()
+        self.assertEqual(arm_ripper.match_by_disc_order(tracks, films, {2: tracks[1]}), {})
+        films[1].runtime = None
+        self.assertEqual(arm_ripper.match_by_disc_order(tracks, films, {}), {})
+        self.assertEqual(arm_ripper.match_by_disc_order(tracks, films, {1: tracks[0]}), {})
+
 
 @unittest.skipIf(IMPORT_ERROR is not None, f"ARM could not be imported here: {IMPORT_ERROR}")
 class TestFileCollection(unittest.TestCase):
@@ -123,13 +257,14 @@ class TestFileCollection(unittest.TestCase):
             patch.stop()
         shutil.rmtree(self.root, ignore_errors=True)
 
-    def _job(self, tracks, films, mainfeature=False, extras_sub="extras", video_type="movie"):
+    def _job(self, tracks, films, mainfeature=False, extras_sub="extras", video_type="movie",
+             title="Stuart-Little", year="1999"):
         for track in tracks:
             with open(os.path.join(self.raw_path, track.filename), "wb") as handle:
                 handle.write(b"\0" * track.filesize)
-        return SimpleNamespace(job_id=27, video_type=video_type, title="Stuart-Little", year="1999", title_manual=None,
+        return SimpleNamespace(job_id=27, video_type=video_type, title=title, year=year, title_manual=None,
                                hasnicetitle=True, stage="171", tracks=_Tracks(tracks), films=films,
-                               path=os.path.join(self.completed, "movies", "Stuart-Little (1999)"),
+                               path=os.path.join(self.completed, "movies", f"{title} ({year})"),
                                config=SimpleNamespace(MAINFEATURE=mainfeature, EXTRAS_SUB=extras_sub,
                                                       COMPLETED_PATH=self.completed, DEST_EXT="mkv"))
 
@@ -165,6 +300,31 @@ class TestFileCollection(unittest.TestCase):
         self.assertFalse(os.path.exists(self._file("Stuart-Little-2 (2002)")))
         self.assertTrue(any("No ripped title matched the runtime of Stuart-Little-2 (2002)" in line
                             for line in logs.output), logs.output)
+
+    def test_films_runtime_cannot_place_are_filed_by_disc_order(self):
+        # ts140 job 135 filed the dogs film as an extra of the cats film
+        tracks = [_track(0, 3152, chapters=6), _track(1, 2998, chapters=6), _track(2, 620, chapters=1)]
+        job = self._job(tracks, _cats_and_dogs(), title="The Secret Life of Cats", year="2014")
+        with self.assertLogs(level="INFO") as logs:
+            self.assertTrue(arm_ripper.file_collection(self.raw_path, job, os.listdir(self.raw_path)))
+        cats, dogs = "The Secret Life of Cats (2014)", "The Secret Life of Dogs (2013)"
+        self.assertTrue(os.path.isfile(self._file(cats, f"{cats}.mkv")))
+        self.assertTrue(os.path.isfile(self._file(dogs, f"{dogs}.mkv")))
+        self.assertEqual(os.listdir(self._file(cats, "extras")), ["title_t02.mkv"])
+        self.assertEqual([film.track_number for film in job.films], ["0", "1"])
+        self.assertFalse(any("main-feature rule" in line or "not filed" in line for line in logs.output),
+                         logs.output)
+
+    def test_a_later_film_runtime_cannot_place_is_filed_by_disc_order(self):
+        tracks = [_track(0, 2998, chapters=6), _track(1, 3152, chapters=6), _track(2, 620, chapters=1)]
+        films = [_film(1, "The Secret Life of Dogs", "2013", 2998),
+                 _film(2, "The Secret Life of Cats", "2014", CATS_AND_DOGS)]
+        job = self._job(tracks, films, title="The Secret Life of Dogs", year="2013")
+        self.assertTrue(arm_ripper.file_collection(self.raw_path, job, os.listdir(self.raw_path)))
+        dogs, cats = "The Secret Life of Dogs (2013)", "The Secret Life of Cats (2014)"
+        self.assertTrue(os.path.isfile(self._file(cats, f"{cats}.mkv")))
+        self.assertEqual(os.listdir(self._file(dogs, "extras")), ["title_t02.mkv"])
+        self.assertEqual([film.track_number for film in films], ["0", "1"])
 
     def test_mainfeature_leaves_extras_in_place(self):
         tracks = [_track(0, 5065, chapters=9), _track(1, 4656, chapters=8), _track(2, 1500, chapters=1)]
