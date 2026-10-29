@@ -6,6 +6,22 @@ ripped title whose length fits a film's runtime is filed as that film. The first
 own `Title (Year)` folder and every other film gets its own folder beside it. Titles that no film claims
 are extras of the first film, as they would be for a single film.
 
+Runtimes do not always place the films. The provider's runtime can be off: TMDB gives The Secret Life of
+Cats and The Secret Life of Dogs 46 minutes each, but their titles on the DVD run 52 and 50 minutes. And
+films given the same runtime (the providers give whole minutes) cannot be told apart by length. A.R.M.
+then files those films in disc order: the first of them gets the first title on the disc that could be
+any of them, the next film the next such title, and so on. Films whose runtimes differ, even by a minute,
+are still told apart by length, whatever order the disc has them in. For films that no title's length
+fits, disc order is used only when:
+
+- every one of them has a known runtime,
+- exactly as many titles are left over as there are such films, counting the titles that run at least
+  half the shortest of their runtimes, and
+- each title is within 30% of its film's runtime.
+
+Otherwise the first film falls back to the usual main-feature rule, and a later film is not filed: its
+title ends up with the extras.
+
 ## Found automatically
 
 A.R.M. treats a disc as a double feature when one of these names several films:
@@ -35,9 +51,9 @@ would. This also ends the manual wait, so the rip starts. Films added after the 
 still used, because the rip is matched to the films only when it is filed.
 
 Each film's runtime is looked up from the metadata provider (TMDB or OMDb) when it is added. A film with
-no known runtime cannot be matched to a ripped title. The first film then falls back to the usual
-main-feature rule; a later film is not filed: its title ends up with the extras, or is left out when
-`MAINFEATURE` is on (see below).
+no known runtime cannot be matched to a ripped title, by length or by disc order. The first film then
+falls back to the usual main-feature rule; a later film is not filed: its title ends up with the
+extras, or is left out when `MAINFEATURE` is on (see below).
 
 **Not a double feature** removes every film. The job keeps its current title.
 

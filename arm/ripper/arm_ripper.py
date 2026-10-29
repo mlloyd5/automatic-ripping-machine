@@ -29,6 +29,16 @@ MAIN_FEATURE_MIN_FRACTION = 0.7
 # the runtime the metadata provider gives (PAL discs run 4% fast), and never closer than this many seconds.
 RUNTIME_TOLERANCE_FRACTION = 0.06
 RUNTIME_TOLERANCE_MIN = 180
+# Films of a double feature whose runtimes are less than this many seconds apart are not told apart by a
+# title's runtime (runtime_alike_films): the metadata providers give whole minutes, so such films have the
+# same runtime.
+RUNTIME_RESOLUTION = 60
+# When runtimes leave films of a double feature unmatched, the titles left over that run at least this
+# fraction of the shortest of those films are taken for them in disc order (match_by_disc_order), as long
+# as each is within DISC_ORDER_TOLERANCE_FRACTION of its own film's runtime: a disc's cut may run long or
+# short of the provider's runtime, but a 50 minute title is not a 90 minute film.
+DISC_ORDER_MIN_FRACTION = 0.5
+DISC_ORDER_TOLERANCE_FRACTION = 0.3
 
 # Minimum title length for a bonus disc when arm.yaml has no BONUS_MINLENGTH
 BONUS_MINLENGTH_DEFAULT = 45
@@ -127,9 +137,10 @@ def rip_visual_media(have_dupes, job, logfile, protection):
     linked, final_directory, linked_transcode_path = recheck_linked(
         job, linked, final_directory, transcode_folder, linked_transcode_path, type_sub_folder, job_title)
 
-    # Update final path if user has set a custom/manual title, or check_runtime found a better match.
+    # Update final path if user has set a custom/manual title or type, or check_runtime found a better match.
+    # recheck_linked refreshed the job, so this sees changes made in the ui during the rip.
     # Not for a bonus disc or continuation: its titles go to the film's folder whatever the job is called
-    logging.debug(f"Job title status: [{job.title_manual}]")
+    logging.debug(f"Job title status: [{job.title_manual}], video type: [{job.video_type}]")
     if not linked:
         final_directory = retitle_final_directory(have_dupes, job, final_directory, type_sub_folder, job_title)
 
@@ -237,22 +248,34 @@ def recheck_linked(job, linked, final_directory, transcode_folder, linked_transc
 
 def retitle_final_directory(have_dupes, job, final_directory, type_sub_folder, job_title):
     """
-    Give the completed folder the job's title when it changed during the rip: a title set by hand
-    in the meantime, or another film taken by check_runtime. The new folder goes through the same
-    duplicate check as the first one, so a film ripped before keeps its folder (RED (2010) is
-    already there when a disc first taken for Red (2017) turns out to be RED); the first folder,
-    which holds no more than the disc's poster at this point, is removed whatever DELRAWFILES says\n
+    Give the completed folder the job's title and type when they changed during the rip: a title
+    or video type set by hand in the meantime, or another film taken by check_runtime. A series
+    set by hand on a disc identified as a movie goes to completed/tv, not completed/movies (and
+    the other way round), so the completed-rip shipper files it with the right library. The new
+    folder goes through the same duplicate check as the first one, so a film ripped before keeps
+    its folder (RED (2010) is already there when a disc first taken for Red (2017) turns out to be
+    RED). A type changed with the title kept is not stopped by ALLOW_DUPLICATES: this title was
+    checked when the rip started, and the finished rip goes to a _<stage> folder beside one already
+    there instead of failing. The first folder, which holds no more than the disc's poster at this
+    point, is removed whatever DELRAWFILES says\n
     :param have_dupes: Does this disc already exist in the database
     :param final_directory: the completed folder made for the title the rip started with
+    :param type_sub_folder: the type folder the rip started with (utils.convert_job_type)
     :param job_title: that title (utils.fix_job_title at the start of the rip)
     :return: the completed folder to file the rip in
     """
     new_title = utils.fix_job_title(job)
-    if new_title == job_title:
+    new_type_sub_folder = utils.convert_job_type(job.video_type)
+    if new_title == job_title and new_type_sub_folder == type_sub_folder:
         return final_directory
-    logging.info(f"Job title changed from {job_title} to {new_title}; renaming the completed folder")
+    if new_title != job_title:
+        logging.info(f"Job title changed from {job_title} to {new_title}; renaming the completed folder")
+    if new_type_sub_folder != type_sub_folder:
+        logging.info(f"Job type changed from {type_sub_folder} to {new_type_sub_folder}; "
+                     "moving the completed folder")
     new_directory = utils.check_for_dupe_folder(
-        have_dupes, os.path.join(job.config.COMPLETED_PATH, type_sub_folder, new_title), job)
+        have_dupes and new_title != job_title,
+        os.path.join(job.config.COMPLETED_PATH, new_type_sub_folder, new_title), job)
     remove_superseded_folder(final_directory, new_directory)
     utils.database_updater({'path': new_directory}, job)
     return new_directory
@@ -779,6 +802,74 @@ def expected_length(film, track):
     return runtime
 
 
+def _disc_order(track):
+    """Sort key for a disc's titles in the order the disc carries them"""
+    try:
+        return int(track.track_number)
+    except (TypeError, ValueError):
+        return 9999
+
+
+def runtime_alike_films(films):
+    """
+    The groups of films whose runtimes are less than RUNTIME_RESOLUTION seconds apart, chained: films the
+    provider gives the same runtime, such as two 46 minute specials. A title fits each film of a group about
+    as well as the others, so its runtime does not tell them apart. Films whose runtimes differ, even by a
+    minute, are told apart by the nearer runtime, as Stuart Little's 84 and 78 minutes are: a title usually
+    lands much closer to its own film than to another, even when it is within tolerance of both\n
+    :param films: the job's films (collection_films)
+    :return: list of lists of Film, each with at least two films, in disc order
+    """
+    timed = sorted((film for film in films if film.runtime), key=lambda film: int(film.runtime))
+    groups, group = [], []
+    for film in timed:
+        if group and int(film.runtime) - int(group[-1].runtime) >= RUNTIME_RESOLUTION:
+            groups.append(group)
+            group = []
+        group.append(film)
+    groups.append(group)
+    return [sorted(group, key=lambda film: int(film.position or 0)) for group in groups if len(group) > 1]
+
+
+def _match_alike_films(films, pairs, matched):
+    """
+    Re-pair the films whose runtimes are alike (runtime_alike_films), which match_tracks_to_films paired
+    by closeness: when every film of a group matched, the group's films take, in disc order, the first of
+    the titles closeness picked for them and the other titles that fit every one of them. If that would
+    give a film a title outside its own tolerance, the runtimes do tell them apart and the closeness
+    pairs stay. When only some of a group matched, none of the group stays matched\n
+    :param films: the job's films (collection_films)
+    :param pairs: (difference, expected, film, track) for each title within tolerance of a film
+    :param matched: dict of film position -> its pair, changed in place
+    :return: set of the positions of the films now paired by disc order
+    """
+    fits = {(film.position, track.track_number) for _, _, film, track in pairs}
+    by_disc_order = set()
+    for group in runtime_alike_films(films):
+        names = " and ".join(film.folder_name for film in group)
+        positions = {film.position for film in group}
+        if not all(position in matched for position in positions):
+            popped = []
+            for position in positions:
+                if position in matched:
+                    popped.append(matched.pop(position))
+            if popped:
+                logging.info(f"{names} run alike and not all of them matched a title by runtime; none is "
+                             "matched by runtime")
+            continue
+        taken = {pair[3].track_number for position, pair in matched.items() if position not in positions}
+        titles = {track.track_number: track for _, _, _, track in pairs if track.track_number not in taken
+                  and all((position, track.track_number) in fits for position in positions)}
+        titles.update((matched[position][3].track_number, matched[position][3]) for position in positions)
+        paired = list(zip(group, sorted(titles.values(), key=_disc_order)))
+        if not all((film.position, track.track_number) in fits for film, track in paired):
+            continue
+        for film, track in paired:
+            matched[film.position] = (None, None, film, track)
+            by_disc_order.add(film.position)
+    return by_disc_order
+
+
 def match_tracks_to_films(tracks, films):
     """
     Pair the ripped titles with the films of a double feature by runtime\n
@@ -786,6 +877,9 @@ def match_tracks_to_films(tracks, films):
     RUNTIME_TOLERANCE_FRACTION (at least RUNTIME_TOLERANCE_MIN seconds) of the film's runtime as the
     disc plays it (see expected_length). Films the provider gave no runtime for, and titles without
     a length, are not matched\n
+    Films whose runtimes are alike (runtime_alike_films) are not told apart by runtime: when every one
+    of them matched a title, they take titles in disc order (see _match_alike_films); when only some
+    did, none of them is matched here and match_by_disc_order gets to place them\n
     :param tracks: ripped tracks that have a file
     :param films: the job's films (collection_films)
     :return: dict of film position -> track
@@ -807,12 +901,62 @@ def match_tracks_to_films(tracks, films):
     for difference, expected, film, track in pairs:
         if film.position in matched or track.track_number in used_tracks:
             continue
-        matched[film.position] = track
+        matched[film.position] = (difference, expected, film, track)
         used_tracks.add(track.track_number)
+    by_disc_order = _match_alike_films(films, pairs, matched)
+    for position, (difference, expected, film, track) in matched.items():
+        if position in by_disc_order:
+            logging.info(f"Title {track.track_number} ({track.filename}, {track.length}s) is {film.folder_name} "
+                         f"by disc order: its {film.runtime}s runtime is too close to another film's to tell them "
+                         "apart")
+            continue
         pal = f" ({expected}s at {track.fps} fps)" if expected != int(film.runtime) else ""
         logging.info(f"Title {track.track_number} ({track.filename}, {track.length}s) is {film.folder_name}: "
                      f"{difference}s off its {film.runtime}s runtime{pal}")
-    return matched
+    return {position: pair[3] for position, pair in matched.items()}
+
+
+def match_by_disc_order(tracks, films, matched):
+    """
+    Pair the films that runtimes left unmatched with the titles left over, in disc order: a disc of two
+    46 minute specials whose titles run 52 and 50 minutes carries them in the order the films are listed\n
+    Only when the provider gave every unmatched film a runtime, exactly as many leftover titles run at
+    least DISC_ORDER_MIN_FRACTION of the shortest of those runtimes, and each of those titles is within
+    DISC_ORDER_TOLERANCE_FRACTION of the runtime of the film it would be (as the disc plays it, see
+    expected_length); otherwise nothing is paired. A first film that is the only one unmatched is left
+    to the main-feature rule as before\n
+    :param tracks: ripped tracks that have a file
+    :param films: the job's films (collection_films)
+    :param matched: dict of film position -> track already paired (match_tracks_to_films)
+    :return: dict of film position -> track for the films paired here
+    """
+    unmatched = [film for film in films if film.position not in matched]
+    if not unmatched or not all(film.runtime for film in unmatched):
+        return {}
+    if [film.position for film in unmatched] == [films[0].position]:
+        return {}  # the main-feature rule places it (file_collection)
+    used = {track.track_number for track in matched.values()}
+    shortest = SimpleNamespace(runtime=min(int(film.runtime) for film in unmatched))
+    features = sorted((track for track in tracks if track.track_number not in used and track.length
+                       and int(track.length) >= expected_length(shortest, track) * DISC_ORDER_MIN_FRACTION),
+                      key=_disc_order)
+    names = " and ".join(film.folder_name for film in unmatched)
+    if len(features) != len(unmatched):
+        logging.info(f"No title matched the runtime of {names}, but {len(features)} feature-length titles are "
+                     "left; not filing by disc order")
+        return {}
+    pairs = list(zip(unmatched, features))
+    for film, track in pairs:
+        expected = expected_length(film, track)
+        if abs(int(track.length) - expected) > expected * DISC_ORDER_TOLERANCE_FRACTION:
+            logging.info(f"Title {track.track_number} ({track.filename}, {track.length}s) is next in disc order "
+                         f"for {film.folder_name}, but too far off its {film.runtime}s runtime; not filing "
+                         f"{names} by disc order")
+            return {}
+    for film, track in pairs:
+        logging.info(f"Title {track.track_number} ({track.filename}, {track.length}s) is {film.folder_name} "
+                     f"by disc order: no title matched its {film.runtime}s runtime")
+    return {film.position: track for film, track in pairs}
 
 
 def feature_length_titles(job):
@@ -914,7 +1058,7 @@ def check_runtime(job):
     # A re-rip has the earlier job's title and year but not its IMDb id: then only the id changes
     renamed = f"{utils.clean_for_filename(best['Title'])} ({best['Year']})" != identified
     logging.info(f"Identifying the disc as {best['Title']} ({best['Year']}) instead of {identified}")
-    identify.apply_search_result(job, best)
+    identify.apply_search_result(job, best, check_series=False)
     if renamed:
         utils.notify(job, constants.NOTIFY_TITLE,
                      f"Identified as {best['Title']} ({best['Year']}) instead of {identified} by runtime")
@@ -1001,7 +1145,10 @@ def file_collection(out_path, job, files, main_features_only=False):
     File the rip of a disc that carries several films (identify.identify_collection)\n
     Each ripped title whose runtime matches a film becomes that film's main feature: the first film's
     in the job folder, every other film's in its own ``Title (Year)`` folder under the same type
-    folder. When the runtimes cannot place the first film, the usual main-feature rule
+    folder. Films the runtimes cannot place, or cannot tell apart, take the feature-length titles left
+    over in disc order when there are as many of those as films and each is near enough its film's
+    runtime (match_by_disc_order). When the first
+    film is still not placed, the usual main-feature rule
     (pick_main_feature) chooses it from the titles left over, so a rip is never worse than a single
     film's. Titles no film claims are extras of the job folder, as for a single film\n
     :param out_path: RAW_PATH or TRANSCODE_PATH holding the ripped files
@@ -1017,6 +1164,7 @@ def file_collection(out_path, job, files, main_features_only=False):
     ripped = [track for track in job.tracks.filter_by(ripped=True) if track.filename in present]
     logging.info(f"Disc carries {len(films)} films: " + ", ".join(film.folder_name for film in films))
     matched = match_tracks_to_films(ripped, films)
+    matched.update(match_by_disc_order(ripped, films, matched))
     leftover = [track for track in ripped if track.track_number not in
                 {track.track_number for track in matched.values()}]
     first = films[0]

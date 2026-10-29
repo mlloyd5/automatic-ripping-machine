@@ -374,6 +374,9 @@ class Job(db.Model):
         pretty_table.field_names = ["Config", "Value"]
         pretty_table._max_width = {"Config": 50, "Value": 60}
         for attr, value in self.__dict__.items():
+            if attr.startswith("_"):
+                # SQLAlchemy's state, and what the ripper keeps on the job for itself (identify's lsdvd titles)
+                continue
             if attr == "config":
                 pretty_table.add_row([str(attr), str(value.pretty_table())])
             else:
@@ -382,12 +385,12 @@ class Job(db.Model):
 
     def get_d(self):
         """
-        Return a dict of class - exclude the _sa_instance_state
+        Return a dict of class - exclude the _sa_instance_state and the other private attributes
         :return: dict containing all attribs from class
         """
         return_dict = {}
         for key, value in self.__dict__.items():
-            if '_sa_instance_state' not in key:
+            if not key.startswith('_'):
                 return_dict[str(key)] = str(value)
         return return_dict
 

@@ -7,10 +7,8 @@ Reference:
 - https://github.com/automatic-ripping-machine/automatic-ripping-machine/wiki/MakeMKV-Codes
 """
 
-import contextlib
 import dataclasses
 import enum
-import fcntl
 import itertools
 import logging
 import os
@@ -18,7 +16,6 @@ import re
 import shlex
 import shutil
 import subprocess
-import tempfile
 from time import sleep, time
 
 import arm.config.config as cfg
@@ -53,13 +50,7 @@ DISC_OPEN_RETRY_WAIT = 30  # [s]
 RIP_OPEN_ATTEMPTS = 5
 """How often a rip (makemkvcon mkv or backup) is started before a disc it cannot open is given up on"""
 RIP_OPEN_RETRY_WAIT = 120  # [s]
-"""Pause before each rip retry, on top of waiting for another drive's info scan to finish"""
-MAKEMKV_INFO_LOCK = os.path.join(tempfile.gettempdir(), "arm-makemkv-info.lock")
-"""Held by the running makemkvcon info scan; the rippers of all drives share it"""
-MAKEMKV_INFO_LOCK_TIMEOUT = 900  # [s]
-"""Longest wait for another drive's scan to finish"""
-MAKEMKV_INFO_LOCK_POLL = 5  # [s]
-"""How often a waiting scan checks whether the lock is free"""
+"""Pause before each rip retry"""
 
 ERROR_MESSAGE_OPERATION_RESULT = "Internal error - Operation result is incorrect (132)"
 ERROR_MESSAGE_TRAY_OPEN = "Scsi error - NOT READY:MEDIUM NOT PRESENT - TRAY OPEN"
@@ -578,39 +569,6 @@ def parse_line(line):
     return msg_type, message
 
 
-@contextlib.contextmanager
-def info_scan_lock():
-    """
-    Let only one makemkvcon info scan run at a time, whichever drive it is for
-
-    Two discs scanned at once can make MakeMKV fail to open one of them ("Failed to open disc"),
-    seen on the t620 when Blu-rays went into two drives within seconds. Only the scans wait for
-    each other; rips (makemkvcon mkv) still run side by side. A scan that holds the lock longer
-    than MAKEMKV_INFO_LOCK_TIMEOUT is taken to hang and is not waited for any longer.
-    """
-    try:
-        lock_file = open(MAKEMKV_INFO_LOCK, "a")
-    except OSError as error:
-        logging.warning(f"Cannot open {MAKEMKV_INFO_LOCK} ({error}); scanning without waiting for other drives")
-        yield
-        return
-    with lock_file:
-        deadline = time() + MAKEMKV_INFO_LOCK_TIMEOUT
-        while True:
-            try:
-                fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                break
-            except BlockingIOError:
-                if time() >= deadline:
-                    logging.warning(f"Another drive's MakeMKV scan has run for over {MAKEMKV_INFO_LOCK_TIMEOUT}s; "
-                                    "scanning anyway")
-                    break
-                logging.debug("Waiting for another drive's MakeMKV scan to finish")
-                sleep(MAKEMKV_INFO_LOCK_POLL)
-        # closing the file at the end of the with block releases the lock
-        yield
-
-
 def makemkv_info(job, select=None, index=9999, options=None):
     """
     Use MakeMKV info to search the system for optical drives
@@ -664,11 +622,10 @@ def makemkv_info(job, select=None, index=9999, options=None):
     job.status = JobState.VIDEO_WAITING.value
     db.session.commit()
     utils.sleep_check_process("makemkvcon", max_processes, sleep=(10, wait_time, 10))
+    job.status = JobState.VIDEO_INFO.value
+    db.session.commit()
     try:
-        with info_scan_lock():
-            job.status = JobState.VIDEO_INFO.value
-            db.session.commit()
-            yield from run(info_options, select)
+        yield from run(info_options, select)
     finally:
         logging.info("MakeMKV info exits.")
         job.status = JobState.VIDEO_WAITING.value
@@ -1198,7 +1155,7 @@ def get_track_info(index, job):
         sleep(DISC_OPEN_RETRY_WAIT)
 
 
-def _titles_match(kept, candidate):
+def _titles_match(kept, candidate, disctype=None):
     """
     Decide whether `candidate` is a copy of `kept`: the same content listed as another title.
 
@@ -1208,16 +1165,27 @@ def _titles_match(kept, candidate):
     match (think of the episodes of a series). Without segment maps the duration and
     size are all there is to go on, so both sizes must actually be known.
 
+    On a DVD the segment map numbers the cells of each title's own program chain, so
+    "1-12" is the map of any title with 12 cells, and two episodes of the same length
+    have the same map (Anne of Avonlea, job 86 on the ts140). Copies of a DVD title play
+    the same cells and so have exactly the same size, so on a DVD the sizes must match
+    to the byte. Blu-ray segment maps list m2ts clip numbers, which are the same for the
+    whole disc, so there equal maps do mean the same content.
+
     Parameters:
         kept: arm.models.track.Track (or anything with length, filesize, segment_map)
         candidate: arm.models.track.Track
+        disctype: the job's disctype, e.g. "dvd" or "bluray"
     Returns:
         bool
     """
     if abs(int(kept.length or 0) - int(candidate.length or 0)) > DUPLICATE_DURATION_TOLERANCE:
         return False
     kept_size, candidate_size = int(kept.filesize or 0), int(candidate.filesize or 0)
-    if abs(kept_size - candidate_size) > max(kept_size, candidate_size) * DUPLICATE_FILESIZE_TOLERANCE:
+    if disctype == "dvd":
+        if not (kept_size > 0 and kept_size == candidate_size):
+            return False
+    elif abs(kept_size - candidate_size) > max(kept_size, candidate_size) * DUPLICATE_FILESIZE_TOLERANCE:
         return False
     kept_map = (kept.segment_map or "").strip()
     candidate_map = (candidate.segment_map or "").strip()
@@ -1226,16 +1194,18 @@ def _titles_match(kept, candidate):
     return kept_size > 0 and candidate_size > 0
 
 
-def find_duplicate_titles(tracks):
+def find_duplicate_titles(tracks, disctype=None):
     """
     Group titles that are copies of the same content.
 
     Many Blu-rays list the main film twice, e.g. one playlist with chapters and one
     without, with the same runtime and size. Within each group the title with the
     most chapters is kept (tie-break: larger file size, then lower track number).
+    On DVDs only titles of exactly the same size count as copies (see _titles_match).
 
     Parameters:
         tracks: iterable of arm.models.track.Track
+        disctype: the job's disctype, e.g. "dvd" or "bluray"
     Returns:
         list of (kept_track, [duplicate_tracks]) for every title that has duplicates
     """
@@ -1245,7 +1215,7 @@ def find_duplicate_titles(tracks):
     groups = []
     for track in ranked:
         for kept, duplicates in groups:
-            if _titles_match(kept, track):
+            if _titles_match(kept, track, disctype):
                 duplicates.append(track)
                 break
         else:
@@ -1267,9 +1237,12 @@ def skip_duplicate_titles(job):
         list of the skipped arm.models.track.Track
     """
     skipped = []
-    for kept, duplicates in find_duplicate_titles(job.tracks.all()):
+    for kept, duplicates in find_duplicate_titles(job.tracks.all(), job.disctype):
         for track in duplicates:
-            reason = "same segment map" if kept.segment_map and track.segment_map else "same duration and size"
+            if kept.segment_map and track.segment_map:
+                reason = "same segment map and size" if job.disctype == "dvd" else "same segment map"
+            else:
+                reason = "same duration and size"
             logging.info(f"Title {track.track_number} ({track.chapters} chapters, {track.length}s, "
                          f"{track.filesize} bytes, {track.source_file or 'unknown source'}) is a copy of "
                          f"title {kept.track_number} ({kept.chapters} chapters, "
@@ -1420,9 +1393,7 @@ def run_rip(cmd):
 
     "Failed to open disc" (MSG:5010) decides it, whatever makemkvcon exits with: it can print it
     and still exit 0, and that run has ripped nothing. Another drive being busy is what makes it
-    fail, which can last minutes, so the attempts are spread over several minutes and each retry
-    also waits for any other drive's info scan to finish (see info_scan_lock). The lock is only
-    waited for, not held during the rip, so other drives can still scan while this one rips.
+    fail, which can last minutes, so the attempts are spread over several minutes.
 
     Parameters:
         cmd (list): makemkvcon cli options
@@ -1435,9 +1406,6 @@ def run_rip(cmd):
             logging.warning(f"MakeMKV could not open the disc to rip it (attempt {attempt - 1} of "
                             f"{RIP_OPEN_ATTEMPTS}); trying again in {RIP_OPEN_RETRY_WAIT}s")
             sleep(RIP_OPEN_RETRY_WAIT)
-            with info_scan_lock():
-                # only wait until no other drive is scanning; the rip itself runs outside the lock
-                pass
         open_failed = False
         try:
             for message in run(cmd, OutputType.MSG):

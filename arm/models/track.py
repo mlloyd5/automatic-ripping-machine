@@ -24,7 +24,8 @@ class Track(db.Model):
     source_file = db.Column(db.String(256))
     """MakeMKV source file name (TINFO id 16), e.g. 00800.mpls"""
     segment_map = db.Column(db.Text)
-    """MakeMKV segment map (TINFO id 26): the stream files this title plays, e.g. 155,156,157"""
+    """MakeMKV segment map (TINFO id 26): the stream files this title plays, e.g. 155,156,157;
+    on DVDs the cells of the title's own program chain, e.g. 1-12"""
     duplicate_of = db.Column(db.String(4))
     """track_number of the title this one duplicates (ripping that one instead), or None"""
 
