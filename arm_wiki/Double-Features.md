@@ -8,9 +8,11 @@ are extras of the first film, as they would be for a single film.
 
 Runtimes do not always place the films. The provider's runtime can be off: TMDB gives The Secret Life of
 Cats and The Secret Life of Dogs 46 minutes each, but their titles on the DVD run 52 and 50 minutes. And
-films whose runtimes are about the same cannot be told apart by length. A.R.M. then files those films in
-disc order: the first of them gets the first title on the disc that could be it, the next film the next
-title, and so on. For films that no title's length fits, this is done only when:
+films given the same runtime (the providers give whole minutes) cannot be told apart by length. A.R.M.
+then files those films in disc order: the first of them gets the first title on the disc that could be
+any of them, the next film the next such title, and so on. Films whose runtimes differ, even by a minute,
+are still told apart by length, whatever order the disc has them in. For films that no title's length
+fits, disc order is used only when:
 
 - every one of them has a known runtime,
 - exactly as many titles are left over as there are such films, counting the titles that run at least
