@@ -133,11 +133,32 @@ class TestMatchTracksToFilms(unittest.TestCase):
         self.assertEqual(_numbers(matched), {1: "0", 2: "1"})
         self.assertTrue(any("by disc order" in line for line in logs.output), logs.output)
 
-    def test_runtimes_within_tolerance_of_each_other_are_told_apart_by_disc_order(self):
+    def test_runtimes_less_than_a_minute_apart_are_told_apart_by_disc_order(self):
         films = [_film(1, "First", "2001", 2760), _film(2, "Second", "2002", 2800)]
         # by closeness the first title would be the second film
         matched = arm_ripper.match_tracks_to_films([_track(0, 2805), _track(1, 2750)], films)
         self.assertEqual(_numbers(matched), {1: "0", 2: "1"})
+
+    def test_runtimes_a_minute_or_more_apart_are_told_apart_by_runtime(self):
+        # two specials 140s apart, on the disc in the reverse of the order they are listed in
+        films = [_film(1, "First", "2001", 2760), _film(2, "Second", "2002", 2900)]
+        self.assertEqual(arm_ripper.runtime_alike_films(films), [])
+        self.assertEqual(arm_ripper.runtime_alike_films([films[0], _film(2, "Second", "2002", 2820)]), [])  # 1 min
+        matched = arm_ripper.match_tracks_to_films([_track(0, 2900), _track(1, 2760)], films)
+        self.assertEqual(_numbers(matched), {1: "1", 2: "0"})
+
+    def test_a_title_near_one_film_does_not_push_out_the_others_exact_titles(self):
+        # the first title is 150s off the second film and 290s off the first
+        films = [_film(1, "First", "2001", 2760), _film(2, "Second", "2002", 2900)]
+        matched = arm_ripper.match_tracks_to_films([_track(0, 3050), _track(1, 2760), _track(2, 2900)], films)
+        self.assertEqual(_numbers(matched), {1: "1", 2: "2"})
+
+    def test_three_films_a_little_apart_take_their_exact_titles(self):
+        # 2760, 2900 and 3050s: each runtime is within tolerance of the next
+        films = [_film(1, "First", "2001", 2760), _film(2, "Second", "2002", 2900), _film(3, "Third", "2003", 3050)]
+        self.assertEqual(arm_ripper.runtime_alike_films(films), [])
+        matched = arm_ripper.match_tracks_to_films([_track(0, 3050), _track(1, 2760), _track(2, 2900)], films)
+        self.assertEqual(_numbers(matched), {1: "1", 2: "2", 3: "0"})
 
     def test_alike_films_not_all_matched_are_left_for_disc_order(self):
         # only the second title fits a 46 minute film; it is no more one film than the other
@@ -152,6 +173,18 @@ class TestMatchTracksToFilms(unittest.TestCase):
         matched = arm_ripper.match_tracks_to_films([_track(0, 2700), _track(1, 2780), _track(2, 2760)],
                                                    _cats_and_dogs())
         self.assertEqual(_numbers(matched), {1: "0", 2: "1"})
+
+    def test_alike_films_take_another_title_only_when_it_fits_every_one_of_them(self):
+        # the first title is 175s off the second film but 215s off the first, so it is no title of theirs
+        films = [_film(1, "First", "2001", 2760), _film(2, "Second", "2002", 2800)]
+        matched = arm_ripper.match_tracks_to_films([_track(0, 2975), _track(1, 2760), _track(2, 2800)], films)
+        self.assertEqual(_numbers(matched), {1: "1", 2: "2"})
+
+    def test_alike_films_keep_the_closest_titles_when_disc_order_puts_one_outside_its_tolerance(self):
+        # in disc order the second film would take the second title, 205s off its runtime
+        films = [_film(1, "First", "2001", 2760), _film(2, "Second", "2002", 2800)]
+        matched = arm_ripper.match_tracks_to_films([_track(0, 2900), _track(1, 2595)], films)
+        self.assertEqual(_numbers(matched), {1: "1", 2: "0"})
 
 
 @unittest.skipIf(IMPORT_ERROR is not None, f"ARM could not be imported here: {IMPORT_ERROR}")

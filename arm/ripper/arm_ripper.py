@@ -27,6 +27,10 @@ MAIN_FEATURE_MIN_FRACTION = 0.7
 # the runtime the metadata provider gives (PAL discs run 4% fast), and never closer than this many seconds.
 RUNTIME_TOLERANCE_FRACTION = 0.06
 RUNTIME_TOLERANCE_MIN = 180
+# Films of a double feature whose runtimes are less than this many seconds apart are not told apart by a
+# title's runtime (runtime_alike_films): the metadata providers give whole minutes, so such films have the
+# same runtime.
+RUNTIME_RESOLUTION = 60
 # When runtimes leave films of a double feature unmatched, the titles left over that run at least this
 # fraction of the shortest of those films are taken for them in disc order (match_by_disc_order), as long
 # as each is within DISC_ORDER_TOLERANCE_FRACTION of its own film's runtime: a disc's cut may run long or
@@ -541,22 +545,20 @@ def _disc_order(track):
 
 def runtime_alike_films(films):
     """
-    The groups of films whose runtimes are within RUNTIME_TOLERANCE_FRACTION (at least RUNTIME_TOLERANCE_MIN
-    seconds) of each other, chained, so two 46 minute specials are one group but Stuart Little's 84 and 78
-    minutes are not. Within a group a title that fits one film fits the others about as well, so its runtime
-    does not tell them apart. Films further apart can still both fit a title in between; the nearer runtime
-    then decides, as it does for Stuart Little\n
+    The groups of films whose runtimes are less than RUNTIME_RESOLUTION seconds apart, chained: films the
+    provider gives the same runtime, such as two 46 minute specials. A title fits each film of a group about
+    as well as the others, so its runtime does not tell them apart. Films whose runtimes differ, even by a
+    minute, are told apart by the nearer runtime, as Stuart Little's 84 and 78 minutes are: a title usually
+    lands much closer to its own film than to another, even when it is within tolerance of both\n
     :param films: the job's films (collection_films)
     :return: list of lists of Film, each with at least two films, in disc order
     """
     timed = sorted((film for film in films if film.runtime), key=lambda film: int(film.runtime))
     groups, group = [], []
     for film in timed:
-        if group:
-            shorter = int(group[-1].runtime)
-            if int(film.runtime) - shorter > max(RUNTIME_TOLERANCE_MIN, shorter * RUNTIME_TOLERANCE_FRACTION):
-                groups.append(group)
-                group = []
+        if group and int(film.runtime) - int(group[-1].runtime) >= RUNTIME_RESOLUTION:
+            groups.append(group)
+            group = []
         group.append(film)
     groups.append(group)
     return [sorted(group, key=lambda film: int(film.position or 0)) for group in groups if len(group) > 1]
@@ -565,13 +567,16 @@ def runtime_alike_films(films):
 def _match_alike_films(films, pairs, matched):
     """
     Re-pair the films whose runtimes are alike (runtime_alike_films), which match_tracks_to_films paired
-    by closeness: when every film of a group matched, the group takes the first titles on the disc that
-    fit any of its films, in disc order; when only some did, none of the group stays matched\n
+    by closeness: when every film of a group matched, the group's films take, in disc order, the first of
+    the titles closeness picked for them and the other titles that fit every one of them. If that would
+    give a film a title outside its own tolerance, the runtimes do tell them apart and the closeness
+    pairs stay. When only some of a group matched, none of the group stays matched\n
     :param films: the job's films (collection_films)
     :param pairs: (difference, expected, film, track) for each title within tolerance of a film
     :param matched: dict of film position -> its pair, changed in place
     :return: set of the positions of the films now paired by disc order
     """
+    fits = {(film.position, track.track_number) for _, _, film, track in pairs}
     by_disc_order = set()
     for group in runtime_alike_films(films):
         names = " and ".join(film.folder_name for film in group)
@@ -586,9 +591,13 @@ def _match_alike_films(films, pairs, matched):
                              "matched by runtime")
             continue
         taken = {pair[3].track_number for position, pair in matched.items() if position not in positions}
-        fitting = {track.track_number: track for _, _, film, track in pairs
-                   if film.position in positions and track.track_number not in taken}
-        for film, track in zip(group, sorted(fitting.values(), key=_disc_order)):
+        titles = {track.track_number: track for _, _, _, track in pairs if track.track_number not in taken
+                  and all((position, track.track_number) in fits for position in positions)}
+        titles.update((matched[position][3].track_number, matched[position][3]) for position in positions)
+        paired = list(zip(group, sorted(titles.values(), key=_disc_order)))
+        if not all((film.position, track.track_number) in fits for film, track in paired):
+            continue
+        for film, track in paired:
             matched[film.position] = (None, None, film, track)
             by_disc_order.add(film.position)
     return by_disc_order
@@ -602,8 +611,8 @@ def match_tracks_to_films(tracks, films):
     disc plays it (see expected_length). Films the provider gave no runtime for, and titles without
     a length, are not matched\n
     Films whose runtimes are alike (runtime_alike_films) are not told apart by runtime: when every one
-    of them matched a title, they take the first titles on the disc that fit any of them, in disc order;
-    when only some did, none of them is matched here and match_by_disc_order gets to place them\n
+    of them matched a title, they take titles in disc order (see _match_alike_films); when only some
+    did, none of them is matched here and match_by_disc_order gets to place them\n
     :param tracks: ripped tracks that have a file
     :param films: the job's films (collection_films)
     :return: dict of film position -> track
