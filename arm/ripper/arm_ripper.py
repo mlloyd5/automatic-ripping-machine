@@ -5,6 +5,8 @@ import sys
 import os
 import shutil
 import logging
+import re
+import subprocess
 from importlib.util import find_spec
 from pathlib import Path
 from types import SimpleNamespace
@@ -42,6 +44,8 @@ DISC_ORDER_TOLERANCE_FRACTION = 0.3
 BONUS_MINLENGTH_DEFAULT = 45
 # Files of a bonus disc's rip that are filed as extras
 VIDEO_EXTENSIONS = (".mkv", ".mp4", ".m4v", ".avi", ".ts", ".webm")
+# mkvmerge exits 1 when it wrote the file but has warnings (a track's codec private data differs, say)
+MKVMERGE_OK = (0, 1)
 # When the identified film's runtime fits none of the disc's feature-length titles, the runtimes of
 # at most this many other films with the disc's title are looked up (one provider request each).
 RUNTIME_CHECK_MAX_CANDIDATES = 6
@@ -57,23 +61,23 @@ def rip_visual_media(have_dupes, job, logfile, protection):
     :param protection: Does the disc have 99 track protection
     :return: None
     """
-    # A bonus disc rips every short title and files them all as the film's extras
-    bonus = apply_bonus_settings(job)
+    # A bonus disc rips every short title and files them all as the film's extras; a continuation (side B,
+    # disc 2) has its main title joined onto the film's. Both are filed with an earlier job's film
+    linked = apply_linked_settings(job)
     # A double feature rips every film, even with MAINFEATURE on (which still keeps its extras out)
-    main_features_only = not bonus and apply_collection_settings(job)
+    main_features_only = not linked and apply_collection_settings(job)
     # Fix the sub-folder type - (movie|tv|unknown)
     type_sub_folder = utils.convert_job_type(job.video_type)
     # Fix the job title - Title (Year) | Title
     job_title = utils.fix_job_title(job)
 
-    if bonus:
+    if linked:
         # Not completed/<type>/<Title (Year)>: that is the film's folder, which may have shipped already,
         # and an empty transcode folder of that name would stop the next rip of the title as a duplicate
         transcode_out_path = os.path.join(job.config.TRANSCODE_PATH, type_sub_folder,
-                                          f"{job_title} - bonus job{job.job_id}")
+                                          f"{job_title} - {linked} job{job.job_id}")
         utils.make_dir(transcode_out_path)
-        final_directory = bonus_folder(job)
-        logging.info(f"Bonus disc: filing every title in {os.path.join(final_directory, utils.bonus_extras_sub(job))}")
+        final_directory = linked_folder(job, linked)
     else:
         # We need to check/construct the final path, and the transcode path
         transcode_out_path = os.path.join(job.config.TRANSCODE_PATH, type_sub_folder, job_title)
@@ -84,12 +88,12 @@ def rip_visual_media(have_dupes, job, logfile, protection):
         # If dupes rips is disabled this might kill the run
         final_directory = utils.check_for_dupe_folder(have_dupes, final_directory, job)
     transcode_folder = transcode_out_path
-    bonus_transcode_path = transcode_folder if bonus else None
+    linked_transcode_path = transcode_folder if linked else None
 
     # Update the job.path with the final directory
     utils.database_updater({'path': final_directory}, job)
-    # Save poster image from disc if enabled (a bonus disc's would replace the film's)
-    if not bonus:
+    # Save poster image from disc if enabled (a bonus disc's or a continuation's would replace the film's)
+    if not linked:
         utils.save_disc_poster(final_directory, job)
 
     logging.info(f"Processing files to: {transcode_out_path}")
@@ -129,22 +133,23 @@ def rip_visual_media(have_dupes, job, logfile, protection):
         utils.delete_raw_files([transcode_out_path])
         transcode_out_path = transcode_in_path
 
-    # Marked (or no longer marked) as a bonus disc in the ui since the wait: file it accordingly
-    bonus, final_directory, bonus_transcode_path = recheck_bonus(
-        job, bonus, final_directory, transcode_folder, bonus_transcode_path, type_sub_folder, job_title)
+    # Marked (or no longer marked) as a bonus disc or continuation in the ui since the wait: file it accordingly
+    linked, final_directory, linked_transcode_path = recheck_linked(
+        job, linked, final_directory, transcode_folder, linked_transcode_path, type_sub_folder, job_title)
 
     # Update final path if user has set a custom/manual title or type, or check_runtime found a better match.
-    # recheck_bonus refreshed the job, so this sees changes made in the ui during the rip.
-    # Not for a bonus disc: its titles go to the film's folder whatever the job is called
+    # recheck_linked refreshed the job, so this sees changes made in the ui during the rip.
+    # Not for a bonus disc or continuation: its titles go to the film's folder whatever the job is called
     logging.debug(f"Job title status: [{job.title_manual}], video type: [{job.video_type}]")
-    if not bonus:
+    if not linked:
         final_directory = retitle_final_directory(have_dupes, job, final_directory, type_sub_folder, job_title)
 
-    # Move to final folder
+    # Move to final folder (a continuation that could not be joined goes to a folder of its own: job.path)
     move_files_post(transcode_out_path, job, main_features_only)
-    if bonus:
+    if linked:
+        final_directory = job.path
         # Beside the film's own disc.jpg; the case barcode and poster are the film's already
-        utils.copy_disc_photo(final_directory, job, bonus_photo_name(job))
+        utils.copy_disc_photo(final_directory, job, linked_photo_name(job, linked))
     else:
         # Keep the webcam photo of the disc and the barcode scanned from its case with the rip
         utils.copy_disc_photo(final_directory, job)
@@ -157,45 +162,88 @@ def rip_visual_media(have_dupes, job, logfile, protection):
     utils.set_permissions(final_directory)
     # If set in the arm.yaml remove the raw files
     utils.delete_raw_files([transcode_in_path, transcode_out_path, makemkv_out_path])
-    if bonus_transcode_path:
+    if linked_transcode_path:
         # Kept by DELRAWFILES: false, but empty and named after no title, so of no use to anyone
-        remove_empty_dir(bonus_transcode_path)
+        remove_empty_dir(linked_transcode_path)
     # report errors if any
     notify_exit(job)
     logging.info("************* ARM processing complete *************")
 
 
-def recheck_bonus(job, bonus, final_directory, transcode_folder, bonus_transcode_path, type_sub_folder,
-                  job_title):
+def linked_kind(job):
+    """``"bonus"`` for a bonus disc, ``"continuation"`` for a continuation, None for an ordinary disc"""
+    if utils.is_bonus_disc(job):
+        return "bonus"
+    if utils.is_continuation(job):
+        return "continuation"
+    return None
+
+
+def apply_linked_settings(job):
     """
-    Take up a bonus disc choice made, or cleared, in the ui while the disc ripped\n
-    :param bonus: whether the rip started as a bonus disc (apply_bonus_settings)
+    Settings for a disc filed with an earlier job's film (apply_bonus_settings, apply_continuation_settings)\n
+    :param job: Current job
+    :return: linked_kind of the job
+    """
+    if apply_bonus_settings(job):
+        return "bonus"
+    if apply_continuation_settings(job):
+        return "continuation"
+    return None
+
+
+def linked_folder(job, kind):
+    """bonus_folder or continuation_folder, by linked_kind"""
+    if kind == "bonus":
+        folder = bonus_folder(job)
+        logging.info(f"Bonus disc: filing every title in {os.path.join(folder, utils.bonus_extras_sub(job))}")
+        return folder
+    folder = continuation_folder(job)
+    if folder == continuation_target_folder(job):
+        logging.info(f"Continuation: joining the main title onto the film's in {folder}")
+    else:
+        logging.info(f"Continuation: the film's main feature is not in {continuation_target_folder(job)} (shipped "
+                     f"already?); filing the main title in {folder} to be joined by hand")
+    return folder
+
+
+def linked_photo_name(job, kind):
+    """bonus_photo_name, or ``disc-continuation-<disc label>.jpg`` for a continuation"""
+    if kind == "bonus":
+        return bonus_photo_name(job)
+    return f"disc-continuation-{utils.bonus_tag(job)}.jpg"
+
+
+def recheck_linked(job, linked, final_directory, transcode_folder, linked_transcode_path, type_sub_folder,
+                   job_title):
+    """
+    Take up a bonus disc or continuation choice made, cleared or changed in the ui while the disc ripped\n
+    :param linked: what the rip started as (apply_linked_settings)
     :param final_directory: the completed folder picked when the rip started
     :param transcode_folder: the transcode folder the rip used
-    :param bonus_transcode_path: the transcode folder to remove once empty, or None
-    :return: (bonus, final_directory, bonus_transcode_path) to file the rip with
+    :param linked_transcode_path: the transcode folder to remove once empty, or None
+    :return: (linked, final_directory, linked_transcode_path) to file the rip with
     """
     db.session.refresh(job)
-    if utils.is_bonus_disc(job):
-        if not bonus:
-            logging.info(f"Job was marked as the bonus disc of job {job.bonus_of_job_id} during the rip; "
-                         "filing its titles as extras")
-            # Before bonus_folder: identified as the film itself once the film had shipped, this folder
-            # has the film's own name, and bonus_folder would take it for the film's folder
+    kind = linked_kind(job)
+    if kind:
+        if not linked:
+            parent = job.bonus_of_job_id if kind == "bonus" else job.continuation_of_job_id
+            logging.info(f"Job was marked as the {kind} of job {parent} during the rip; filing it with that film")
+            # Before linked_folder: identified as the film itself once the film had shipped, this folder
+            # has the film's own name, and linked_folder would take it for the film's folder
             remove_unused_final_dir(final_directory)
-            bonus_transcode_path = transcode_folder
-            bonus = True
+            linked_transcode_path = transcode_folder
         # The film's folder may have shipped (or the choice changed) since the rip started
-        final_directory = bonus_folder(job)
+        final_directory = linked_folder(job, kind)
         utils.database_updater({'path': final_directory}, job)
-    elif bonus:
+    elif linked:
         # Not in the film's folder, where the main feature would meet the film's own file
-        logging.warning("Job is no longer marked as a bonus disc; filing its titles the usual way")
-        bonus = False
+        logging.warning(f"Job is no longer marked as a {linked}; filing its titles the usual way")
         final_directory = utils.check_for_dupe_folder(
             False, os.path.join(job.config.COMPLETED_PATH, type_sub_folder, job_title), job)
         utils.database_updater({'path': final_directory}, job)
-    return bonus, final_directory, bonus_transcode_path
+    return kind, final_directory, linked_transcode_path
 
 
 def retitle_final_directory(have_dupes, job, final_directory, type_sub_folder, job_title):
@@ -341,6 +389,7 @@ def move_files_post(transcode_out_path, job, main_features_only=False):
     if series move all to 1 folder\n
     if movie check what source we got them from, for MakeMKV use skip_transcode_movie to pick the main feature\n
     if a bonus disc, everything is an extra of the film it belongs to (file_bonus)\n
+    if a continuation, its main title is joined onto the film's (file_continuation)\n
     :param transcode_out_path: This should either be the RAW_PATH from MakeMKV, /dev/srX or TRANSCODE_PATH
     :param job: current job
     :param main_features_only: a double feature whose MAINFEATURE apply_collection_settings lifted: file
@@ -350,6 +399,8 @@ def move_files_post(transcode_out_path, job, main_features_only=False):
     tracks = job.tracks.filter_by(ripped=True)  # .order_by(job.tracks.length.desc())
     if utils.is_bonus_disc(job):
         file_bonus(transcode_out_path, job, os.listdir(transcode_out_path))
+    elif utils.is_continuation(job):
+        file_continuation(transcode_out_path, job, os.listdir(transcode_out_path))
     elif job.video_type == "series":
         for track in tracks:
             utils.move_files(transcode_out_path, track.filename, job, False)
@@ -494,6 +545,209 @@ def remove_empty_dir(path):
         logging.info(f"Removed empty folder {path}")
     except OSError:
         pass
+
+
+def apply_continuation_settings(job):
+    """
+    Settings for a disc marked in the ui as the continuation of an earlier job's film
+    (utils.continuation_parent): side B of a flipper, or the second disc of a film too long for one.
+    The job takes the film's title (a title fixed by hand included), year, type, metadata id and poster;
+    it is ripped with its own settings, and file_continuation joins its main title onto the film's\n
+    :param job: Current job
+    :return: True when the job is a continuation
+    """
+    parent = utils.continuation_parent(job)
+    if parent is None:
+        return False
+    logging.info(f"Continuation of job {parent.job_id} ({utils.fix_job_title(parent)}, disc {parent.label}): "
+                 "its main title is joined onto the film's main feature")
+    utils.database_updater({'title': parent.title_manual or parent.title, 'year': parent.year,
+                            'imdb_id': parent.imdb_id, 'poster_url': parent.poster_url,
+                            'video_type': parent.video_type, 'hasnicetitle': parent.hasnicetitle}, job)
+    return True
+
+
+def continuation_target_folder(job):
+    """
+    The folder of the film a continuation belongs to: the parent job's own folder (job.path)\n
+    :param job: Current job (a continuation)
+    :return: path
+    """
+    parent = utils.continuation_parent(job)
+    if parent.path:
+        return parent.path
+    return os.path.join(job.config.COMPLETED_PATH, utils.convert_job_type(parent.video_type),
+                        utils.fix_job_title(parent))
+
+
+def continuation_feature(job):
+    """
+    The film's main feature a continuation is joined onto: ``<Title (Year)>.<ext>`` of the parent job in
+    its folder (continuation_target_folder), named by the job's title or, for a title fixed after the rip,
+    the folder's (less a ``_<stage>`` suffix); None when it is not there: the completed-rip shipper has
+    moved it to the media box, or the parent's rip filed no main feature\n
+    :param job: Current job (a continuation)
+    :return: path or None
+    """
+    parent = utils.continuation_parent(job)
+    folder = continuation_target_folder(job).rstrip(os.sep)
+    stems = [utils.fix_job_title(parent), os.path.basename(folder), re.sub(r"_\d+$", "", os.path.basename(folder))]
+    for stem in dict.fromkeys(stems):
+        for extension in VIDEO_EXTENSIONS:
+            feature = os.path.join(folder, stem + extension)
+            if os.path.isfile(feature):
+                return feature
+    return None
+
+
+def continuation_part_folder(job):
+    """``<film folder> - continuation job<id>``: where a continuation is filed when it cannot be joined"""
+    return f"{continuation_target_folder(job).rstrip(os.sep)} - continuation job{job.job_id}"
+
+
+def continuation_folder(job):
+    """
+    Where a continuation is filed: the film's folder while its main feature is still in the completed
+    path (the job's path then holds the folder back from the completed-rip shipper until the join is
+    done), else continuation_part_folder. The shipper never ships that folder: the media box would
+    show its file as a second version of the film, so it waits on the ripper to be joined by hand\n
+    :param job: Current job (a continuation)
+    :return: path
+    """
+    if continuation_feature(job):
+        return continuation_target_folder(job)
+    return continuation_part_folder(job)
+
+
+def continuation_main_title(out_path, job, videos):
+    """
+    The continuation's own main feature among its ripped files, by the rule move_files_post uses for a
+    film: the only file, pick_main_feature for a MakeMKV rip, HandBrake's main feature, else the largest\n
+    :param out_path: folder holding the ripped files
+    :param videos: the video files in it
+    :return: file name
+    """
+    if len(videos) == 1:
+        return videos[0]
+    tracks = [track for track in job.tracks.filter_by(ripped=True) if track.filename in videos]
+    if any(track.source == "MakeMKV" for track in tracks):
+        return pick_main_feature(videos, job, out_path)
+    main = next((track.filename for track in tracks if track.main_feature), None)
+    return main or utils.find_largest_file(videos, out_path)
+
+
+def join_feature(feature, part):
+    """
+    Append ``part`` to the film's main feature with ``mkvmerge -o joined feature + part``: one file whose
+    chapters run on from the first part's. The output is written beside the feature under a dot name and
+    renamed over it once mkvmerge succeeded, so the feature is never left half written; a feature that was
+    not Matroska is replaced by the joined ``.mkv``. ``part`` is removed once joined\n
+    :param feature: the film's main feature
+    :param part: the continuation's main title
+    :return: the joined file, or None when it could not be joined (the feature and part are left as they were)
+    """
+    mkvmerge = shutil.which("mkvmerge")
+    if mkvmerge is None:
+        logging.error("mkvmerge (mkvtoolnix) is not installed; cannot join the continuation onto the film")
+        return None
+    folder, name = os.path.split(feature)
+    joined = os.path.join(folder, f".{os.path.splitext(name)[0]}.joining.mkv")
+    if os.path.exists(joined):
+        # Left by a join that never ended (ARM stopped while mkvmerge ran)
+        logging.info(f"Removing {joined}, left by an earlier join that did not finish")
+        os.remove(joined)
+    command = [mkvmerge, "-o", joined, feature, "+", part]
+    logging.info(f"Joining {part} onto {feature}: {' '.join(command)}")
+    try:
+        result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, check=False)
+    except OSError as error:
+        logging.error(f"Could not run mkvmerge: {error}")
+        result = None
+    if result is None or result.returncode not in MKVMERGE_OK or not os.path.isfile(joined):
+        if result is not None:
+            logging.error(f"mkvmerge exited {result.returncode}; the film is left as it was:\n{result.stdout[-2000:]}")
+        if os.path.exists(joined):
+            os.remove(joined)
+        return None
+    if result.returncode:
+        logging.warning(f"mkvmerge finished with warnings:\n{result.stdout[-2000:]}")
+    target = os.path.splitext(feature)[0] + ".mkv"
+    os.replace(joined, target)
+    if target != feature:
+        os.remove(feature)
+    os.remove(part)
+    logging.info(f"Joined the continuation onto {target} ({os.path.getsize(target)} bytes)")
+    return target
+
+
+def file_continuation(out_path, job, files):
+    """
+    File a continuation's rip. Its main title (continuation_main_title) is joined onto the film's main
+    feature (join_feature) when that is still in the completed path. Otherwise, or when the join fails,
+    it is filed as ``<Title (Year)> - pt2.<ext>`` in continuation_part_folder, the job's path from then on,
+    and the user is told to join it by hand. Its other titles are extras of the same folder, named
+    ``<disc label>_<file>`` like a bonus disc's, unless MAINFEATURE is on or EXTRAS_SUB is none.\n
+    The parent job's ``continues`` mark, which holds the film's folder back from the completed-rip
+    shipper, is cleared once the film is whole, or once its main feature has left the ripper, unless
+    another disc marked as the film's continuation has still to finish (a third disc on another drive).
+    After a failed join, or when nothing was ripped, it is kept, so the film waits on the ripper (beside
+    the part to be joined by hand) and the user is told\n
+    :param out_path: RAW_PATH or TRANSCODE_PATH holding the ripped files
+    :param job: Current job (a continuation)
+    :param files: os.listdir(out_path)
+    :return: the joined feature, or None when the main title was filed as a part
+    """
+    videos = sorted(name for name in files if name.lower().endswith(VIDEO_EXTENSIONS)
+                    and not name.startswith(".") and os.path.isfile(os.path.join(out_path, name)))
+    parent = utils.continuation_parent(job)
+    if not videos:
+        logging.warning(f"Continuation: no video files in {out_path}; nothing to join")
+        if parent.continues:
+            held = (f"The film's folder is held on the ripper until \"continues\" is cleared on job {parent.job_id}: "
+                    "rip the disc again, or clear the mark to ship the film as it is.")
+        else:
+            held = "Rip the disc again to join it."
+        utils.notify(job, constants.NOTIFY_TITLE,
+                     f"{utils.fix_job_title(parent)}: no title of the second part was ripped (all shorter than "
+                     f"MINLENGTH?), so nothing was joined onto the film. {held}")
+        return None
+    main = continuation_main_title(out_path, job, videos)
+    feature = continuation_feature(job) if job.path == continuation_target_folder(job) else None
+    joined = join_feature(feature, os.path.join(out_path, main)) if feature else None
+    if joined is None:
+        part_folder = continuation_part_folder(job)
+        utils.database_updater({'path': part_folder}, job)
+        utils.make_dir(part_folder)
+        stem = utils.fix_job_title(parent)
+        part = os.path.join(part_folder, utils.unused_name(part_folder, f"{stem} - pt2{os.path.splitext(main)[1]}"))
+        utils.move_files_main(os.path.join(out_path, main), part, part_folder)
+        where = feature or os.path.join(continuation_target_folder(job), f"{stem}.mkv")
+        logging.warning(f"Continuation filed as {part}; join it onto the film by hand: "
+                        f"mkvmerge -o joined.mkv \"{where}\" + \"{part}\"")
+        if feature:
+            held = (f"mkvmerge could not join it. The film's folder is held on the ripper until "
+                    f"\"continues\" is cleared on job {parent.job_id}")
+        else:
+            held = "the film's main feature has left the ripper"
+        utils.notify(job, constants.NOTIFY_TITLE,
+                     f"{stem}: the second part was not joined onto the film: {held}. It is in {part_folder}, "
+                     "which is not shipped; join it by hand.")
+    for name in videos:
+        if name == main:
+            continue
+        if job.config.MAINFEATURE:
+            logging.info(f"MAINFEATURE IS {job.config.MAINFEATURE} - Skipping move of {name}")
+        elif str(job.config.EXTRAS_SUB).lower() != "none":
+            utils.move_files(out_path, name, job, False)
+        else:
+            logging.info(f"Not moving extra: \"{name}\" - Sub folder is not set or named incorrectly")
+    if joined is not None or feature is None:
+        if utils.continuation_pending(parent, job):
+            logging.info(f"Job {parent.job_id} stays marked \"continues\": another disc marked as the film's "
+                         "continuation has still to finish")
+        else:
+            utils.database_updater({'continues': False}, parent)
+    return joined
 
 
 def apply_collection_settings(job):
@@ -756,14 +1010,11 @@ def check_runtime(job):
     When another film is taken, the user is notified. Left alone: titles set by hand, series,
     double features (file_collection matches those by runtime), and rips without title lengths:
     only the mkv rip method lists the titles (makemkv.get_track_info); a Blu-ray ripped with
-    RIPMETHOD backup is not checked, which is logged as a warning. Nor is a bonus disc: it carries the
-    film's IMDb id but its titles are the extras, so the runtime never fits and the search for another
-    film could rename the job\n
+    RIPMETHOD backup is not checked, which is logged as a warning. Nor are the discs runtime_check_skipped
+    names: a bonus disc, and either part of a film split over two sides or discs\n
     :return: True when the job was given another film
     """
-    if utils.is_bonus_disc(job):
-        logging.info(f"Bonus disc of job {job.bonus_of_job_id}: its titles are extras, so the runtime of "
-                     f"{job.title} ({job.year}) is not checked against them")
+    if runtime_check_skipped(job):
         return False
     if (not job.config.GET_VIDEO_TITLE or job.title_manual or job.video_type != "movie"
             or not job.imdb_id or collection_films(job)):
@@ -812,6 +1063,33 @@ def check_runtime(job):
         utils.notify(job, constants.NOTIFY_TITLE,
                      f"Identified as {best['Title']} ({best['Year']}) instead of {identified} by runtime")
     return True
+
+
+def runtime_check_skipped(job):
+    """
+    True (and logged) for a disc whose titles the film's runtime is not to be checked against, since it
+    never fits them and the search for a film that does could rename the job: a bonus disc, which carries
+    the film's IMDb id but whose titles are the extras; a continuation, whose main title is the rest of
+    the film; and the first part of a split film (``continues``, marked before its rip ended), whose main
+    title is only part of it. The parts are not checked joined either: a provider's runtime is often the
+    theatrical cut's, and a film split over two sides is typically a longer one (Das Boot's 209 minute
+    director's cut against the 149 minutes given for the film)\n
+    :param job: Current job
+    :return: bool
+    """
+    if utils.is_bonus_disc(job):
+        logging.info(f"Bonus disc of job {job.bonus_of_job_id}: its titles are extras, so the runtime of "
+                     f"{job.title} ({job.year}) is not checked against them")
+        return True
+    if utils.is_continuation(job):
+        logging.info(f"Continuation of job {job.continuation_of_job_id}: its main title is the rest of "
+                     f"{job.title} ({job.year}), so the film's runtime is not checked against it")
+        return True
+    if getattr(job, "continues", None):
+        logging.info(f"{job.title} ({job.year}) continues on another side or disc: its main title is only part "
+                     "of the film, so the film's runtime is not checked against it")
+        return True
+    return False
 
 
 def best_runtime_candidate(job, tracks, limit=None):

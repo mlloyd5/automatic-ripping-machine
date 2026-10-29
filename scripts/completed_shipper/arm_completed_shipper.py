@@ -54,6 +54,15 @@ Safety rules:
   ``<film folder> - bonus job<id>`` instead, and that folder ships into
   ``<film folder>`` on the media box under the same overwrite rule: files are
   only added, and if one would replace a file there the folder stays.
+* A film split over two sides or discs (the fork marks the second as the
+  continuation of the first job, and the first as ``continues``) is joined
+  into one file by ARM, in the first job's folder, so that folder is held
+  here while its job is marked ``continues``; ARM clears the mark once the
+  film is whole.  The continuation's job has that folder as its path while it
+  rips, which holds it too.  When the first part had shipped before the
+  second finished, ARM files the second in ``<film folder> - continuation
+  job<id>``, and that folder is never shipped: on the media box it would be
+  a second version of the film.  It waits on the ripper to be joined by hand.
 * Only the standard library plus ``rsync`` are needed.
 
 The shipper may run outside ARM's container (e.g. on the Docker or Proxmox
@@ -124,6 +133,11 @@ BONUS_COLUMNS = ("bonus_of_job_id",)
 """The fork's bonus disc column, read when present: the job whose film a disc's titles are extras of."""
 BONUS_FOLDER = re.compile(r"^(?P<target>.+) - bonus job(?P<job_id>\d+)$")
 """ARM's folder for a bonus disc whose film folder had already shipped: ``<film folder> - bonus job<id>``."""
+CONTINUATION_COLUMNS = ("continuation_of_job_id", "continues")
+"""The fork's split-film columns, read when present: the job whose film a disc continues, and the mark on a job
+whose film goes on on another side or disc."""
+CONTINUATION_FOLDER = re.compile(r"^(?P<target>.+) - continuation job(?P<job_id>\d+)$")
+"""ARM's folder for a continuation it could not join onto its film: ``<film folder> - continuation job<id>``."""
 JOB_COLUMNS = ("job_id", "status", "path", "title", "title_manual", "year", "year_manual", "video_type",
                "imdb_id", "label", "disctype", "disc_barcode", "disc_barcode_title", "sleeve_id", "box",
                "stop_time", "stage", "start_time")
@@ -232,7 +246,7 @@ def read_jobs(db_path):
     conn = sqlite3.connect(uri, uri=True, timeout=30)
     try:
         present = {row[1] for row in conn.execute("PRAGMA table_info(job)")}
-        columns = [column for column in JOB_COLUMNS + BONUS_COLUMNS if column in present]
+        columns = [column for column in JOB_COLUMNS + BONUS_COLUMNS + CONTINUATION_COLUMNS if column in present]
         if "path" not in columns or "status" not in columns:
             raise ShipperError(f"{db_path} has no job table with path and status columns")
         rows = conn.execute(f"SELECT {', '.join(columns)} FROM job WHERE path IS NOT NULL AND path != ''").fetchall()
@@ -272,6 +286,14 @@ def warn_once(message, *args):
     if key not in _warned:
         _warned.add(key)
         log.warning(message, *args)
+
+
+def info_once(message, *args):
+    """``log.info`` a message only the first time this run, like :func:`warn_once`."""
+    key = (message, args)
+    if key not in _warned:
+        _warned.add(key)
+        log.info(message, *args)
 
 
 def film_folder_name(film):
@@ -454,11 +476,36 @@ def finished_jobs(db_path, completed_path, arm_completed_path=None):
                       "claim it; move it by hand", path, ", ".join(str(job_id) for job_id in claimants))
             continue
         successes = [job for job in jobs if job["status"] == SUCCESS_STATUS]
-        # A bonus disc's job never stands for a folder it shares with its film's job: ARM filed the
-        # bonus disc's extras into the film's folder, which is still the film's rip
-        own = [job for job in successes if not job.get("bonus_of_job_id")]
-        shippable[path] = max(own or successes, key=lambda job: job.get("job_id") or 0)
+        # A bonus disc's or continuation's job never stands for a folder it shares with its film's job: ARM
+        # filed the extras, or joined the second part, into the film's folder, which is still the film's rip
+        own = [job for job in successes if not job.get("bonus_of_job_id") and not job.get("continuation_of_job_id")]
+        chosen = max(own or successes, key=lambda job: job.get("job_id") or 0)
+        if held_for_continuation(path, chosen):
+            continue
+        shippable[path] = chosen
     return shippable
+
+
+def held_for_continuation(local_folder, job):
+    """
+    True (and logged) when a finished folder is to stay on the ripper for a film split over two sides or discs.
+
+    The folder of a job marked ``continues`` waits for the continuation ARM
+    joins onto its main feature; a continuation's own folder
+    (:data:`CONTINUATION_FOLDER`, filed when its film had shipped or the join
+    failed) waits to be joined by hand, for good.
+    """
+    if job.get("continues"):
+        info_once("holding %s: job %s continues on another side or disc, which ARM joins onto it here; clear "
+                  "\"continues\" on the job in ARM to ship it as it is", local_folder, job.get("job_id"))
+        return True
+    match = CONTINUATION_FOLDER.match(os.path.basename(local_folder.rstrip(os.sep)))
+    if match and job.get("continuation_of_job_id") and int(match.group("job_id")) == job.get("job_id"):
+        warn_once("not shipping %s: it holds the rest of job %s's film, which ARM could not join onto it; join "
+                  "the two by hand (mkvmerge -o joined.mkv part1.mkv + part2.mkv)", local_folder,
+                  job.get("continuation_of_job_id"))
+        return True
+    return False
 
 
 def finished_job_paths(db_path, completed_path, arm_completed_path=None):

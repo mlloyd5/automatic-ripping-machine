@@ -200,6 +200,35 @@ beside it:
   Its holding folder stays on the ripper (run exits 1) until the extras are
   renamed or moved by hand.
 
+### Split films
+
+A film split over two sides of a flipper DVD, or over two discs, is joined
+into one file by ARM, not here: in its web UI the second side is marked as
+the continuation of the first side's job ("Split Film" on the job, see the
+wiki's Split Films page), and ARM appends its main title to the film's main
+feature with `mkvmerge` once it has ripped.  That needs both files on the
+ripper, and the media box key only receives, so the shipper's part is to keep
+the first side here until then:
+
+* A folder whose job is marked `continues` is held, however long ago the job
+  finished, and the run logs `holding ...` once.  Marking the second side
+  marks the first side's job too; marking the first side while it rips (or
+  any time before the shipper takes it) closes the gap between the first
+  side finishing and the second being marked.  ARM clears the mark once the
+  film is whole, and the folder ships on the next run as the film's rip: the
+  first side's job row stands for it (destination name, catalog record).
+  Clearing the mark in ARM's UI ships the folder as it is.
+* While the second side rips, its job has the film's folder as its `path`,
+  so the folder also waits for that job to finish, as for a bonus disc.
+* When the first side had shipped before the second finished, or `mkvmerge`
+  could not join the two, ARM files the second side's main title as
+  `<Title (Year)> - pt2.mkv` in `<film folder> - continuation job<id>`.  That
+  folder is never shipped (a warning names it on each run): on the media box
+  it would be a second version of the film.  Join the two by hand
+  (`mkvmerge -o joined.mkv "<Title (Year)>.mkv" + "<Title (Year)> - pt2.mkv"`)
+  and remove the folder.  After a failed join the first side stays held
+  beside it until `continues` is cleared.
+
 ## Requirements
 
 * Ripping box (wherever the shipper runs): Python 3.6+ (stdlib only),

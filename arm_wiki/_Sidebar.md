@@ -20,6 +20,7 @@
   - _Coming Soon_
   - [Jobs](Web-Jobs)
     - [Bonus Discs](Bonus-Discs)
+    - [Split Films](Split-Films)
     - [Double Features](Double-Features)
   - [Settings](Web-Settings)
     - [Drive Management](Web-Settings-Drives)

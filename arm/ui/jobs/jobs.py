@@ -10,6 +10,7 @@ Covers
 - activerips [GET]
 - changeparams [GET]
 - bonusdisc [GET, POST]
+- splitfilm [GET, POST]
 - doublefeature [GET, POST]
 - list_titles [GET]
 - json [JSON GET]
@@ -32,6 +33,7 @@ from arm.ui.forms import TitleSearchForm, ChangeParamsForm, TrackFormDynamic
 from arm.ripper import disc_photo
 from arm.ripper import disc_vision
 from arm.ui.jobs import bonus
+from arm.ui.jobs import continuation
 from arm.ui.jobs import double_feature
 
 route_jobs = Blueprint('route_jobs', __name__,
@@ -260,6 +262,32 @@ def bonusdisc():
         return redirect(url_for('home'))
     return render_template('bonusdisc.html', title='Bonus Disc', job=job,
                            candidates=bonus.bonus_candidates(job), film_label=bonus.film_label)
+
+
+@route_jobs.route('/splitfilm', methods=['GET', 'POST'])
+@login_required
+def splitfilm():
+    """
+    A film split over two sides or discs: mark the disc of a job as the continuation of a recent job's film,
+    so its main title is joined onto that film's, or mark a job's film as continuing on another side or disc
+    """
+    job_id = str(request.values.get('job_id') or '').strip()
+    if not job_id.isdigit() or (job := Job.query.get(int(job_id))) is None:
+        abort(404)
+    if request.method == 'POST':
+        if 'continues' in request.form:
+            success, message = continuation.set_continues(job, request.form.get('continues') == "yes")
+        else:
+            success, message = continuation.set_continuation_of(job, request.form.get('continuation_of'))
+        if not success:
+            flash(message, "danger")
+            return redirect(url_for('route_jobs.splitfilm', job_id=job.job_id))
+        db.session.add(Notifications(f"Job: {job.job_id} was updated", message))
+        db.session.commit()
+        flash(message, "success")
+        return redirect(url_for('home'))
+    return render_template('splitfilm.html', title='Split Film', job=job,
+                           candidates=continuation.continuation_candidates(job), film_label=bonus.film_label)
 
 
 @route_jobs.route('/doublefeature', methods=['GET', 'POST'])

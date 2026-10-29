@@ -98,6 +98,8 @@
                                             Title</a>
                                         <a href="bonusdisc?job_id={{ jobs.job_id }}" class="btn btn-primary">Bonus
                                             Disc</a>
+                                        <a href="splitfilm?job_id={{ jobs.job_id }}" class="btn btn-primary">Split
+                                            Film</a>
                                         <a href="doublefeature?job_id={{ jobs.job_id }}" class="btn btn-primary">Double
                                             Feature</a>
                                         <a id="plot" class="btn btn-primary">Plot</a>
@@ -121,6 +123,8 @@
                                             Title</a>
                                         <a href="bonusdisc?job_id={{ jobs.job_id }}" class="btn btn-primary">Bonus
                                             Disc</a>
+                                        <a href="splitfilm?job_id={{ jobs.job_id }}" class="btn btn-primary">Split
+                                            Film</a>
                                         <a href="doublefeature?job_id={{ jobs.job_id }}" class="btn btn-primary">Double
                                             Feature</a>
                                         <a id="plot" class="btn btn-primary">Plot</a>
@@ -396,6 +400,26 @@
                                         <a href="jobdetail?job_id={{ jobs.bonus_of_job_id }}">job {{ jobs.bonus_of_job_id }}</a>
                                         {% if jobs.bonus_of %}({{ jobs.bonus_of.title }}, disc {{ jobs.bonus_of.label }}){% endif %}:
                                         its titles are filed as extras
+                                    </td>
+                                </tr>
+                                {% endif %}
+                                {% if jobs.continuation_of_job_id %}
+                                <tr>
+                                    <td style="text-align:left"><strong>continuation_of</strong></td>
+                                    <td style="text-align:left">
+                                        Continues the film of
+                                        <a href="jobdetail?job_id={{ jobs.continuation_of_job_id }}">job {{ jobs.continuation_of_job_id }}</a>
+                                        {% if jobs.continuation_of %}({{ jobs.continuation_of.title }}, disc {{ jobs.continuation_of.label }}){% endif %}:
+                                        its main title is joined onto the film's
+                                    </td>
+                                </tr>
+                                {% endif %}
+                                {% if jobs.continues %}
+                                <tr>
+                                    <td style="text-align:left"><strong>continues</strong></td>
+                                    <td style="text-align:left">
+                                        The film continues on another side or disc: its folder stays on the ripper until
+                                        that is joined onto it (<a href="splitfilm?job_id={{ jobs.job_id }}">change</a>)
                                     </td>
                                 </tr>
                                 {% endif %}
