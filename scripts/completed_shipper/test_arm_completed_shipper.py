@@ -1017,6 +1017,131 @@ class SplitFilm(MediaBoxFixture):
         self.assertFalse(shipper.held_for_continuation(self._local("movies", "Movie A (2001)"), {"job_id": 1}))
 
 
+class SharedFolder(MediaBoxFixture):
+    """Jobs that had one folder in turn: it ships as the one whose rip it holds, the last of them to finish."""
+
+    SHOW = "The West (1996)"
+    FILM = {"title": "Heat", "year": "1995", "video_type": "movie"}
+
+    def setUp(self):
+        super().setUp()
+        conn = sqlite3.connect(self.db)
+        for column in ("start_time DATETIME", "bonus_of_job_id INTEGER", "continuation_of_job_id INTEGER",
+                       "continues BOOLEAN"):
+            conn.execute(f"ALTER TABLE job ADD COLUMN {column}")
+        conn.commit()
+        conn.close()
+
+    def _disc(self, job_id, label, status, start_time, stop_time=None, path=None, **fields):
+        """A job of The West (or of ``fields``' title) with its own job id; ``path`` None keeps it off every folder."""
+        columns = {"job_id": job_id, "status": status, "path": path, "title": "The West", "year": "1996",
+                   "video_type": "series", "label": label, "disctype": "dvd", "start_time": start_time,
+                   "stop_time": stop_time, **fields}
+        conn = sqlite3.connect(self.db)
+        conn.execute(f"INSERT INTO job ({', '.join(columns)}) VALUES ({', '.join('?' * len(columns))})",
+                     tuple(columns.values()))
+        conn.commit()
+        conn.close()
+
+    def _update(self, job_id, **fields):
+        conn = sqlite3.connect(self.db)
+        conn.execute("UPDATE job SET %s WHERE job_id = ?" % ", ".join(f"{k} = ?" for k in fields),
+                     (*fields.values(), job_id))
+        conn.commit()
+        conn.close()
+
+    def _fill(self, label):
+        """The show's folder as ARM files a disc of it: title_t00.mkv and title_t01.mkv, named alike on every disc."""
+        folder = self._local("tv", self.SHOW)
+        os.makedirs(folder, exist_ok=True)
+        for name in ("title_t00.mkv", "title_t01.mkv"):
+            with open(os.path.join(folder, name), "w") as handle:
+                handle.write(f"{label} {name}\n")
+        return folder
+
+    def _chosen(self, folder):
+        return shipper.finished_jobs(self.db, self.completed)[os.path.realpath(folder)]["job_id"]
+
+    def _records(self, job_id):
+        return [parse_record(self._read(os.path.join(self.records, name)))[0]
+                for name in sorted(os.listdir(self.records)) if f"-job{job_id}." in name]
+
+    def test_folder_refilled_by_an_older_job_ships_under_that_jobs_label(self):
+        # The West on the ts140, 2026-11-02: discs one (job 168) and three (job 170) ripped at once on two
+        # drives.  Three finished first and shipped; one was given the show's folder after that and refilled it.
+        folder = self._fill("The_West_Disc_Three")
+        self._disc(168, "The_West_Disc_One", "ripping", "2026-11-02 11:10:33.512000")
+        self._disc(170, "The_West_Disc_Three", "success", "2026-11-02 11:10:43.204000", "2026-11-02 11:25:00.731000",
+                   folder)
+        self.assertEqual(self._run(), 0)
+        show = self._shipped("TV", self.SHOW)
+        self.assertEqual(self._read(os.path.join(show, "title_t00.mkv")), "The_West_Disc_Three title_t00.mkv\n")
+        self.assertFalse(os.path.exists(folder))
+
+        self._fill("The_West_Disc_One")
+        self._update(168, status="success", path=folder, stop_time="2026-11-02 11:36:10.088000")
+        self.assertEqual(self._chosen(folder), 168)
+        self.assertEqual(self._run(), 0)
+        # Disc one's episodes have disc three's file names, so they land beside them under disc one's label.
+        beside = self._shipped("TV", f"{self.SHOW} - The_West_Disc_One")
+        self.assertEqual(self._read(os.path.join(beside, "title_t00.mkv")), "The_West_Disc_One title_t00.mkv\n")
+        self.assertEqual(self._read(os.path.join(show, "title_t00.mkv")), "The_West_Disc_Three title_t00.mkv\n")
+        self.assertEqual(self._dest_folders("TV"), ["Show A (2010)", self.SHOW, f"{self.SHOW} - The_West_Disc_One"])
+        self.assertFalse(os.path.exists(folder))
+        # Each disc has one catalog record, naming the folder that received its files.
+        self.assertEqual([(top["label"], top["library"]) for top in self._records(170)],
+                         [("The_West_Disc_Three", f"tv/{self.SHOW}")])
+        self.assertEqual([(top["label"], top["library"]) for top in self._records(168)],
+                         [("The_West_Disc_One", f"tv/{self.SHOW} - The_West_Disc_One")])
+
+        # Disc five (job 172) went in later and finished last as well as having the highest id.
+        self._fill("The_West_Disc_Five")
+        self._disc(172, "The_West_Disc_Five", "success", "2026-11-02 11:40:12.000000", "2026-11-02 12:02:41.000000",
+                   folder)
+        self.assertEqual(self._chosen(folder), 172)
+        self.assertEqual(self._run(), 0)
+        self.assertEqual(self._read(os.path.join(self._shipped("TV", f"{self.SHOW} - The_West_Disc_Five"),
+                                                 "title_t00.mkv")), "The_West_Disc_Five title_t00.mkv\n")
+
+    def test_last_finished_goes_by_stop_time_then_job_id(self):
+        one = {"job_id": 168, "stop_time": "2026-11-02 11:36:10.088000"}
+        three = {"job_id": 170, "stop_time": "2026-11-02 11:25:00"}
+        five = {"job_id": 172, "stop_time": "2026-11-02 12:02:41"}
+        self.assertEqual(shipper.last_finished([three, one])["job_id"], 168)
+        self.assertEqual(shipper.last_finished([one, five, three])["job_id"], 172)
+        self.assertEqual(shipper.last_finished([dict(three, stop_time=one["stop_time"]), one])["job_id"], 170)
+        # A row without a stop time (a finished ARM job always has one) leaves only the job id to go by.
+        self.assertEqual(shipper.last_finished([one, dict(three, stop_time=None)])["job_id"], 170)
+        self.assertEqual(shipper.last_finished([one, dict(three, stop_time="")])["job_id"], 170)
+
+    def test_bonus_disc_never_stands_for_the_folder_its_film_refilled(self):
+        # Two copies of one film ripped at once: the DVD's (170) shipped before the Blu-ray (168) was given the
+        # folder.  The Blu-ray's bonus disc then filed its extras there and finished last of the three.
+        folder = self._local("movies", "Heat (1995)")
+        os.makedirs(folder)
+        self._disc(168, "HEAT_BD", "success", "2026-11-02 11:10:33", "2026-11-02 11:36:10", folder, **self.FILM)
+        self._disc(170, "HEAT_DVD", "success", "2026-11-02 11:10:43", "2026-11-02 11:25:00", folder, **self.FILM)
+        self._disc(175, "HEAT_BONUS", "success", "2026-11-02 11:40:00", "2026-11-02 11:58:00", folder,
+                   bonus_of_job_id=168, **self.FILM)
+        self.assertEqual(self._chosen(folder), 168)
+
+    def test_film_in_the_refilled_folder_waits_for_its_continuation(self):
+        # As above, but the Blu-ray's film goes on on a second disc.  Taken by job id, the DVD's row (no
+        # "continues") stood for the folder, which shipped before ARM had joined the second disc onto the film.
+        folder = self._local("movies", "Heat (1995)")
+        os.makedirs(folder)
+        self._disc(168, "HEAT_DISC_1", "success", "2026-11-02 11:10:33", "2026-11-02 11:36:10", folder, continues=1,
+                   **self.FILM)
+        self._disc(170, "HEAT_DVD", "success", "2026-11-02 11:10:43", "2026-11-02 11:25:00", folder, **self.FILM)
+        self.assertNotIn(os.path.realpath(folder), shipper.finished_job_paths(self.db, self.completed))
+        self._disc(176, "HEAT_DISC_2", "ripping", "2026-11-02 11:45:00", None, folder, continuation_of_job_id=168,
+                   **self.FILM)
+        self.assertNotIn(os.path.realpath(folder), shipper.finished_job_paths(self.db, self.completed))
+        self._update(176, status="success", stop_time="2026-11-02 12:20:00")
+        self._update(168, continues=0)
+        self.assertEqual(self._chosen(folder), 168)
+
+
 class KeptNameWithoutRecords(ShipperFixture):
     """Records off: the destination name is still kept in the spool across an interrupted transfer."""
 

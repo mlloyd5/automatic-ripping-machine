@@ -433,7 +433,8 @@ def finished_jobs(db_path, completed_path, arm_completed_path=None):
 
     A folder qualifies when at least one job with that path has status
     ``success`` and no job with that path is still unfinished.  The row kept is
-    the newest successful job, which is the one whose rip the folder holds.
+    the successful job that finished last, which is the one whose rip the
+    folder holds (see :func:`last_finished`).
 
     A double feature's further films (see :func:`read_films`) count as folders
     of their own, each with its parent job's status and a :func:`film_job` row,
@@ -441,7 +442,7 @@ def finished_jobs(db_path, completed_path, arm_completed_path=None):
     for that job too.  Only the films of a job whose ``job.path`` is under
     COMPLETED_PATH are looked at, since ARM files them beside it.  A film row
     never represents a folder that is some job's own path: that folder ships
-    with the newest successful such job, or not at all.  A folder that is no
+    with the last such job to finish successfully, or not at all.  A folder that is no
     job's own and that films of more than one job claim ships with none of
     them (a warning names the jobs): :func:`film_folder_for` only lets a job
     claim a folder that changed while it ran, so those are jobs whose runs
@@ -479,11 +480,32 @@ def finished_jobs(db_path, completed_path, arm_completed_path=None):
         # A bonus disc's or continuation's job never stands for a folder it shares with its film's job: ARM
         # filed the extras, or joined the second part, into the film's folder, which is still the film's rip
         own = [job for job in successes if not job.get("bonus_of_job_id") and not job.get("continuation_of_job_id")]
-        chosen = max(own or successes, key=lambda job: job.get("job_id") or 0)
+        chosen = last_finished(own or successes)
         if held_for_continuation(path, chosen):
             continue
         shippable[path] = chosen
     return shippable
+
+
+def last_finished(jobs):
+    """
+    The job of ``jobs`` (rows on one folder) with the latest ``stop_time``: the one whose rip the folder holds.
+
+    ARM gives a job a folder's name only by making the folder; a rip that
+    finds it there goes into ``<name>_<stage>`` beside it (a bonus disc or a
+    continuation files into its film's folder, but :func:`finished_jobs` only
+    asks about those when no other job has the path).  So the jobs that
+    have one path took it one after another, each once the folder of the one
+    before had shipped and gone, and the last of them to finish is the one in
+    it now.  The job id says nothing about that: ARM numbers jobs as discs go
+    in, and of two discs ripped at once on two drives the later one may
+    finish first, ship, and leave the name to the other.  When a row has no
+    ``stop_time`` (never on a finished ARM job) the highest job id is taken.
+    """
+    stops = [_datetime(job.get("stop_time")) for job in jobs]
+    if all(stops):
+        return max(zip(stops, jobs), key=lambda pair: (pair[0], pair[1].get("job_id") or 0))[1]
+    return max(jobs, key=lambda job: job.get("job_id") or 0)
 
 
 def held_for_continuation(local_folder, job):
