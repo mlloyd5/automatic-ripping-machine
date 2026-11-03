@@ -1142,6 +1142,50 @@ class SharedFolder(MediaBoxFixture):
         self.assertEqual(self._chosen(folder), 168)
 
 
+class EmptyFolder(ShipperFixture):
+    """A finished folder with no rip in it stays on the ripper instead of landing in the library empty."""
+
+    NAME = "I-John-Wayne (2021)"
+
+    def _leftover(self, files):
+        """
+        The ts140, 2026-11-03: job 238's rip of the film had shipped, then job 240 failed on the same path and
+        left the folder behind with ``files`` in it (nothing at all on the day).  A success and nothing still
+        running on the path, so the database alone says it is ready to ship.
+        """
+        folder = self._job("movies", self.NAME, "success", files=files)
+        os.makedirs(folder, exist_ok=True)
+        self._row("fail", folder)
+        self.assertIn(os.path.realpath(folder), shipper.finished_job_paths(self.db, self.completed))
+        return folder
+
+    def _assert_held(self, folder, files):
+        with self.assertLogs(shipper.log, "INFO") as logs:
+            self.assertEqual(self._run(), 0)
+        self.assertTrue(os.path.isdir(folder))
+        self.assertEqual(sorted(shipper.folder_files(folder)), files)
+        self.assertFalse(os.path.exists(self._shipped("Movies", self.NAME)))
+        self.assertEqual([c for c in self._calls() if self.NAME in c], [])
+        # One line per run, though the run lists movies/ again before each unidentified folder.
+        self.assertEqual(sum(line.startswith("INFO:") and f"not shipping {os.path.realpath(folder)}:" in line
+                             for line in logs.output), 1)
+        # The rest ships as usual, unidentified folders included.
+        self.assertTrue(os.path.isfile(os.path.join(self._shipped("Movies", "Movie A (2001)"), "Movie A (2001).mkv")))
+        self.assertTrue(os.path.isfile(os.path.join(self._shipped("staging", "UNKNOWN_2"), "title_t00.mkv")))
+
+    def test_empty_folder_is_not_shipped(self):
+        self._assert_held(self._leftover(()), [])
+
+    def test_folder_of_only_the_disc_photo_is_not_shipped(self):
+        self._assert_held(self._leftover(["disc.jpg"]), ["disc.jpg"])
+
+    def test_folder_with_a_rip_ships_with_its_disc_photo(self):
+        folder = self._leftover(["disc.jpg", f"{self.NAME}.mkv"])
+        self.assertEqual(self._run(), 0)
+        self.assertFalse(os.path.exists(folder))
+        self.assertEqual(sorted(os.listdir(self._shipped("Movies", self.NAME))), [f"{self.NAME}.mkv", "disc.jpg"])
+
+
 class KeptNameWithoutRecords(ShipperFixture):
     """Records off: the destination name is still kept in the spool across an interrupted transfer."""
 
@@ -1504,7 +1548,8 @@ class CatalogRecords(ShipperFixture):
         self.assertEqual(top["label"], "")
 
     def test_folder_without_media_files_gets_no_record(self):
-        self._job("movies", "Movie F (2006)", "success", files=["disc.jpg", "disc.barcode"])
+        # Only the disc photo and barcode and the folder would stay (see EmptyFolder); any other file ships.
+        self._job("movies", "Movie F (2006)", "success", files=["disc.jpg", "disc.barcode", "cover.png"])
         self.assertEqual(self._run(), 0)
         self.assertFalse(os.path.exists(self._local("movies", "Movie F (2006)")))
         self.assertEqual(len(self._records()), 2)
