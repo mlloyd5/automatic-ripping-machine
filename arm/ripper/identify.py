@@ -904,7 +904,9 @@ def identify_from_photo(job):
     titled exactly like a candidate is taken, so a misread photo cannot replace the product
     title the disc was named after. When the vision model already read the label well enough to
     name the disc (:func:`title_from_disc_photo`) OCR does not run at all: tesseract reads far
-    less off the same photo, and its first fuzzy match would replace the better name.
+    less off the same photo, and its first fuzzy match would replace the better name. Nor does it
+    run when the volume label contradicts that read (:func:`label_contradicts`): the photo shows
+    something other than the disc, and tesseract would read the same thing.
 
     :return: True when a title was found from the photo
     """
@@ -912,7 +914,7 @@ def identify_from_photo(job):
         return False
     if job.disctype not in ["dvd", "bluray"] or not job.disc_photo or job.hasnicetitle:
         return False
-    vision_title = disc_label_read_title(job)
+    vision_title = disc_label_read_title(job, check_label=False)
     if vision_title:
         logging.info(f"The vision model read the disc label as '{vision_title}'; not running OCR on the photo")
         return False
@@ -947,13 +949,65 @@ def identify_from_photo(job):
     return False
 
 
-def disc_label_read_title(job):
+def disc_label_read_title(job, check_label=True):
     """
     The title the vision model read off the disc photo, when it was sure enough of it to name the
-    disc (:data:`disc_vision.NAME_CONFIDENCE`, see :func:`title_from_disc_photo`), else None.
+    disc (:data:`disc_vision.NAME_CONFIDENCE`, see :func:`title_from_disc_photo`), else None. With
+    ``check_label`` a title the disc's volume label contradicts (:func:`label_contradicts`) is None
+    too: the photo showed something other than the disc.
     """
     title, _ = disc_vision.label_title(disc_vision.parse_answer(getattr(job, 'disc_photo_vision', None)))
+    if title and check_label and label_contradicts(job.label, title):
+        return None
     return title
+
+
+#: words of a volume label or title that say nothing of which film it is: disc numbering, packaging
+#: and authoring tool defaults ("LOGICAL_VOLUME", "SEASON_1_DISC_2", "SPECIAL_FEATURES")
+LABEL_NOISE_WORDS = frozenset(("disc", "disk", "dvd", "bluray", "video", "volume", "vol", "logical", "side",
+                               "part", "season", "episode", "special", "edition", "collector", "collectors",
+                               "widescreen", "fullscreen", "bonus", "extras", "features"))
+
+
+def _significant_words(text) -> set:
+    """
+    The words of a title or volume label that say which film it is. Words split as for the label
+    search (:func:`_title_words`: "WAR_IN_THE_PACIFIC_02" is war, in, the, pacific, 02) and lose a
+    disc number on their end ("DISC2", "D1"); what is then shorter than three letters, has a digit
+    in it, is a minor word ("the", "of") or one of :data:`LABEL_NOISE_WORDS` is dropped.
+    """
+    words = set()
+    for word in _title_words(text):
+        word = re.sub(r"\d+$", "", word)
+        if len(word) > 2 and word.isalpha() and word not in disc_vision.MINOR_WORDS | LABEL_NOISE_WORDS:
+            words.add(word)
+    return words
+
+
+def label_contradicts(label, title) -> bool:
+    """
+    Whether a disc's volume label names something that shares no significant word
+    (:func:`_significant_words`) with ``title``, a title the vision model read off the disc photo.
+
+    Job 230 on the ts140: the photo was taken with the tray still empty, a Planet of the Apes case
+    under the drive showed through the tray's centre hole, and the model's confident "Planet of the
+    Apes" named a disc labelled WAR_IN_THE_PACIFIC_02. A label that names no film (DVD_VIDEO, see
+    is_placeholder_title, or one of numbers and noise words only) contradicts nothing, nor does a
+    title of short words only ("Up"). Labels run words together and shorten them, so a word of one
+    found inside the other also counts as shared ("PLANETOFTHEAPES"; "CARTOONS_D3" for "Toon Time:
+    Ultimate Cartoon Collection"), as does a label word made of the title's initials ("LOTR_FOTR").
+    """
+    if is_placeholder_title(label):
+        return False
+    label_words, title_words = _significant_words(label), _significant_words(title)
+    if not label_words or not title_words or label_words & title_words:
+        return False
+    squashed_label, squashed_title = _normalise_title(label), _normalise_title(title)
+    initials = "".join(word[0] for word in _title_words(title))
+    shared = ([word for word in title_words if len(word) > 3 and word in squashed_label]
+              + [word for word in label_words if len(word) > 3 and word in squashed_title]
+              + [word for word in label_words if word in initials])
+    return not shared
 
 
 def identify_vision_step(job):
@@ -980,7 +1034,9 @@ def identify_from_photo_vision(job):
     better than its volume label does.
     What the model read is kept on the job (JSON) so the title fix pages can offer it and
     :func:`title_from_disc_photo` can name the disc when nothing online matches. The title (and
-    the title with its subtitle) is searched online with the year read, exact matches only.
+    the title with its subtitle) is searched online with the year read, exact matches only. A read
+    the disc's volume label contradicts (:func:`label_contradicts`) is not searched: the label
+    search identifies the disc instead.
 
     :return: True when a title was found from the photo
     """
@@ -1009,6 +1065,11 @@ def identify_from_photo_vision(job):
                  f"(confidence {answer['confidence']:.2f}, rotated {answer.get('rotation')} degrees)")
     utils.database_updater({'disc_photo_vision': json.dumps(answer)}, job)
 
+    read = disc_vision.search_titles(answer)[-1]
+    if label_contradicts(job.label, read):
+        logging.info(f"The vision model read '{read}' off the photo, which shares no word with the disc label "
+                     f"'{job.label}': the photo may show something other than the disc; leaving it to its label")
+        return False
     for title in disc_vision.search_titles(answer):
         best = search_film(title, answer['year'])
         if best:
@@ -1028,7 +1089,8 @@ def title_from_disc_photo(job):
     :func:`title_from_barcode_product`: the disc names itself more precisely than its case does
     (job 34's case said "59 Cartoon Classics", the disc "Toon Time: Ultimate Cartoon Collection").
     A title the disc itself supplied (a Blu-ray's bdmt_eng.xml) is kept, and a read the model was
-    not reasonably sure of is ignored. As with the product title the year goes with the title:
+    not reasonably sure of, or that the volume label contradicts (:func:`label_contradicts`), is
+    ignored. As with the product title the year goes with the title:
     the one read, or none, never the date of a Blu-ray's metadata file. ``hasnicetitle`` stays
     False: this is a name, not an identification.
 
@@ -1039,7 +1101,7 @@ def title_from_disc_photo(job):
     if job.title not in (None, "", "not identified") and str(job.title) not in _label_titles(job):
         return False
     title, year = disc_vision.label_title(disc_vision.parse_answer(job.disc_photo_vision))
-    if not title:
+    if not title or label_contradicts(job.label, title):
         return False
     title = utils.clean_for_filename(title)
     year = year or ""

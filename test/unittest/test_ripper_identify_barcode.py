@@ -89,6 +89,16 @@ CARTOONS_D3 = [_result("Greatest Cartoons of the Golden Era Vol. 3", "2024", 2)]
 TOON_TIME = {"title": "Toon Time", "subtitle": "Ultimate Cartoon Collection", "year": "2011",
              "studio": "Echo Bridge Home Entertainment", "disc_number": None, "catalog_number": "73619",
              "format": "DVD", "other_text": None, "confidence": 0.95, "rotation": 0}
+# Job 230 on the ts140 (2026-11-03), label WAR_IN_THE_PACIFIC_02: the photo was taken with the tray still
+# empty, and a Planet of the Apes DVD case lying under the drive showed through the tray's centre hole.
+# qwen2.5vl:7b read it with confidence 0.90 and ARM named the job Planet-of-the-Apes (2001).
+APES_THROUGH_THE_TRAY = {"scene": "disc_label", "legible_text": ["PLANET", "OF", "THE", "APES"],
+                         "title": "Planet of the Apes", "subtitle": None, "year": None, "studio": None,
+                         "disc_number": None, "catalog_number": None, "format": "DVD", "confidence": 0.90,
+                         "rotation": 0}
+# stand-ins for what TMDB has for the read and the label
+PLANET_OF_THE_APES = [_result("Planet of the Apes", "2001", 5000), _result("Planet of the Apes", "1968", 4000)]
+WAR_IN_THE_PACIFIC = [_result("War in the Pacific", "1951", 3)]
 
 # Job 37 on the ts140: barcode 013131210392 is "Thomas the Tank Engine and Friends - Best of James [DVD]",
 # TMDB words the brand "Thomas & Friends", and the query "Best of James" is led by a wrestling compilation.
@@ -527,6 +537,67 @@ class TestIdentifyFromPhotoVision(unittest.TestCase):
         search.assert_not_called()
         self.assertIsNone(job.disc_photo_vision)
 
+    def test_a_read_the_label_shares_no_word_with_is_not_taken(self):
+        """Job 230: an empty tray, a Planet of the Apes case seen through it, a disc labelled WAR_IN_THE_PACIFIC_02."""
+        job = _job(disc_photo=self.PHOTO, disc_barcode=None, label="WAR_IN_THE_PACIFIC_02")
+        apes = {"Search": PLANET_OF_THE_APES}
+        with mock.patch.object(identify.disc_vision, "read_disc_photo", return_value=dict(APES_THROUGH_THE_TRAY)), \
+                mock.patch.object(identify, "_provider_search", return_value=apes) as search, \
+                self.assertLogs(level="INFO") as logs:
+            self.assertFalse(identify.identify_from_photo_vision(job))
+        search.assert_not_called()
+        self.assertEqual((job.title, job.hasnicetitle), ("not identified", False))
+        rejections = [line for line in logs.output if "shares no word" in line]
+        self.assertEqual(len(rejections), 1)
+        self.assertIn("'Planet of the Apes'", rejections[0])
+        self.assertIn("'WAR_IN_THE_PACIFIC_02'", rejections[0])
+        # the read is kept for the title fix page, but neither names the disc nor holds back the label search
+        self.assertEqual(json.loads(job.disc_photo_vision)["title"], "Planet of the Apes")
+        self.assertIsNone(identify.disc_label_read_title(job))
+        self.assertFalse(identify.title_from_disc_photo(job))
+        self.assertEqual(job.title, "not identified")
+        with mock.patch.object(identify.utils, "database_updater", side_effect=_fake_updater):
+            identify.update_job(job, {"Search": WAR_IN_THE_PACIFIC}, "WAR_IN_THE_PACIFIC_02")
+        self.assertEqual((job.title, job.hasnicetitle), ("War-in-the-Pacific", True))
+
+    def test_a_matching_or_generic_label_still_takes_the_read(self):
+        for label in ("PLANET_OF_THE_APES", "PLANETOFTHEAPES", "Planet-of-the-Apes", "APES_D1",
+                      "DVD_VIDEO", "LOGICAL_VOLUME", "DISC_1", "not identified"):
+            job = _job(disc_photo=self.PHOTO, disc_barcode=None, label=label)
+            with mock.patch.object(identify.disc_vision, "read_disc_photo",
+                                   return_value=dict(APES_THROUGH_THE_TRAY)), \
+                    mock.patch.object(identify, "_provider_search", return_value={"Search": PLANET_OF_THE_APES}):
+                self.assertTrue(identify.identify_from_photo_vision(job), label)
+            self.assertEqual((job.title, job.year, job.hasnicetitle), ("Planet-of-the-Apes", "2001", True), label)
+            self.assertEqual(identify.disc_label_read_title(job), "Planet of the Apes", label)
+
+
+@unittest.skipIf(IMPORT_ERROR is not None, f"ARM could not be imported here: {IMPORT_ERROR}")
+class TestLabelContradicts(unittest.TestCase):
+    def test_a_label_naming_something_else(self):
+        for label, title in (("WAR_IN_THE_PACIFIC_02", "Planet of the Apes"),
+                             ("war-in-the-pacific", "Planet of the Apes"),
+                             ("ALASKA_DISC_2", "Toon Time: Ultimate Cartoon Collection"),
+                             ("HOME_ALONE", "WALL-E")):
+            self.assertTrue(identify.label_contradicts(label, title), (label, title))
+
+    def test_a_label_sharing_a_word_or_naming_nothing(self):
+        for label, title in (("PLANET_OF_THE_APES", "Planet of the Apes"),
+                             ("planet of the apes", "PLANET OF THE APES"),
+                             ("PLANETOFTHEAPES", "Planet of the Apes"),
+                             ("CARTOONS_D3", "Toon Time: Ultimate Cartoon Collection"),
+                             ("SPIDERMAN", "Spider-Man"),
+                             ("LOTR_FOTR", "The Lord of the Rings: The Fellowship of the Ring"),
+                             ("COAL_MINERS_DAUGHTER", "Coal Miner's Daughter"),
+                             # labels of authoring defaults, disc numbers and noise words name no film
+                             ("DVD_VIDEO", "Planet of the Apes"), ("not identified", "Planet of the Apes"),
+                             ("", "Planet of the Apes"), (None, "Planet of the Apes"),
+                             ("LOGICAL_VOLUME", "WALL-E"), ("DISC_1", "WALL-E"), ("D1", "WALL-E"),
+                             ("SEASON_1_DISC_2", "Friends"), ("THE_A_OF_01", "WALL-E"),
+                             # nor does a title of short words, minor words and numbers only
+                             ("WAR_IN_THE_PACIFIC_02", "Up"), ("WAR_IN_THE_PACIFIC_02", "1917")):
+            self.assertFalse(identify.label_contradicts(label, title), (label, title))
+
 
 class _Response:
     def __init__(self, body):
@@ -823,6 +894,25 @@ class TestIdentifyEndToEnd(unittest.TestCase):
         # metadata_selector looks for the exact title without the year, finds none, keeps the year search
         self.assertEqual(self.searched, [("Cartoons+D3", "2026"), ("Cartoons+D3", None)])
         self.assertEqual((job.title, job.hasnicetitle), ("Greatest-Cartoons-of-the-Golden-Era-Vol.-3", True))
+
+    def test_a_read_the_label_contradicts_leaves_the_disc_to_the_label_search(self):
+        """Job 230: the read of a case seen through the empty tray skipped the label search and named the disc."""
+        def tmdb(title, year=None, **_options):
+            self.searched.append((title, year))
+            if "apes" in title.lower():
+                return {"Search": PLANET_OF_THE_APES}
+            return {"Search": WAR_IN_THE_PACIFIC if "pacific" in title.lower() else CARTOONS_D3}
+
+        cfg.arm_config["DISC_PHOTO_VISION_URL"] = "http://llm:11434"
+        self.addCleanup(cfg.arm_config.__setitem__, "DISC_PHOTO_VISION_URL", "")
+        job = self._job("dvd")
+        job.disc_barcode, job.label, job.disc_photo = None, "WAR_IN_THE_PACIFIC_02", "sr1_20261026-120000.jpg"
+        with mock.patch.object(identify.disc_vision, "read_disc_photo", return_value=dict(APES_THROUGH_THE_TRAY)), \
+                mock.patch.object(identify.ui_utils, "tmdb_search", side_effect=tmdb):
+            identify.identify(job)
+        self.assertEqual(self.searched[0], ("WAR_IN_THE_PACIFIC_02", None))
+        self.assertEqual([title for title, year in self.searched if "apes" in title.lower()], [])
+        self.assertEqual((job.title, job.year, job.hasnicetitle), ("War-in-the-Pacific", "1951", True))
 
 
 @unittest.skipIf(IMPORT_ERROR is not None, f"ARM could not be imported here: {IMPORT_ERROR}")
