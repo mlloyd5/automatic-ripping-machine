@@ -162,6 +162,25 @@ def read_media_properties(devpath):
     return properties
 
 
+def folder_suffix(job):
+    """
+    What sets a job's folders and log apart from older ones of the same name (``<name>_<suffix>``): the
+    job's start stamp, ``time() * 100``, which Job.__init__ keeps in ``stage``.
+
+    The web UI used to overwrite ``stage`` with rip progress text ("Track 1/2<br>Saving to MKV file"), and its
+    ``/`` made a nested folder. A stage that is not a plain number (a row from then, or none) gives a stamp of
+    the same form from ``start_time`` instead, or from the clock, so the suffix is always digits alone.
+    :param job: Job (or anything with ``stage`` and ``start_time``)
+    :return: str
+    """
+    stage = str(getattr(job, "stage", None) or "")
+    if stage.isascii() and stage.isdigit():
+        return stage
+    start_time = getattr(job, "start_time", None)
+    started = start_time.timestamp() if isinstance(start_time, dt) else time.time()
+    return str(round(started * 100))
+
+
 class Job(db.Model):
     """
     Job Class hold most of the details for each job
@@ -182,6 +201,8 @@ class Job(db.Model):
     )
     """
     stage = db.Column(db.String(63))
+    """The job's start stamp (``time() * 100``), set once: the suffix of its folders and log (folder_suffix).
+    The UI's rip progress text goes to the job list json as "stage", never into this column"""
     no_of_titles = db.Column(db.Integer)
     title = db.Column(db.String(256))
     title_auto = db.Column(db.String(256))
