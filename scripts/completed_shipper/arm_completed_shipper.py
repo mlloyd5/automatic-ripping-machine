@@ -24,6 +24,11 @@ Safety rules:
   once rsync has transferred it; the empty job folder is pruned only after rsync
   exited 0.  A failed or interrupted run leaves the job folder (and every file
   not yet transferred) in place and the next run resumes it.
+* A job folder that holds no files, or only the disc photo and barcode ARM
+  copies in beside a rip, never ships: on the media box it would be an empty
+  title in the library.  That is what a failed job leaves when it shares its
+  path with a successful one whose rip has already gone.  The folder stays on
+  the ripper, untouched, and ships once a file turns up in it.
 * Interrupted files are kept in a ``.rsync-partial`` directory on the
   destination, never under their final name, so Plex never indexes a
   truncated file.
@@ -117,6 +122,9 @@ PENDING_SUFFIX = ".pending"
 TMP_SUFFIX = ".tmp"
 MEDIA_EXTENSIONS = (".mkv", ".mp4", ".m4v", ".webm", ".avi", ".ts")
 """Files a job folder holds that belong in a media catalog; sidecars (disc.jpg, disc.barcode, posters) do not."""
+SIDECAR_FILES = ("disc.jpg", "disc.barcode")
+"""Files ARM copies into a job folder beside the rip (``arm/ripper/disc_photo.py``); a folder of only these
+has nothing to ship (see :func:`has_rip_files`)."""
 UHD_MIN_WIDTH = 3000
 HD_MIN_WIDTH = 1280
 SUFFIX_MAX_LENGTH = 64
@@ -536,7 +544,14 @@ def finished_job_paths(db_path, completed_path, arm_completed_path=None):
 
 
 def pending_folders(cfg, sub_folder, shippable):
-    """List job folders in COMPLETED_PATH/<sub_folder> whose job finished successfully."""
+    """
+    List job folders in COMPLETED_PATH/<sub_folder> whose job finished successfully and that hold a rip.
+
+    A folder :func:`finished_jobs` passes can still be empty: the leftover of
+    a failed job on the path of a successful one whose rip has already
+    shipped.  One with nothing but :data:`SIDECAR_FILES` in it is left where
+    it is, with an INFO line, rather than shipped as an empty library folder.
+    """
     base = os.path.join(cfg["completed_path"], sub_folder)
     if not os.path.isdir(base):
         return []
@@ -545,10 +560,13 @@ def pending_folders(cfg, sub_folder, shippable):
         full = os.path.realpath(os.path.join(base, name))
         if not os.path.isdir(full):
             continue
-        if full in shippable:
-            folders.append(full)
-        else:
+        if full not in shippable:
             log.debug("not shippable yet: %s", full)
+        elif not has_rip_files(full):
+            info_once("not shipping %s: it holds no files besides %s, so it would land in the library empty; "
+                      "leaving it here", full, " or ".join(SIDECAR_FILES))
+        else:
+            folders.append(full)
     return folders
 
 
@@ -733,6 +751,11 @@ def folder_files(local_folder):
             if os.path.isfile(full) and not os.path.islink(full):
                 found.append(os.path.relpath(full, local_folder).replace(os.sep, "/"))
     return found
+
+
+def has_rip_files(local_folder):
+    """True when a job folder holds a regular file other than ARM's :data:`SIDECAR_FILES` at its top."""
+    return any(relative not in SIDECAR_FILES for relative in folder_files(local_folder))
 
 
 def bonus_remote_name(local_folder, job):
