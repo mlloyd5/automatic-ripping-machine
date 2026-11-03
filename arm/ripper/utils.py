@@ -947,14 +947,23 @@ def duplicate_run_check(dev_path):
         logging.info(f"Device {dev_path}: Job ({job.job_id}) status '{job.status}'")
     # check for running jobs by associated drive.
     drive = SystemDrives.query.filter_by(mount=dev_path).first()
-    if drive is None or not drive.processing:
-        return  # unknown or idle drive is safe to start another run.
+    if drive is None:
+        return  # unknown drive is safe to start another run.
+    # A query leaves what the session holds as it is, and setup() loaded the drive before waiting for a readable
+    # disc. The eject of the job before this one starts this run, so that job may have released the drive since
+    db.session.refresh(drive)
+    if not drive.processing:
+        return  # idle drive is safe to start another run.
     job = drive.job_current
     if not job_process_alive(job):
-        # The job died with its process (a container restart, a kill): it must not hold the drive
-        logging.warning(f"Drive {dev_path}'s job ({job.job_id}, {job.status}) has no live process (pid {job.pid}); "
-                        "marking it failed and taking the drive")
-        job.status = JobState.FAILURE.value
+        if job.finished:
+            logging.info(f"Drive {dev_path}'s job ({job.job_id}, {job.status}) finished without releasing the drive "
+                         f"(pid {job.pid} is gone); taking the drive")
+        else:
+            # The job died with its process (a container restart, a kill): it must not hold the drive
+            logging.warning(f"Drive {dev_path}'s job ({job.job_id}, {job.status}) has no live process "
+                            f"(pid {job.pid}); marking it failed and taking the drive")
+            job.status = JobState.FAILURE.value
         drive.release_current_job()
         db.session.commit()
         return
