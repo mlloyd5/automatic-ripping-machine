@@ -2,6 +2,11 @@
 Tests for the Active Rips progress and ETA calculation from a MakeMKV progress file (arm/ui/json_api).
 Like test_ui_boxes.py this builds a throwaway config and SQLite database under a temp folder and
 skips itself when the ARM package cannot be imported on this host.
+
+The progress text ("Track 1/2<br>Saving to MKV file") goes to the job list json only. It used to be
+written into job.stage, the job's start stamp that its folders and log are suffixed with, and its "/"
+made a nested folder: ts140 job 169 (The West, disc 2) filed into
+completed/tv/The West (1996)_Track 1/2<br>Saving to MKV file/, which the completed-rip shipper never sent.
 """
 import atexit
 import importlib
@@ -11,6 +16,7 @@ import tempfile
 import unittest
 from datetime import datetime
 from pathlib import Path
+from unittest import mock
 
 import yaml
 
@@ -60,6 +66,12 @@ PRGC:5017,0,"Saving to MKV file"
 PRGV:32768,32768,65536
 """
 
+HANDBRAKE = """Processing track #1 of 2
+Encoding: task 1 of 1, 42.50 % (30.00 fps, avg 29.50 fps, ETA 00h10m00s)
+"""
+
+STAMP = "177000990100"
+
 
 @unittest.skipIf(IMPORT_ERROR is not None, f"ARM could not be imported here: {IMPORT_ERROR}")
 class TestMakeMkvProgress(unittest.TestCase):
@@ -75,7 +87,8 @@ class TestMakeMkvProgress(unittest.TestCase):
         job = Job.__mapper__.class_manager.new_instance()
         for key, value in dict(job_id=9901, devpath="/dev/sr1", status="ripping", disctype="dvd", title="Jaws",
                                year="1975", label="JAWS", start_time=datetime(2026, 10, 25, 23, 0), no_of_titles=2,
-                               hasnicetitle=True, ejected=False, updated=False, video_type="movie").items():
+                               hasnicetitle=True, ejected=False, updated=False, video_type="movie",
+                               stage=STAMP, logfile="JAWS.log").items():
             setattr(job, key, value)
         self.job = job
         self.progress_dir = os.path.join(cfg.arm_config["LOGPATH"], "progress")
@@ -99,7 +112,8 @@ class TestMakeMkvProgress(unittest.TestCase):
         self.assertTrue(os.path.exists(batch_file), "the first poll must start the batch info file")
         with open(batch_file) as handle:
             self.assertRegex(handle.read().strip(), r"^BINF:\d{10},1,2,5017$")
-        self.assertEqual(self.job.stage, "Track 1/2<br>Saving to MKV file")
+        self.assertEqual(first["stage"], "Track 1/2<br>Saving to MKV file")
+        self.assertEqual(self.job.stage, STAMP, "the progress text must not replace the job's folder suffix")
 
         second = json_api.process_makemkv_logfile(self.job, {})
         self.assertEqual(second["progress"], "50.00")
@@ -110,13 +124,57 @@ class TestMakeMkvProgress(unittest.TestCase):
         json_api.process_makemkv_logfile(self.job, {})
         with open(os.path.join(self.progress_dir, f"{self.job.job_id}.log"), "a") as handle:
             handle.write('PRGC:3104,0,"Decrypting data"\nPRGV:49152,49152,65536\n')
-        json_api.process_makemkv_logfile(self.job, {})
+        second = json_api.process_makemkv_logfile(self.job, {})
         batch_file = os.path.join(self.progress_dir, f"{self.job.job_id}.log.batchinfo")
         with open(batch_file) as handle:
             lines = [line for line in handle.read().splitlines() if line]
         self.assertEqual(len(lines), 2)
         self.assertTrue(lines[-1].endswith(",3104"))
-        self.assertEqual(self.job.stage, "Track 1/2<br>Decrypting data")
+        self.assertEqual(second["stage"], "Track 1/2<br>Decrypting data")
+        self.assertEqual(self.job.stage, STAMP)
+
+    def test_job_list_shows_the_progress_and_commits_nothing(self):
+        fake_db = mock.MagicMock()
+        fake_db.session.query.return_value.filter.return_value.all.return_value = [self.job]
+        with mock.patch.object(json_api, "db", fake_db), \
+                mock.patch.object(json_api, "authenticated_state", return_value=True):
+            listing = json_api.get_x_jobs("joblist")
+        self.assertEqual(listing["results"][0]["stage"], "Track 1/2<br>Saving to MKV file")
+        self.assertEqual(listing["results"][0]["progress"], "50.00")
+        self.assertEqual(self.job.stage, STAMP)
+        fake_db.session.commit.assert_not_called()
+
+    def test_job_list_without_progress_shows_the_column(self):
+        # Nothing in the progress file yet: the json carries the job's own stage, as before
+        with open(os.path.join(self.progress_dir, f"{self.job.job_id}.log"), "w") as handle:
+            handle.write("")
+        fake_db = mock.MagicMock()
+        fake_db.session.query.return_value.filter.return_value.all.return_value = [self.job]
+        with mock.patch.object(json_api, "db", fake_db), \
+                mock.patch.object(json_api, "authenticated_state", return_value=True):
+            listing = json_api.get_x_jobs("joblist")
+        self.assertEqual(listing["results"][0]["stage"], STAMP)
+
+    def test_handbrake_progress_stays_out_of_the_stage(self):
+        self.job.status = "transcoding"
+        logfile = os.path.join(cfg.arm_config["LOGPATH"], "JAWS_handbrake.log")
+        with open(logfile, "w") as handle:
+            handle.write(HANDBRAKE)
+        self.addCleanup(os.remove, logfile)
+        results = json_api.process_handbrake_logfile(logfile, self.job, {})
+        self.assertEqual(results["stage"], "1 of 1 - 1/2")
+        self.assertEqual(results["progress"], "42.50")
+        self.assertEqual(self.job.stage, STAMP)
+
+    def test_audio_progress_stays_out_of_the_stage(self):
+        self.job.disctype, self.job.status = "music", "ripping"
+        logfile = "JAWS_abcde.log"
+        with open(os.path.join(cfg.arm_config["LOGPATH"], logfile), "w") as handle:
+            handle.write("Ripping from sector       0 (track  1 [0:00.00])\n")  # cdparanoia, under abcde
+        self.addCleanup(os.remove, os.path.join(cfg.arm_config["LOGPATH"], logfile))
+        results = json_api.process_audio_logfile(logfile, self.job, {})
+        self.assertEqual(results["stage"], "Track:   1 /2")
+        self.assertEqual(self.job.stage, STAMP)
 
 
 if __name__ == "__main__":

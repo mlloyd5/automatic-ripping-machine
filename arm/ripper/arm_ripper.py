@@ -19,7 +19,7 @@ if find_spec("arm") is None:
 import arm.config.config as cfg  # noqa E402
 from arm.ripper import utils, makemkv, handbrake, ffmpeg, identify  # noqa E402
 from arm.ui import app, db, constants  # noqa E402
-from arm.models.job import JobState  # noqa E402
+from arm.models.job import JobState, folder_suffix  # noqa E402
 
 # A ripped title must be at least this fraction of the longest title (by runtime, or by file size when
 # no runtime is known) to be considered as the main feature. Keeps a many-chapter bonus reel from winning.
@@ -477,7 +477,7 @@ def bonus_target_folder(job):
     type_sub_folder = utils.convert_job_type("movie")
     if film is not None and int(film.position or 1) > 1:
         plain = os.path.join(job.config.COMPLETED_PATH, type_sub_folder, film.folder_name)
-        suffixed = f"{plain}_{parent.stage}"
+        suffixed = f"{plain}_{folder_suffix(parent)}"
         return suffixed if os.path.isdir(suffixed) else plain
     if parent.path:
         return parent.path
@@ -1130,7 +1130,7 @@ def file_film(out_path, filename, film, job):
     film_path = os.path.join(job.config.COMPLETED_PATH, type_sub_folder, film.folder_name)
     if utils.make_dir(film_path) is False:
         logging.info(f"Output directory \"{film_path}\" already exists.")
-        film_path = film_path + "_" + str(job.stage)
+        film_path = film_path + "_" + folder_suffix(job)
         utils.make_dir(film_path)
     film_file = os.path.join(film_path, f"{film.folder_name}.{job.config.DEST_EXT}")
     logging.info(f"Track is the main title of {film.folder_name}. Moving '{os.path.join(out_path, filename)}' "

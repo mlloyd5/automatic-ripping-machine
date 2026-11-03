@@ -55,6 +55,7 @@ def get_x_jobs(job_status):
         job_results[i] = {}
         job_log = os.path.join(cfg.arm_config['LOGPATH'], str(j.logfile))
         process_logfile(job_log, j, job_results[i])
+        progress_stage = job_results[i].get('stage')
         try:
             job_results[i]['config'] = j.config.get_d()
         except AttributeError:
@@ -64,6 +65,9 @@ def get_x_jobs(job_status):
         for key, value in j.get_d().items():
             if key != "config":
                 job_results[i][str(key)] = str(value)
+        if progress_stage is not None:
+            # The job's stage column is its start stamp (folder_suffix); the page shows the progress in its place
+            job_results[i]['stage'] = progress_stage
         i += 1
     if jobs:
         app.logger.debug("jobs  - we have " + str(len(job_results)) + " jobs")
@@ -200,10 +204,10 @@ def process_makemkv_logfile(job, job_results):
                             )
             app.logger.debug(f"job_stage_index: {job_stage_index}")
             current_index = f"Track {job_batch_info.group(2)}/{job_batch_info.group(3)}<br>{job_stage_index.group(3)}"
-            job.stage = job_results['stage'] = current_index
-            db.session.commit()
+            # Into the json only: job.stage is the job's folder suffix, and this text's "/" made a nested folder
+            job_results['stage'] = current_index
         except Exception as error:
-            job.stage = f"Unknown -  {error}"
+            job_results['stage'] = f"Unknown -  {error}"
 
     return job_results
 
@@ -238,26 +242,27 @@ def process_handbrake_logfile(logfile, job, job_results):
             ffmpeg_job_status = ffmpeg_search
 
     # Check ARM can read the Handbrake library and get a status
+    # The progress goes into the json, not job.stage: that is the job's folder suffix (folder_suffix)
     if job_status is not None:
         app.logger.debug(job_status.group())
-        job.stage = job_status.group(1)
+        stage = job_status.group(1)
         job.progress = job_status.group(2)
         job.cur_fps = job_status.group(3)
         job.avg_fps = job_status.group(4)
         job.eta = job_status.group(5)
         job.progress_round = int(float(job.progress))
     elif ffmpeg_job_status is not None:
-        job.stage = "Transcoding"
+        stage = "Transcoding"
         job.progress = ffmpeg_job_status.group(1)
         job.eta = "Unknown"
         job.progress_round = int(float(job.progress))
     else:
         app.logger.debug(f"Job [{job.job_id}] handbrake/ffmpeg status not defined - setting progress to 0%")
-        job.stage = "Unknown"
+        stage = "Unknown"
         job.progress = job.progress_round = 0
         job.eta = "Unknown"
 
-    job_results['stage'] = job.stage
+    job_results['stage'] = stage
     job_results['progress'] = job.progress
     job_results['eta'] = job.eta
     job_results['cur_fps'] = getattr(job, 'cur_fps', 0)
@@ -267,10 +272,10 @@ def process_handbrake_logfile(logfile, job, job_results):
     if job_status_index:
         try:
             current_index = int(job_status_index.group(1))
-            job.stage = job_results['stage'] = f"{job.stage} - {current_index}/{job.no_of_titles}"
+            job_results['stage'] = f"{stage} - {current_index}/{job.no_of_titles}"
         except Exception as error:
             app.logger.debug(f"Problem finding the current track {error}")
-            job.stage = f"{job.stage} - %0%/%0%"
+            job_results['stage'] = f"{stage} - %0%/%0%"
     else:
         app.logger.debug("Cant find index")
 
@@ -281,7 +286,7 @@ def process_audio_logfile(logfile, job, job_results):
     """
     Process audio disc logs to show current ripping tracks
     :param logfile: will come in as only the bare logfile, no path
-    :param job: current job, so we can update the stage
+    :param job: current job, for its track count and start time
     :param job_results:
     :return:
     """
@@ -292,14 +297,15 @@ def process_audio_logfile(logfile, job, job_results):
         if job_stage_index:
             try:
                 current_index = f"Track: {job_stage_index.group(1)}/{job.no_of_titles}"
-                job.stage = job_results['stage'] = current_index
+                # Into the json only, like process_makemkv_logfile: job.stage is the job's folder suffix
+                job_results['stage'] = current_index
                 job.eta = calc_process_time(job.start_time, job_stage_index.group(1), job.no_of_titles)
                 job.progress = round(percentage(job_stage_index.group(1), job.no_of_titles + 1))
                 job.progress_round = round(job.progress)
             except Exception as error:
                 app.logger.debug("Error processing abcde logfile. Error dump"
                                  f"-  {error}", exc_info=True)
-                job.stage = "Unknown"
+                job_results['stage'] = "Unknown"
                 job.eta = "Unknown"
                 job.progress = job.progress_round = 0
     return job_results

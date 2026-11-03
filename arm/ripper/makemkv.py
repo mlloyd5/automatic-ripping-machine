@@ -20,7 +20,7 @@ from time import sleep, time
 
 import arm.config.config as cfg
 from arm.models import SystemDrives, Track
-from arm.models.job import JobState
+from arm.models.job import JobState, folder_suffix
 from arm.ripper import utils
 from arm.ripper.utils import notify
 from arm.ui import db
@@ -918,7 +918,7 @@ def setup_rawpath(job, raw_path):
             logging.error(err)
     else:
         logging.info(f"{raw_path} exists.  Adding timestamp.")
-        raw_path = os.path.join(str(job.config.RAW_PATH), f"{job.title}_{job.stage}")
+        raw_path = os.path.join(str(job.config.RAW_PATH), f"{job.title}_{folder_suffix(job)}")
         logging.info(f"raw_path is {raw_path}")
         try:
             os.makedirs(raw_path)

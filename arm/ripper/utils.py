@@ -24,7 +24,7 @@ from netifaces import interfaces, ifaddresses, AF_INET
 import arm.config.config as cfg
 from arm.ripper.ProcessHandler import arm_subprocess
 from arm.ui import db  # needs to be imported before models
-from arm.models.job import Job, JobState
+from arm.models.job import Job, JobState, folder_suffix
 from arm.models.notifications import Notifications
 from arm.models.track import Track
 from arm.models.user import User
@@ -1001,7 +1001,7 @@ def check_for_dupe_folder(have_dupes, hb_out_path, job):
         logging.debug(f"Value of ALLOW_DUPLICATES: {cfg.arm_config['ALLOW_DUPLICATES']}")
         logging.debug(f"Value of have_dupes: {have_dupes}")
         if cfg.arm_config["ALLOW_DUPLICATES"] or not have_dupes:
-            hb_out_path = hb_out_path + "_" + job.stage
+            hb_out_path = hb_out_path + "_" + folder_suffix(job)
             make_dir(hb_out_path, False)
         else:
             # We aren't allowed to rip dupes, notify and exit

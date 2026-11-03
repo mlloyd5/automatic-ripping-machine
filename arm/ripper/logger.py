@@ -38,8 +38,11 @@ def setup_job_log(job):
     else:
         valid_label = job.label.replace("/", "_")
 
+    # Imported here: arm.models.job imports arm.ui, which imports this module
+    from arm.models.job import folder_suffix
+
     log_file_name = f"{valid_label}.log"
-    new_log_file = f"{valid_label}_{job.stage}.log"
+    new_log_file = f"{valid_label}_{folder_suffix(job)}.log"
     temp_log_full = os.path.join(cfg.arm_config['LOGPATH'], log_file_name)
     log_file = new_log_file if os.path.isfile(temp_log_full) else log_file_name
     log_full = os.path.join(cfg.arm_config['LOGPATH'], log_file)
