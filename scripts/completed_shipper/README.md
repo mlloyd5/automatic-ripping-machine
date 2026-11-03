@@ -18,7 +18,14 @@ for you to rename by hand, at lower priority and with a bandwidth cap.
    `status` is `success`, translated to the same folder under `completed_path`.  A folder is only
    eligible if no other job (for example a re-rip of the same disc) is still
    unfinished on that same path.  Logs are never tailed.  A double feature's
-   further films count too (see **Double features** below).
+   further films count too (see **Double features** below).  When several
+   jobs have had the same path, the folder ships as the one that finished
+   last (latest `stop_time`), whose rip it holds: ARM only gives a job a
+   folder's name once the folder before it has shipped and gone, so two discs
+   of a series ripped at once get it in turn, and the higher job id may have
+   finished first.  That job's disc label is the one a collision appends and
+   its row goes into the catalog record.  A bonus disc or continuation filed
+   into the folder never stands for it (see below).
 2. Ships every eligible folder in `movies/`, then `tv/`, with
    `rsync -a -s --partial-dir=.rsync-partial --remove-source-files`.  First,
    though, rsync dry runs ask the media box whether the destination folder
