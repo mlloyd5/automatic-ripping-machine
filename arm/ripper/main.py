@@ -54,7 +54,25 @@ def entry():
 
 
 DISC_LOADING_STATES = (CDS.DRIVE_NOT_READY, CDS.NO_INFO, CDS.DISC_OK)
-"""Tray states that mean a disc is in the drive, whether or not it could be read."""
+"""Tray states that mean a disc may be in the drive, whether or not it could be read."""
+EMPTY_TRAY_STATES = (CDS.NO_DISC, CDS.TRAY_OPEN)
+"""Tray states a drive settles on when it has no disc to load."""
+
+
+def disc_was_loading(seen):
+    """
+    Decide whether a wait for a readable disc that timed out had a disc behind it.
+
+    Closing an empty tray makes the drive report DRIVE_NOT_READY for a few seconds before it
+    settles on NO_DISC, so a loading state only counts if the drive did not end up empty.
+    DISC_OK always counts: that is a disc the drive found but could not read.
+
+    :param seen: the distinct tray states from SystemDrives.wait_until_ready, in order
+    :return: True for a disc that never became readable, False for an empty drive
+    """
+    if CDS.DISC_OK not in seen and seen[-1] in EMPTY_TRAY_STATES:
+        return False
+    return any(state in DISC_LOADING_STATES for state in seen)
 
 
 def log_udev_params(dev_path):
@@ -214,11 +232,11 @@ def setup():
     ready, seen = drive.wait_until_ready(timeout, logger=arm_log)
     if not ready:
         states = ", ".join(state.name for state in seen)
-        if any(state in DISC_LOADING_STATES for state in seen):
+        if disc_was_loading(seen):
             raise utils.RipperException(
                 f"Timed out after {timeout}s waiting for a readable disc in {devpath} (tray status: {states})."
             )
-        # Nothing was ever loaded: a tray left open, or a queued udev event replayed after the eject
+        # Nothing was ever loaded: a tray left open or closed empty, or a queued udev event replayed after the eject
         raise utils.EmptyDriveException(f"No disc in drive {devpath} (tray status: {states}).")
 
     # ARM Job starts

@@ -42,9 +42,10 @@ try:
     identify = importlib.import_module("arm.ripper.identify")
     utils = importlib.import_module("arm.ripper.utils")
     cfg = importlib.import_module("arm.config.config")
+    ripper_main = importlib.import_module("arm.ripper.main")
     IMPORT_ERROR = None
 except Exception as error:  # pragma: no cover - depends on the host
-    system_drives = job_module = identify = utils = cfg = None
+    system_drives = job_module = identify = utils = cfg = ripper_main = None
     IMPORT_ERROR = error
 
 
@@ -129,10 +130,81 @@ class TestWaitUntilReady(unittest.TestCase):
         self.assertEqual(self.clock.sleeps, [1.0] * 5)
         self.assertEqual(self.opens, 0)
 
+    def test_closing_an_empty_tray_ends_on_no_disc(self):
+        ready, seen = self._wait(itertools.chain([3, 3, 3], itertools.repeat(1)), timeout=10)
+        self.assertFalse(ready)
+        self.assertEqual(seen, [system_drives.CDS.DRIVE_NOT_READY, system_drives.CDS.NO_DISC])
+        self.assertEqual(self.opens, 0)
+
     def test_unreadable_status_is_recorded_as_error(self):
         ready, seen = self._wait([None, 4], timeout=10)
         self.assertTrue(ready)
         self.assertEqual(seen, [system_drives.CDS.ERROR, system_drives.CDS.DISC_OK])
+
+
+@unittest.skipIf(IMPORT_ERROR is not None, f"ARM could not be imported here: {IMPORT_ERROR}")
+class TestDriveWaitTimeout(unittest.TestCase):
+    """What a timed-out wait means: the first sequences of each list are from the t620's arm.log."""
+    DISC_LOADED = (
+        "DISC_OK",
+        "DRIVE_NOT_READY, DISC_OK",
+        "TRAY_OPEN, DRIVE_NOT_READY",
+        "DISC_OK, NO_DISC",  # DISC_OK anywhere means a disc was there, whatever came after it
+        "DISC_OK, TRAY_OPEN",
+        "NO_INFO",
+        "DRIVE_NOT_READY, NO_INFO",
+        "DRIVE_NOT_READY, ERROR",  # no status at the end: unknown, so still worth telling the user
+    )
+    EMPTY = (
+        "DRIVE_NOT_READY, NO_DISC",
+        "TRAY_OPEN, DRIVE_NOT_READY, NO_DISC",
+        "NO_DISC",
+        "TRAY_OPEN",
+        "NO_DISC, TRAY_OPEN",
+        "ERROR",
+    )
+
+    def setUp(self):
+        _switch_config()
+
+    @staticmethod
+    def _states(sequence):
+        return [system_drives.CDS[name] for name in sequence.split(", ")]
+
+    def _setup(self, sequence):
+        drive = mock.MagicMock()
+        drive.wait_until_ready.return_value = (False, self._states(sequence))
+        with mock.patch.object(ripper_main, "signal"), \
+                mock.patch.object(ripper_main, "entry", return_value=SimpleNamespace(devpath="sr0", syslog=False)), \
+                mock.patch.object(ripper_main.logger, "create_early_logger"), \
+                mock.patch.object(ripper_main.utils, "arm_setup"), \
+                mock.patch.object(ripper_main, "SystemDrives") as drives:
+            drives.query.filter_by.return_value.one_or_none.return_value = drive
+            ripper_main.setup()
+
+    def test_disc_was_loading(self):
+        for sequence in self.DISC_LOADED:
+            with self.subTest(sequence):
+                self.assertTrue(ripper_main.disc_was_loading(self._states(sequence)))
+        for sequence in self.EMPTY:
+            with self.subTest(sequence):
+                self.assertFalse(ripper_main.disc_was_loading(self._states(sequence)))
+
+    def test_setup_is_fatal_when_a_disc_was_loading(self):
+        for sequence in self.DISC_LOADED:
+            with self.subTest(sequence):
+                with self.assertRaises(utils.RipperException) as raised:
+                    self._setup(sequence)
+                # EmptyDriveException is a RipperException too, and that one sends no notification
+                self.assertNotIsInstance(raised.exception, utils.NothingToDoException)
+                self.assertIn(f"tray status: {sequence}", str(raised.exception))
+
+    def test_setup_has_nothing_to_rip_when_the_drive_is_empty(self):
+        for sequence in self.EMPTY:
+            with self.subTest(sequence):
+                with self.assertRaises(utils.EmptyDriveException) as raised:
+                    self._setup(sequence)
+                self.assertIn(f"tray status: {sequence}", str(raised.exception))
 
 
 @unittest.skipIf(IMPORT_ERROR is not None, f"ARM could not be imported here: {IMPORT_ERROR}")
