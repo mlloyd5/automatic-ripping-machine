@@ -727,6 +727,38 @@ class TestIdentifyEndToEnd(unittest.TestCase):
                                          ("Cartoon-Classics-Collection", None)])
         self.assertEqual((job.title, job.year, job.hasnicetitle), ("Cartoon-Classics-Collection", "1998", True))
 
+    def test_bluray_without_a_label_is_not_searched_for(self):
+        """
+        A Blu-ray the drive could not read has no label and no file system: str(None) made its title
+        "None", and TMDB's exact match "None (2025)" named a Zootopia disc on the t620 (job 127).
+        """
+        def tmdb(title, year=None, **_options):
+            self.searched.append((title, year))
+            return {"Search": [_result("None", "2025", 3)]}
+
+        for label in (None, ""):
+            self.searched.clear()
+            job = self._job("bluray")
+            job.label, job.disc_barcode = label, None
+            with mock.patch.object(identify.ui_utils, "tmdb_search", side_effect=tmdb):
+                identify.identify(job)
+            self.assertEqual(self.searched, [], label)
+            self.assertEqual((job.label, job.title, job.title_auto, job.year, job.hasnicetitle),
+                             ("not identified", "not identified", "not identified", "", False), label)
+
+    def test_bluray_without_a_label_and_unreadable_metadata_is_not_searched_for(self):
+        def tmdb(title, year=None, **_options):
+            self.searched.append((title, year))
+            return {"Search": [_result("None", "2025", 3)]}
+
+        self._bdmt(BDMT_BROKEN)
+        job = self._job("bluray")
+        job.label, job.disc_barcode = None, None
+        with mock.patch.object(identify.ui_utils, "tmdb_search", side_effect=tmdb):
+            identify.identify(job)
+        self.assertEqual(self.searched, [])
+        self.assertEqual((job.title, job.year, job.hasnicetitle), ("not identified", "", False))
+
     def test_without_a_barcode_the_label_search_still_guesses(self):
         job = self._job("dvd")
         job.disc_barcode = None
