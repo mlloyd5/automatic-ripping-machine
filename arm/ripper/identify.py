@@ -153,9 +153,28 @@ def identify(job):
     unmount_disc(job)
 
 
+def _unlabelled_bluray(job):
+    """
+    A Blu-ray with neither a label nor a title in bdmt_eng.xml keeps the placeholder as it is, as
+    identify_dvd's failsafe does, with no year (not the metadata file's). Through the filename cleaner it
+    would be "not-identified", which the label search shortens to "not" and searches for.
+
+    :return: False: the disc is not identified
+    """
+    job.title = job.title_auto = "not identified"
+    job.year = job.year_auto = ""
+    db.session.commit()
+    return False
+
+
 def identify_bluray(job):
     """ Get's Blu-Ray title by parsing XML in bdmt_eng.xml """
 
+    # A disc the drive could not read has no label, and str(None) is "None": the label search then
+    # took "None (2025)" from TMDB for a Zootopia Blu-ray the t620's sr1 failed to read. identify_dvd
+    # gives an unlabelled disc the "not identified" placeholder, which search_and_update never searches for
+    if not job.label:
+        job.label = "not identified"
     try:
         with open(job.mountpoint + '/BDMV/META/DL/bdmt_eng.xml', "rb") as xml_file:
             xml_data = xml_file.read()
@@ -197,21 +216,15 @@ def identify_bluray(job):
         logging.error("Disc is a bluray, but bdmt_eng.xml could not be found. "
                       "Disc cannot be identified.  Error "
                       f"number is: {error.errno}")
-        # Maybe call OMdb with label when we can't find any ident on disc ?
-        # Attempt to parse label
-        if str(job.label) == "":
-            job.title = str(job.label)
-            job.year = ""
-            db.session.commit()
-            return False
-        else:
-            bluray_title = str(job.label)
-            bluray_title = bluray_title.replace('_', ' ')
-            bluray_title = bluray_title.title()
-            job.title = job.title_auto = bluray_title
-            job.year = ""
-            db.session.commit()
-            return True
+        if job.label == "not identified":
+            return _unlabelled_bluray(job)
+        bluray_title = str(job.label)
+        bluray_title = bluray_title.replace('_', ' ')
+        bluray_title = bluray_title.title()
+        job.title = job.title_auto = bluray_title
+        job.year = ""
+        db.session.commit()
+        return True
 
     if doc is None:
         bluray_title = str(job.label)
@@ -227,6 +240,8 @@ def identify_bluray(job):
                 "Using disc label '%s'.",
                 job.label,
             )
+    if bluray_title == "not identified":
+        return _unlabelled_bluray(job)
 
     bluray_modified_timestamp = os.path.getmtime(job.mountpoint + '/BDMV/META/DL/bdmt_eng.xml')
     bluray_year = (datetime.datetime.fromtimestamp(bluray_modified_timestamp).strftime('%Y'))
