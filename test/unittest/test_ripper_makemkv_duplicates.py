@@ -352,6 +352,129 @@ class TestMakemkvMkvRouting(unittest.TestCase):
         self.assertEqual([call[0] for call in order.mock_calls], ["commit", "run", "run"])
 
 
+def _shuffled_copies(count, first_number=0, length=6549, filesize=34_405_355_520):
+    """Titles like The Lighthouse's: clips 501-515 in a different order each, same length and size."""
+    clips = list(range(501, 516))
+    copies = []
+    for index in range(count):
+        order = clips[:1] + clips[1:-1][index:] + clips[1:-1][:index] + clips[-1:]
+        copies.append(_track(first_number + index, length, filesize, 16, ",".join(map(str, order)),
+                             f"{first_number + index:05d}.mpls"))
+    return copies
+
+
+@unittest.skipIf(IMPORT_ERROR is not None, f"ARM could not be imported here: {IMPORT_ERROR}")
+class TestFindObfuscatedPlaylists(unittest.TestCase):
+
+    def test_shuffled_copies_are_one_group(self):
+        copies = _shuffled_copies(12)
+        extra = _track(20, 1121, 2_000_000_000, 4, "600", "00700.mpls")
+        groups = makemkv.find_obfuscated_playlists([extra] + copies[::-1])
+        self.assertEqual(len(groups), 1)
+        self.assertEqual([track.track_number for track in groups[0]], [str(n) for n in range(12)])
+
+    def test_variant_with_an_extra_clip_is_left_out(self):
+        # The Lighthouse's 00405.mpls: 6609 s and clip 2199 on top of the film's clips
+        copies = _shuffled_copies(12)
+        variant = _track(40, 6609, 34_468_786_176, 17, "505,2199," + copies[0].segment_map.split(",", 1)[1],
+                         "00405.mpls")
+        groups = makemkv.find_obfuscated_playlists(copies + [variant])
+        self.assertNotIn(variant, groups[0])
+
+    def test_a_few_orders_are_not_obfuscation(self):
+        # A film with a theatrical and an alternate cut, or a handful of language intros
+        self.assertEqual(makemkv.find_obfuscated_playlists(_shuffled_copies(
+            makemkv.OBFUSCATED_PLAYLIST_MIN_TITLES - 1)), [])
+
+    def test_same_order_many_times_is_not_obfuscation(self):
+        # plain copies are find_duplicate_titles' job
+        copies = [_track(n, 6549, 34_405_355_520, 16, "1,2,3") for n in range(20)]
+        self.assertEqual(makemkv.find_obfuscated_playlists(copies), [])
+
+    def test_different_sizes_are_separate_groups(self):
+        small = _shuffled_copies(6)
+        big = _shuffled_copies(6, first_number=10, filesize=40_000_000_000)
+        self.assertEqual(makemkv.find_obfuscated_playlists(small + big), [])
+
+    def test_titles_without_segment_maps_are_ignored(self):
+        self.assertEqual(makemkv.find_obfuscated_playlists(
+            [_track(n, 6549, 34_405_355_520, 16) for n in range(20)]), [])
+
+
+@unittest.skipIf(IMPORT_ERROR is not None, f"ARM could not be imported here: {IMPORT_ERROR}")
+class TestObfuscatedDiscRouting(unittest.TestCase):
+    """A playlist-obfuscated disc waits for the user instead of ripping every copy."""
+
+    def setUp(self):
+        self.copies = _shuffled_copies(12)
+        self.extra = _track(20, 1121, 2_000_000_000, 4, "600", "00700.mpls")
+        self.mode = "auto"
+        patches = [
+            mock.patch.object(makemkv.utils, "get_drive_mode", side_effect=lambda devpath: self.mode),
+            mock.patch.object(makemkv, "get_track_info"),
+            mock.patch.object(makemkv, "run", return_value=iter(())),
+            mock.patch.object(makemkv, "progress_log", return_value="/tmp/progress.log"),
+            mock.patch.object(makemkv.db.session, "commit"),
+            mock.patch.object(makemkv, "notify"),
+            mock.patch.object(makemkv, "manual_wait"),
+        ]
+        mocks = [patch.start() for patch in patches]
+        for patch in patches:
+            self.addCleanup(patch.stop)
+        self.run_mock, self.notify, self.manual_wait = mocks[2], mocks[5], mocks[6]
+
+    def _job(self, **config):
+        job = _job(self.copies + [self.extra], **config)
+        job.title, job.manual_mode = "The-Lighthouse", False
+        return job
+
+    def _ripped_titles(self):
+        return [cmd[cmd.index("dev:/dev/sr0") + 1] for cmd in (call.args[0] for call in self.run_mock.call_args_list)]
+
+    def test_auto_mode_waits_for_the_user_and_rips_only_the_ticked_title(self):
+        job = self._job()
+
+        def user_ticks_one(waiting_job):
+            self.assertTrue(waiting_job.manual_mode)
+            self.assertFalse(any(track.process for track in self.copies))
+            self.copies[7].process = True
+            return True
+
+        self.manual_wait.side_effect = user_ticks_one
+        with mock.patch("builtins.open", mock.mock_open()):
+            makemkv.makemkv_mkv(job, "/raw")
+        self.assertEqual(self._ripped_titles(), ["7"])
+        self.assertIn("Pick the title", self.notify.call_args_list[0].args[1])
+
+    def test_no_answer_fails_the_job_without_ripping(self):
+        self.manual_wait.return_value = False
+        with self.assertRaises(makemkv.utils.RipperException):
+            makemkv.makemkv_mkv(self._job(), "/raw")
+        self.run_mock.assert_not_called()
+
+    def test_mainfeature_does_not_pick_a_copy(self):
+        self.manual_wait.return_value = False
+        with self.assertRaises(makemkv.utils.RipperException):
+            makemkv.makemkv_mkv(self._job(MAINFEATURE=True), "/raw")
+        self.run_mock.assert_not_called()
+
+    def test_manual_drive_starts_with_the_copies_unticked(self):
+        self.mode = "manual"
+        for track in self.copies:
+            track.process = True
+        self.manual_wait.return_value = True
+        with mock.patch("builtins.open", mock.mock_open()):
+            makemkv.makemkv_mkv(self._job(), "/raw")
+        self.assertEqual(self._ripped_titles(), [])
+
+    def test_ordinary_disc_is_unchanged(self):
+        job = _job([_track(0, 6903, 75_000_000_000, 20, "1,2,3"), self.extra])
+        makemkv.makemkv_mkv(job, "/raw")
+        self.manual_wait.assert_not_called()
+        self.notify.assert_not_called()
+        self.assertIn("all", self.run_mock.call_args_list[0].args[0])
+
+
 @unittest.skipIf(IMPORT_ERROR is not None, f"ARM could not be imported here: {IMPORT_ERROR}")
 class TestGetTrackInfoRetry(unittest.TestCase):
     """A disc MakeMKV fails to open is scanned again (RED 2 on the t620 opened on a later try)."""

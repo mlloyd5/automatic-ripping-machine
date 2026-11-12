@@ -43,6 +43,8 @@ DUPLICATE_DURATION_TOLERANCE = 2  # [s]
 """Titles whose durations differ by more than this are never treated as duplicates of each other"""
 DUPLICATE_FILESIZE_TOLERANCE = 0.02
 """Titles whose sizes differ by more than this fraction of the larger one are never treated as duplicates"""
+OBFUSCATED_PLAYLIST_MIN_TITLES = 10
+"""This many titles playing the same clips in different orders mark a disc as using playlist obfuscation"""
 DISC_OPEN_ATTEMPTS = 3
 """How often makemkvcon info is run before a disc it cannot open is given up on"""
 DISC_OPEN_RETRY_WAIT = 30  # [s]
@@ -697,8 +699,15 @@ def makemkv_mkv(job, rawpath):
                                     "(or could not open it)")
     # Titles that are copies of another title (same content, different playlist) get ripped once only
     skipped = skip_duplicate_titles(job) if job.config.SKIP_DUPLICATE_TITLES else []
+    # A disc with hundreds of shuffled copies of the film can't be ripped unattended: ripping "all"
+    # fills the disk (The Lighthouse, 388 titles of 33 GB each), and the main feature or any one
+    # copy is most likely a scrambled cut. The user picks the right title instead.
+    obfuscated = find_obfuscated_playlists(job.tracks.all())
+    if obfuscated:
+        hand_obfuscated_disc_to_user(job, obfuscated)
+        mode = 'manual'
     # route to ripping functions.
-    if job.config.MAINFEATURE:
+    if job.config.MAINFEATURE and not obfuscated:
         logging.info("Trying to find mainfeature (sorting by chapters desc, filesize desc, track_number asc)")
         track = Track.query.filter_by(job_id=job.job_id).order_by(
             Track.chapters.desc(), Track.filesize.desc(), Track.track_number.asc()).first()
@@ -1221,6 +1230,81 @@ def find_duplicate_titles(tracks, disctype=None):
         else:
             groups.append((track, []))
     return [(kept, duplicates) for kept, duplicates in groups if duplicates]
+
+
+def _segments(track):
+    """The clip numbers of a title's segment map, in play order ([] without one)."""
+    return [segment.strip() for segment in (track.segment_map or "").split(",") if segment.strip()]
+
+
+def find_obfuscated_playlists(tracks):
+    """
+    Find the groups of titles that a disc's playlist obfuscation produced.
+
+    Some Blu-rays (many Lionsgate and A24 releases) carry hundreds of playlists that all play
+    the film's clips, but each in a different order, so only one plays the film as cut. The
+    titles have the same duration and size and different segment maps, so find_duplicate_titles
+    doesn't group them. Here titles count as one group when they play the same set of clips,
+    their durations and sizes match within the duplicate tolerances, and there are at least
+    OBFUSCATED_PLAYLIST_MIN_TITLES different clip orders among them.
+
+    Parameters:
+        tracks: iterable of arm.models.track.Track
+    Returns:
+        list of lists of arm.models.track.Track, one list per group, ordered by track number
+    """
+    by_clips = {}
+    for track in tracks:
+        segments = _segments(track)
+        if len(segments) > 1:
+            by_clips.setdefault(tuple(sorted(segments)), []).append(track)
+    groups = []
+    for candidates in by_clips.values():
+        clusters = []
+        for track in sorted(candidates, key=lambda candidate: int(candidate.track_number)):
+            for cluster in clusters:
+                first = cluster[0]
+                first_size, size = int(first.filesize or 0), int(track.filesize or 0)
+                if (abs(int(first.length or 0) - int(track.length or 0)) <= DUPLICATE_DURATION_TOLERANCE
+                        and abs(first_size - size) <= max(first_size, size) * DUPLICATE_FILESIZE_TOLERANCE):
+                    cluster.append(track)
+                    break
+            else:
+                clusters.append([track])
+        for cluster in clusters:
+            if len({tuple(_segments(track)) for track in cluster}) >= OBFUSCATED_PLAYLIST_MIN_TITLES:
+                groups.append(cluster)
+    return groups
+
+
+def hand_obfuscated_disc_to_user(job, groups):
+    """
+    Leave the choice of title on a playlist-obfuscated disc to the user.
+
+    The obfuscated titles are unticked, the job is switched to
+    manual mode (the job page then lets the user tick titles while it waits) and the user is told
+    why. Nothing is ripped unless the user ticks a title.
+
+    Parameters:
+        job: arm.models.job.Job
+        groups: the result of find_obfuscated_playlists
+    """
+    for group in groups:
+        for track in group:
+            track.process = False
+        first = group[0]
+        logging.warning(f"Playlist obfuscation: {len(group)} titles of {first.length}s "
+                        f"({first.filesize} bytes) play the same clips in different orders, e.g. titles "
+                        f"{', '.join(track.track_number for track in group[:5])}. Only one of them plays the "
+                        "film in the right order, so ARM won't pick one.")
+    job.manual_mode = True
+    db.session.commit()
+    copies = sum(len(group) for group in groups)
+    notify(job, "Pick the title to rip",
+           f"{job.title} has {copies} playlists that play the film's scenes in shuffled order (playlist "
+           "obfuscation) and only one is right, so ARM is waiting for you to tick it on the job page. "
+           "The MakeMKV forum usually has a thread naming the right .mpls playlist for the disc; the "
+           "job page shows each title's playlist and segment map.")
 
 
 def skip_duplicate_titles(job):
